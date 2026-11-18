@@ -76,6 +76,10 @@ XL_SECS=1800 ./xl run
 Every kernel argument: [docs/boot-args.md](docs/boot-args.md). From Windows without WSL, `tools/mk-winboot.sh`
 makes a folder with `boot-ios.bat`. HakiOS's general guides: [docs/](docs/index.md).
 
+## Documentation
+
+Documentation of the port: [t.me/ProjectIseng](https://t.me/ProjectIseng) (Telegram).
+
 ## Credits
 
 [HakiOS](https://github.com/oosexgang/hakios-xnu-kernel) and its team (the kernel port, loader, common drivers,
