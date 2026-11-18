@@ -11,11 +11,16 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <map>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/command.hpp"
+#include "hakios-metal/compiler.hpp"
 #include "hakios-metal/fake_gpu.hpp"
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/texture.hpp"
@@ -36,6 +41,8 @@
 #include "fixtures/tri_arr_vs_air.hpp"
 #include "fixtures/tri_flat_fs_air.hpp"
 #include "fixtures/tri_flat_vs_air.hpp"
+#include "fixtures/var_ab_vs_air.hpp"
+#include "fixtures/var_ba_fs_air.hpp"
 #include "test.hpp"
 
 using namespace hakios::metal;
@@ -5801,4 +5808,148 @@ TEST(each_profiled_pass_says_why_it_was_drawn_in_sysmem) {
         CHECK(std::string(cb->passSysmemWhy(0)).find("GMEM off") != std::string::npos);
     }
     CHECK_EQ(r.fake->stats().faults, 0u);
+}
+// --- the A650 link by varying identity, at the draw (.kiro/specs/metal-var1-linkage-crash-fix, task 5.2) ---------------
+// The synthetic reorder pair (tools/kernels/var_ab_vs.ll writes {a, b}, var_ba_fs.ll reads {b, a}) linked for the A650
+// and drawn on the fake. The draw re-links Program::vs/fs (render.cpp, "the link"), so the words it writes must be the
+// name-matched Linkage's: SP_VS_OUT_REG and SP_VS_VPC_DST_REG put the VS register of each identity at the inloc of the
+// FS input of that identity, VPC_VARYING_INTERP_MODE is the Linkage's. By slot the two inputs would swap.
+namespace {
+const std::string kVarIdA = "generated(1aDv4_f)", kVarIdB = "generated(1bDv4_f)";   // the identities var_*.ll declare
+// the register of the VS output whose identity is NAME (slot VAR0 + its index in NAMES), kRegidNone for none
+uint32_t vsRegidOf(const Stage& vs, const std::vector<std::string>& names, const std::string& name) {
+    for (uint32_t k = 0; k < names.size(); k++) {
+        if (names[k] != name) continue;
+        for (uint32_t j = 0; j < vs.numOutputs; j++) {
+            if (vs.outputs[j].slot == kSlotVar0 + k) return vs.outputs[j].regid;
+        }
+    }
+    return a6xx::kRegidNone;
+}
+// the inloc of the FS input whose identity is NAME, by the FS's own slots (before the name match), or -1
+int fsInlocOf(const Stage& fs, const std::vector<std::string>& names, const std::string& name) {
+    for (uint32_t i = 0; i < fs.numInputs; i++) {
+        uint32_t s = fs.inputs[i].slot;
+        if (s >= kSlotVar0 && s - kSlotVar0 < names.size() && names[s - kSlotVar0] == name) return fs.inputs[i].inloc;
+    }
+    return -1;
+}
+// the VS register the encoded SP_VS_OUT_REG / SP_VS_VPC_DST_REG words send to location LOC, or -1 for none
+int regidAtLoc(const Encoded& e, uint32_t cnt, uint32_t loc) {
+    for (uint32_t j = 0; j < cnt; j++) {
+        uint32_t dst = e.reg(a6xx::regSpVsVpcDstReg(j / 4)), out = e.reg(a6xx::regSpVsOutReg(j / 2));
+        if (((dst >> (8 * (j % 4))) & 0xff) == loc) return int((out >> (16 * (j % 2))) & 0xff);
+    }
+    return -1;
+}
+// Encodes and draws P on a fresh rig; holds the VPC words to LINK (the name-matched Linkage) and to the identities of
+// the original stages VS and FS (FS with its own slots, NAMES its identity tables)
+void expectDrawLinksByIdentity(const char* what, const Program& p, const Linkage& link, const Stage& vs, const std::vector<std::string>& vsNames,
+                               const Stage& fs, const std::vector<std::string>& fsNames) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r);
+    RenderPass pass;
+    pass.color0 = t.get();
+    Encoded e(r, p, pass, wholeDraw());
+    CHECK(e.ok);
+    if (!e.ok) {
+        std::fprintf(stderr, "  %s: %s\n", what, e.error.c_str());
+        return;
+    }
+    // the words, from the Linkage, as tu6_emit_vpc packs them
+    CHECK(link.cnt > 0 && link.cnt <= kMaxStageOutputs);
+    for (uint32_t i = 0; i < (link.cnt + 1) / 2; i++) {
+        const Linkage::Var& a = link.var[2 * i];
+        const bool hasB = 2 * i + 1 < link.cnt;
+        CHECK_EQ(e.reg(regSpVsOutReg(i)), spVsOutReg(a.regid, a.compmask, hasB ? link.var[2 * i + 1].regid : 0u, hasB ? link.var[2 * i + 1].compmask : 0u));
+    }
+    for (uint32_t i = 0; i < (link.cnt + 3) / 4; i++) {
+        uint32_t loc[4] = {0, 0, 0, 0};
+        for (uint32_t j = 0; j < 4 && 4 * i + j < link.cnt; j++) loc[j] = link.var[4 * i + j].loc;
+        CHECK_EQ(e.reg(regSpVsVpcDstReg(i)), spVsVpcDstReg(loc[0], loc[1], loc[2], loc[3]));
+    }
+    for (uint32_t i = 0; i < kVpcVaryingRegs; i++) CHECK_EQ(e.reg(regVpcVaryingInterpMode(i)), link.interpMode[i]);
+    CHECK_EQ(e.reg(REG_A6XX_SP_VS_PRIMITIVE_CNTL), spVsPrimitiveCntl(link.cnt));
+    // and the words, by identity: each FS input's location reads the VS register of its own name, never the other's
+    for (const std::string& name : fsNames) {
+        int inloc = fsInlocOf(fs, fsNames, name);
+        uint32_t want = vsRegidOf(vs, vsNames, name);
+        CHECK(inloc >= 0 && want != kRegidNone);
+        int got = inloc < 0 ? -1 : regidAtLoc(e, link.cnt, uint32_t(inloc));
+        CHECK_EQ(got, int(want));
+        if (got != int(want)) std::fprintf(stderr, "  %s: '%s' at inloc %d reads regid 0x%02x, expected 0x%02x\n", what, name.c_str(), inloc, unsigned(got), want);
+    }
+    // the slot link would have written other words: the pair is one the fix is for
+    Linkage bySlot{};
+    std::string why;
+    CHECK(render::link(vs, fs, &bySlot, &why));
+    CHECK(spVsOutReg(bySlot.var[0].regid, bySlot.var[0].compmask, bySlot.var[1].regid, bySlot.var[1].compmask) != e.reg(regSpVsOutReg(0)));
+    // through the fake: the draw completes and the fake's own VPC checks find the link whole
+    auto cb = drawOnce(r, p, pass, wholeDraw());
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    if (cb->status() != CommandBuffer::kCompleted) std::fprintf(stderr, "  %s: %s %s\n", what, cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    FakeGpu::Stats s = r.fake->stats();
+    CHECK_EQ(s.faults, 0u);
+    CHECK_EQ(s.draws, 1u);
+    CHECK_EQ(s.lastDraw.vsOutCount, link.cnt);
+    CHECK_EQ(s.lastDraw.positionLoc, link.positionLoc);
+}
+std::vector<uint8_t> hostBitcode(const char* name) {
+    std::ifstream f(std::string("out/host/kernels/") + name + ".bc", std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+}  // namespace
+// The fixtures' tables, name-matched as linkProgram does for two A650 stages (matchVaryingsByName over a copy of the
+// FS), drawn with the Linkage of that copy
+TEST(an_a650_draw_of_the_reorder_pair_reads_each_varying_by_its_identity) {
+    const Stage& vs = kernels::var_ab_vs_air;
+    const Stage& fs = kernels::var_ba_fs_air;
+    const std::vector<std::string> vsNames = {kVarIdA, kVarIdB}, fsNames = {kVarIdB, kVarIdA};
+    Stage f2 = fs;
+    std::vector<std::string> unmatched;
+    render::matchVaryingsByName(vs, vsNames, &f2, fsNames, &unmatched);
+    CHECK(unmatched.empty());
+    Linkage link{};
+    std::string why;
+    CHECK(render::link(vs, f2, &link, &why));
+    if (!why.empty()) std::fprintf(stderr, "  %s\n", why.c_str());
+    expectDrawLinksByIdentity("var_ab_vs+var_ba_fs", Program{vs, f2, link, "var_ab_vs+var_ba_fs"}, link, vs, vsNames, fs, fsNames);
+}
+// With the compiler in (MESA=1): the pair compiled for the A650 and linked by linkProgram; the Program it stores is
+// drawn as it is, and the draw's re-link must give the words of the Linkage linkProgram stored
+TEST(an_a650_draw_of_the_linkProgram_reorder_pair_keeps_its_stored_link) {
+    if (!hasCompiler()) {
+        std::printf("       (no compiler in this build: the A650 linkProgram draw did not run)\n");
+        return;
+    }
+    std::shared_ptr<CompiledStage> st[2];
+    const char* names[2] = {"var_ab_vs", "var_ba_fs"};
+    for (int i = 0; i < 2; i++) {
+        std::vector<uint8_t> bc = hostBitcode(names[i]);
+        CHECK(!bc.empty());
+        if (bc.empty()) {
+            std::printf("       out/host/kernels/%s.bc is missing (make test MESA=1 assembles it)\n", names[i]);
+            return;
+        }
+        std::string why;
+        st[i] = compileStageForChip(bc.data(), bc.size(), a6xx::kA650ChipId, &why);
+        CHECK(st[i] != nullptr);
+        if (st[i] == nullptr) {
+            std::printf("       %s: %s\n", names[i], why.c_str());
+            return;
+        }
+    }
+    const std::vector<std::string> vsNames = {kVarIdA, kVarIdB}, fsNames = {kVarIdB, kVarIdA};
+    CHECK(st[0]->varyingNames == vsNames);
+    CHECK(st[1]->varyingNames == fsNames);
+    std::string why;
+    auto prog = linkProgram(st[0], st[1], PixelFormat::kRGBA8Unorm, &why);
+    CHECK(prog != nullptr);
+    if (prog == nullptr) {
+        std::fprintf(stderr, "  var_ab_vs+var_ba_fs (A650): refused: \"%s\"\n", why.c_str());
+        return;
+    }
+    CHECK(prog->linkNote.empty());
+    expectDrawLinksByIdentity("var_ab_vs+var_ba_fs (linkProgram)", prog->program, prog->program.link, st[0]->stage, vsNames, st[1]->stage, fsNames);
 }

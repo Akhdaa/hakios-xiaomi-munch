@@ -1,0 +1,9 @@
+# devices/munch/drivers/wifi/conf: the POCO F4's own Wi-Fi hardware (docs/porting/drivers.md, docs/drivers-config.md).
+
+driver MUNCH_WIFI
+	file    bsd/dev/hakios.munch_pcie.c
+	file    bsd/dev/hakios.munch_mhi.c
+	help    the POCO F4's QCA6390 on PCIe 0: the link, the card's power, MHI with its firmware to mission mode and QRTR on its
+	help    channels, under ath11k (wifi=1, fw-wifi/; pcie_probe=N looks at the bus alone). The supplies go through the touch
+	help    screen's RPMh writes (hakios_munch_vreg)
+	requires WIFI MUNCH_TOUCH

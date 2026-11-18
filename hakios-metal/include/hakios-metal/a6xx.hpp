@@ -28,6 +28,7 @@ namespace hakios::metal::a6xx {
 // speedbin of the A635) is a6xx_base + a6xx_gen4 with num_ccu = 2.
 
 inline constexpr uint32_t kChipId = 0x06030500;             // not-in-headers: freedreno_devices.py GPUId(chip_id=0x..06030500)
+inline constexpr uint32_t kA650ChipId = 0x06050002;
 inline constexpr bool kHasLpac = true;                       // not-in-headers: freedreno_devices.py a6xx_gen4.has_lpac
 inline constexpr bool kSupportsDoubleThreadsize = true;      // not-in-headers: freedreno_devices.py a6xx_base.supports_double_threadsize
 // CP_LOAD_STATE6_0_NUM_UNIT for a shader (ST6_SHADER) is capped at this many instruction groups: Mesa's comment says

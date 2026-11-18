@@ -84,19 +84,40 @@ struct CompiledStage {
     std::vector<uint32_t> words;
     std::vector<uint32_t> immediates;
     std::vector<Resource> resources;
-    std::vector<std::string> varyingNames;   // the front end's names of the varyings, VS outputs or FS inputs, in slot order (VAR0 first)
+    // the varyings' link names (the string after air.vertex_output / air.fragment_input), in slot order (VAR0 first):
+    // VS outputs on every chip, FS inputs only for a stage compiled for the A650 (empty elsewhere)
+    std::vector<std::string> varyingNames;
     std::vector<std::pair<uint32_t, Sampler>> inlineSamplers;   // as CompiledKernel's
+    uint32_t chipId = 0;                     // the chip compileStageForChip compiled for (a6xx::kChipId for compileStage)
     uint32_t iboBase = 0;                    // compileStage's IBO_BASE, as it took effect (0 for a stage with no device buffers)
     bool writesMemory = true;                // the NIR stores to or does atomics on a device buffer (or global memory); false only when it was looked at and does not
     std::string name;
     std::string listing;
+    // how compileStageForChip came by it (metal-ca-perf's measurement; not in the cache's file, not in its key):
+    // CACHE_SOURCE 0 compiled, 1 from the writable cache (HAKIOS_METAL_CACHE), 2 from a seed (HAKIOS_METAL_CACHE_SEED);
+    // CACHE_NAME the cache file's name ("" when it has none); DIGEST stageDigest() of what it holds; COMPILE_US the
+    // request's time, cache lookups included
+    uint32_t cacheSource = 0;
+    std::string cacheName;
+    uint64_t digest = 0;
+    uint64_t compileUs = 0;
 };
+
+// FNV-1a 64 over a stage's instruction words, then its immediates (their bytes as they lie): the same digest on the
+// host and on the phone is the same program
+uint64_t stageDigest(const CompiledStage& s);
+// what the compiled-stage cache's key is made of besides the stage's own inputs: the compiler's build (the Makefile's
+// HAKIOS_METAL_CACHE_BUILD) and the layout, as "BUILD STAGE/KERNEL" (sizeof(Stage), sizeof(Kernel)); "" without a compiler
+const char* stageCacheBuild();
 
 // a VS and an FS linked for one colour format (render.hpp's Program), owning both stages
 struct CompiledProgram {
     Program program{};
     std::shared_ptr<CompiledStage> vs, fs;
     std::string name;   // "vs+fs"
+    // One line, empty when there is nothing to say: on the A650, the fragment inputs whose identity no vertex output has
+    // (they read zeros, a leniency Metal's validation would not give) and the inputs left slot-linked for want of a name
+    std::string linkNote;
 };
 
 // whether a compiler is in this build
@@ -147,5 +168,10 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, 
 // nullptr with *why: the front end's refusal, named by stage ("intrinsic: air.simd_sum not handled"), or ir3's, or
 // "not a compute kernel", or that no compiler is in this build.
 std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {});
+std::unique_ptr<CompiledKernel> compileAirForChip(const void* bitcode, size_t size, uint32_t chipId, std::string* why,
+                                                  const FunctionConstants& constants = {});
+std::unique_ptr<CompiledStage> compileStageForChip(const void* bitcode, size_t size, uint32_t chipId, std::string* why,
+                                                  const FunctionConstants& constants = {}, uint32_t iboBase = 0,
+                                                  const KnownBuffer* known = nullptr);
 
 }  // namespace hakios::metal

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "hakios-metal/hakios_metal.h"
@@ -874,5 +875,169 @@ TEST(c_api_the_device_counts_what_it_has_allocated) {
     CHECK_EQ(hakios_metal_device_allocated_bytes(d) - before, 32768ull);
     hakios_metal_buffer_free(b);
     CHECK_EQ(hakios_metal_device_allocated_bytes(d), before);
+    hakios_metal_close(d);
+}
+
+// --- metal-ca-perf's measurement through C: the stage record, the cache's build, the commit copies' damage -------------
+
+namespace {
+struct StageEvents {
+    std::vector<hakios_metal_stage_event> events;
+    std::vector<std::string> names;
+};
+void stageObserved(const hakios_metal_stage_event* e, void* context) {
+    auto* s = static_cast<StageEvents*>(context);
+    s->events.push_back(*e);
+    s->names.push_back(e->cache_name != nullptr ? e->cache_name : "(null)");
+}
+}  // namespace
+
+// Every stage request of a program is told to the observer as it is answered, with what hakios_metal_program_stage_info
+// says of the stage afterwards; without the compiler, the refusal. Nothing is told once the observer is taken away.
+TEST(c_api_stage_observer_and_stage_info) {
+    StageEvents seen;
+    std::vector<uint8_t> vsBc = readFile("out/host/kernels/tri_flat_vs.bc"), fsBc = readFile("out/host/kernels/tri_flat_fs.bc");
+    uint8_t garbage[64] = {'B', 'C', 0xc0, 0xde};
+    hakios_metal_set_stage_observer(stageObserved, &seen);
+    if (!hakios_metal_has_compiler()) {
+        CHECK(hakios_metal_program_new_bitcode(garbage, sizeof garbage, garbage, sizeof garbage, 70) == nullptr);
+        CHECK_EQ(seen.events.size(), size_t(1));
+        if (!seen.events.empty()) CHECK(seen.events[0].compiled == 0 && seen.events[0].stage == 0 && seen.events[0].size == sizeof garbage);
+        CHECK(hakios_metal_cache_build()[0] == '\0');
+        hakios_metal_set_stage_observer(nullptr, nullptr);
+        std::printf("       (no compiler in this build: the stage record's compiled half did not run)\n");
+        return;
+    }
+    CHECK(!vsBc.empty() && !fsBc.empty());
+    hakios_metal_program* p = hakios_metal_program_new_bitcode(vsBc.data(), vsBc.size(), fsBc.data(), fsBc.size(), 70);
+    CHECK(p != nullptr);
+    CHECK_EQ(seen.events.size(), size_t(2));
+    if (p != nullptr && seen.events.size() == 2) {
+        for (unsigned stage = 0; stage < 2; stage++) {
+            const hakios_metal_stage_event& e = seen.events[stage];
+            unsigned source = 99;
+            uint64_t digest = 0, us = 0;
+            char name[80] = "x";
+            CHECK_EQ(hakios_metal_program_stage_info(p, stage, &source, &digest, &us, name, sizeof name), 0);
+            CHECK(e.compiled == 1 && e.stage == stage);
+            CHECK(e.bitcode == (stage == 0 ? vsBc.data() : fsBc.data()) && e.size == (stage == 0 ? vsBc.size() : fsBc.size()));
+            CHECK(e.known == nullptr && e.constant_count == 0);
+            CHECK_EQ(e.source, source);
+            CHECK(source <= 2);
+            CHECK(digest != 0 && e.digest == digest);
+            CHECK_EQ(e.words, hakios_metal_program_stage_words(p, stage));
+            CHECK_EQ(e.microseconds, us);
+            CHECK(seen.names[stage] == name);
+        }
+        CHECK_EQ(seen.events[1].ibo_base, 0u);   // (tri_flat's vertex stage has no device buffers)
+    }
+    CHECK_EQ(hakios_metal_program_stage_info(p, 2, nullptr, nullptr, nullptr, nullptr, 0), -1);
+    CHECK_EQ(hakios_metal_program_stage_info(nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0), -1);
+    // the same bitcode compiled again: the same digests
+    hakios_metal_program* again = hakios_metal_program_new_bitcode(vsBc.data(), vsBc.size(), fsBc.data(), fsBc.size(), 70);
+    CHECK(again != nullptr && seen.events.size() == 4);
+    if (seen.events.size() == 4) CHECK(seen.events[2].digest == seen.events[0].digest && seen.events[3].digest == seen.events[1].digest);
+    // the cache's build: "BUILD STAGE/KERNEL", the layout last
+    const char* build = hakios_metal_cache_build();
+    const char* layout = strrchr(build, ' ');
+    CHECK(layout != nullptr && strchr(layout, '/') != nullptr);
+    hakios_metal_set_stage_observer(nullptr, nullptr);
+    hakios_metal_program* third = hakios_metal_program_new_bitcode(vsBc.data(), vsBc.size(), fsBc.data(), fsBc.size(), 70);
+    CHECK_EQ(seen.events.size(), size_t(4));
+    hakios_metal_program_free(third);
+    hakios_metal_program_free(again);
+    hakios_metal_program_free(p);
+}
+
+// hakios_metal_cb_damage_stats after a resolve, and the commit copy it describes (metal-ca-perf task 5.3): a draw
+// scissored to 32x16 at (40,20) into a 256x128 target with Load counts its area widened to 16 pixels by 4 rows (48x16 of
+// 32768 pixels: 23 thousandths) and copies that rectangle, a Clear the whole target, a 16x16 copy into it at (8,8) the
+// 32x16 at (0,8) around it (15 thousandths). With the damage copy off (metal_damage=0) or the target marked whole the
+// copy is whole and the count the same; a mark is used up by the copy it makes whole.
+TEST(c_api_damage_stats_measure_without_changing_the_copy) {
+    constexpr unsigned W = 256, H = 128, kSurfaceId = 3;
+    hakios_metal_device* d = hakios_metal_open_fake_chip(0x06050002);
+    CHECK(d != nullptr);
+    hakios_metal_fake_add_surface(d, kSurfaceId, W, H, W * 4, 0x42475241u);
+    std::vector<uint8_t> bytes(size_t(W) * 4 * H, 0x11);
+    hakios_metal_fake_write_surface(d, kSurfaceId, 0, bytes.data(), bytes.size());
+    int targeted = -1;
+    hakios_metal_texture* t =
+        hakios_metal_texture_new_iosurface_target(d, kSurfaceId, 80, W, H, HAKIOS_METAL_TEXTURE_USAGE_RENDER_TARGET | 1, 1, &targeted);
+    CHECK(t != nullptr && targeted == 1);
+    hakios_metal_texture* small = hakios_metal_texture_new(d, 2, 80, 16, 16, 1);
+    hakios_metal_queue* q = hakios_metal_queue_new(d);
+    uint8_t one[4];
+    hakios_metal_texture_read(t, 0, 0, 1, 1, one, 4);   // (the target's fill done)
+    std::vector<hakios_metal_fake_write> w(64);
+    auto lastCopyIs = [&](unsigned x0, unsigned y0, unsigned x1, unsigned y1) {
+        const int n = hakios_metal_fake_writes(d, w.data(), unsigned(w.size()), 1);
+        return n > 0 && w[size_t(n) - 1].x0 == x0 && w[size_t(n) - 1].y0 == y0 && w[size_t(n) - 1].x1 == x1 && w[size_t(n) - 1].y1 == y1;
+    };
+    auto lastCopyWhole = [&]() { return lastCopyIs(0, 0, W - 1, H - 1); };
+    unsigned copies = 99, smallest = 99, largest = 99;
+    uint64_t whole = 0, damage = 0;
+    // a Clear: the whole target
+    hakios_metal_fake_writes(d, nullptr, 0, 1);
+    hakios_metal_cb* cb = hakios_metal_cb_new(q);
+    hakios_metal_render_pass pass{};
+    pass.color0 = t;
+    pass.load_action = 2;
+    pass.store_action = 1;
+    CHECK_EQ(hakios_metal_cb_clear(cb, &pass), 0);
+    CHECK_EQ(hakios_metal_cb_resolve_surface_targets(cb), 1);
+    hakios_metal_cb_damage_stats(cb, &copies, &whole, &damage, &smallest, &largest);
+    CHECK(copies == 1 && whole == uint64_t(W) * H && damage == whole && smallest == 1000 && largest == 1000);
+    hakios_metal_cb_commit(cb, nullptr, nullptr);
+    hakios_metal_cb_wait(cb);
+    CHECK(lastCopyWhole());
+    hakios_metal_cb_free(cb);
+    // a copy into the target: its destination aligned, copied so; then marked whole (once), then with the damage copy off
+    for (int round = 0; round < 4; round++) {
+        if (round == 1) hakios_metal_surface_target_mark_whole(t);
+        if (round == 3) hakios_metal_surface_target_set_damage(d, 0);
+        cb = hakios_metal_cb_new(q);
+        CHECK_EQ(hakios_metal_cb_blit(cb, small, 0, 0, 0, 16, 16, t, 0, 8, 8, 16, 16, 0), 0);
+        CHECK_EQ(hakios_metal_cb_resolve_surface_targets(cb), 1);
+        hakios_metal_cb_damage_stats(cb, &copies, &whole, &damage, &smallest, &largest);
+        CHECK(copies == 1 && whole == uint64_t(W) * H && damage == 32 * 16 && smallest == 15 && largest == 15);
+        hakios_metal_cb_commit(cb, nullptr, nullptr);
+        hakios_metal_cb_wait(cb);
+        CHECK(round == 1 || round == 3 ? lastCopyWhole() : lastCopyIs(0, 8, 31, 23));
+        hakios_metal_cb_free(cb);
+    }
+    hakios_metal_surface_target_set_damage(d, 1);
+    // nothing written: nothing copied, nothing counted
+    cb = hakios_metal_cb_new(q);
+    CHECK_EQ(hakios_metal_cb_resolve_surface_targets(cb), 0);
+    hakios_metal_cb_damage_stats(cb, &copies, &whole, &damage, nullptr, nullptr);
+    CHECK(copies == 0 && whole == 0 && damage == 0);
+    hakios_metal_cb_free(cb);
+    // a scissored draw with Load (the compiler's)
+    std::vector<uint8_t> vsBc = readFile("out/host/kernels/tri_flat_vs.bc"), fsBc = readFile("out/host/kernels/tri_flat_fs.bc");
+    if (hakios_metal_has_compiler() && !vsBc.empty() && !fsBc.empty()) {
+        hakios_metal_program* p = hakios_metal_program_new_bitcode(vsBc.data(), vsBc.size(), fsBc.data(), fsBc.size(), 80);
+        CHECK(p != nullptr);
+        hakios_metal_scissor sc = {40, 20, 32, 16};
+        pass.load_action = 1;
+        cb = hakios_metal_cb_new(q);
+        CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, &sc, 3, 0, 3, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
+        CHECK_EQ(hakios_metal_cb_resolve_surface_targets(cb), 1);
+        hakios_metal_cb_damage_stats(cb, &copies, &whole, &damage, &smallest, &largest);
+        CHECK(copies == 1 && whole == uint64_t(W) * H);
+        CHECK_EQ(damage, uint64_t(48) * 16);
+        CHECK(smallest == 23 && largest == 23);
+        hakios_metal_cb_commit(cb, nullptr, nullptr);
+        hakios_metal_cb_wait(cb);
+        CHECK(hakios_metal_cb_status(cb) == HAKIOS_METAL_COMPLETED);
+        CHECK(lastCopyIs(32, 20, 79, 35));
+        hakios_metal_cb_free(cb);
+        hakios_metal_program_free(p);
+    } else {
+        std::printf("       (no compiler in this build: the damage of a draw did not run)\n");
+    }
+    hakios_metal_queue_free(q);
+    hakios_metal_texture_free(small);
+    hakios_metal_texture_free(t);
     hakios_metal_close(d);
 }

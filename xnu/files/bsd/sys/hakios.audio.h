@@ -72,6 +72,15 @@ void hakios_speaker_stop(void);        /* faded out, muted, powered down, in And
 void hakios_speaker_quiesce(void);     /* powered down at once, without sleeping: on a panic's way out */
 /* the amplifiers' own temperature and battery voltage read (every second while they play): the reduction they call for */
 uint32_t hakios_speaker_monitor(bool tell);
+/* the POCO F4's two TFA9874s (devices/munch/drivers/audio/hakios.munch_amp.c), the same way; its volume is put on the samples */
+bool hakios_munch_amp_prepare(const uint8_t *cnt, uint64_t size);    /* /fw/tfa98xx.cnt: set up, in powerdown */
+void hakios_munch_amp_slots(uint32_t bits);
+bool hakios_munch_amp_start(void);     /* operating, the samples silent: only while the MI2S clock runs */
+bool hakios_munch_amp_volume(uint32_t below, uint32_t step_ms);
+bool hakios_munch_amp_healthy(void);
+void hakios_munch_amp_scale(int16_t *frames, uint32_t count);  /* stereo frames on their way to the DSP, in place */
+void hakios_munch_amp_stop(void);
+void hakios_munch_amp_quiesce(void);
 
 /*
  * The speakers' guard (drivers/audio/hakios.guard.c): what the samples go through in the feeder on their

@@ -1,0 +1,5 @@
+# devices/munch/drivers/modem/conf: the POCO F4's external modem, a Snapdragon X55 on PCIe 2 (docs/porting/drivers.md).
+
+driver MUNCH_MODEM
+	file    bsd/dev/hakios.munch_modem.c
+	help    the POCO F4's Snapdragon X55 on PCIe 2 over MHI (munch_modem=1: a look at its GPIOs, power and link)

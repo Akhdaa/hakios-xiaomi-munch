@@ -1,0 +1,7 @@
+driver MUNCH_BT
+	file    bsd/dev/hakios.munch_bt.c
+	file    bsd/dev/hakios.munch_bt_channel.c
+	file    bsd/dev/hakios.munch_bt_host.c
+	file    iokit/Kernel/hakios.munch_bt_service.cpp iokitcpp
+	help    QCA6390 Bluetooth UART (munch_bt=1 queries the ROM, =2 scans, =3 connects to iOS)
+	requires MUNCH_WIFI

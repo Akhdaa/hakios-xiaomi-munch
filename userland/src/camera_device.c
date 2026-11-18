@@ -443,6 +443,7 @@ struct stream {
 	CFDictionaryRef colour_info;    /* from VideoOutputsColorInfo */
 	CFDictionaryRef metadata;       /* the last frame's (frame_metadata()), for a buffer that has none of its own */
 	pthread_mutex_t metadata_lock;  /* (not `lock': AddAttachmentsToSampleBuffer may come while a frame is given out) */
+	int32_t         exposure_bias;  /* linear Q8 exposure multiplier, 256 = neutral */
 	unsigned        stills_wanted;  /* photographs asked for by StillImageCaptureNow, not yet given */
 	int             format_index;
 	double          min_fps, max_fps;
@@ -504,7 +505,11 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 		value = number_f(s->max_fps);
 	} else if (key_is(key, "Clock")) {
 		value = CFRetain(CMClockGetHostTimeClock());
-	} else if (key_is(key, "TorchLevel") || key_is(key, "ExposureBias")) {
+	} else if (key_is(key, "ExposureBias")) {
+		pthread_mutex_lock(&s->lock);
+		value = number_i(s->exposure_bias);
+		pthread_mutex_unlock(&s->lock);
+	} else if (key_is(key, "TorchLevel")) {
 		value = number_f(0);
 	} else if (key_is(key, "VideoOutputConfigurations") || key_is(key, "VideoOutputsEnabled")) {
 		/*
@@ -650,6 +655,20 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		}
 		s->format_index = (int)i;
 		say("stream: format %lld", (long long)i);
+		return 0;
+	}
+	if (key_is(key, "ExposureBias")) {
+		int32_t bias;
+
+		if (value == NULL || CFGetTypeID(value) != CFNumberGetTypeID() ||
+		    !CFNumberGetValue(value, kCFNumberSInt32Type, &bias)) {
+			return ERR_PARAM;
+		}
+		bias = bias < 32 ? 32 : bias > 2048 ? 2048 : bias;
+		pthread_mutex_lock(&s->lock);
+		s->exposure_bias = bias;
+		pthread_mutex_unlock(&s->lock);
+		say("stream: exposure bias %.2f EV (Q8 %d)\n", log2((double)bias / 256), bias);
 		return 0;
 	}
 	if (key_is(key, "ZoomFactor")) {
@@ -1100,6 +1119,7 @@ enum { AF_WATCH, AF_STEADY, AF_CLIMB, AF_SWEEP, AF_FINE_SEARCH, AF_SETTLE };
 
 struct af {
 	int             state;
+	int             minimum, maximum;
 	uint32_t        at, target;     /* where the lens was told to go; where it is going a step at a time */
 	unsigned        wait;           /* frames before the next measurement */
 	int             way;            /* +1 nearer, -1 further */
@@ -1121,7 +1141,7 @@ af_go(int device, struct af *af, uint32_t target)
 {
 	struct hakios_camera_command c = { .command = HAKIOS_CAMERA_FOCUS };
 
-	af->target = target < AF_NEAR ? AF_NEAR : target > AF_FAR ? AF_FAR : target;
+	af->target = target < (uint32_t)af->minimum ? (uint32_t)af->minimum : target > (uint32_t)af->maximum ? (uint32_t)af->maximum : target;
 	c.a = af->at < af->target ? (af->target - af->at > AF_STEP ? af->at + AF_STEP : af->target) :
 	    (af->at - af->target > AF_STEP ? af->at - AF_STEP : af->target);
 	af->at = c.a;
@@ -1147,6 +1167,9 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 		return;
 	}
 	if (af->at == 0 && af->target == 0) {
+		bool has_range = f->focus_min < f->focus_max && f->focus_max <= 1023;
+		af->minimum = has_range ? (int)f->focus_min : AF_NEAR;
+		af->maximum = has_range ? (int)f->focus_max : AF_FAR;
 		af->at = af->target = f->focus;         /* (where the kernel put it) */
 	}
 	if (af->wait > 0) {
@@ -1200,14 +1223,14 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 			af->best_sharpness = -1;
 			af->worse = 0;
 			af->steps = 0;
-			af->way = af->at - AF_NEAR < AF_FAR - af->at ? 1 : -1;
-			af_go(device, af, af->way > 0 ? AF_NEAR : AF_FAR);     /* (walked there a step at a time) */
+			af->way = af->at - af->minimum < af->maximum - af->at ? 1 : -1;
+			af_go(device, af, af->way > 0 ? af->minimum : af->maximum);     /* (walked there a step at a time) */
 			return;
 		}
 		af->state = AF_CLIMB;
 		af->best = af->start = af->at;
 		af->best_sharpness = sharpness;
-		af->way = af->at + AF_STEP > AF_FAR ? -1 : 1;
+		af->way = (int)af->at + AF_STEP > af->maximum ? -1 : 1;
 		af->turned = false;
 		af->worse = 0;
 		af->steps = 0;
@@ -1215,7 +1238,7 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 		return;
 	case AF_CLIMB: {
 		int next = (int)af->at + af->way * AF_STEP;
-		bool end = next < AF_NEAR || next > AF_FAR;
+		bool end = next < af->minimum || next > af->maximum;
 
 		if (sharpness > af->best_sharpness * 1.02f) {
 			af->best = af->at;
@@ -1229,7 +1252,7 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 			return;
 		}
 		next = (int)af->best - af->way * AF_STEP;
-		if (!af->turned && af->best == af->start && next >= AF_NEAR && next <= AF_FAR) {
+		if (!af->turned && af->best == af->start && next >= af->minimum && next <= af->maximum) {
 			/* not sharper that way at all: the other way, from where it started */
 			af->turned = true;
 			af->way = -af->way;
@@ -1238,8 +1261,8 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 			return;
 		}
 		af->state = AF_FINE_SEARCH;
-		af->fine_to = af->best + 2 * AF_FINE > AF_FAR ? AF_FAR : af->best + 2 * AF_FINE;
-		af_go(device, af, af->best > 2 * AF_FINE + AF_NEAR ? af->best - 2 * AF_FINE : AF_NEAR);
+		af->fine_to = (int)af->best + 2 * AF_FINE > af->maximum ? af->maximum : af->best + 2 * AF_FINE;
+		af_go(device, af, (int)af->best > 2 * AF_FINE + af->minimum ? af->best - 2 * AF_FINE : af->minimum);
 		return;
 	}
 	case AF_SWEEP:
@@ -1251,13 +1274,13 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 		} else if (sharpness < af->best_sharpness * 0.85f) {
 			af->worse++;
 		}
-		if (af->worse < 2 && (int)af->at + af->way * AF_STEP >= AF_NEAR && (int)af->at + af->way * AF_STEP <= AF_FAR) {
+		if (af->worse < 2 && (int)af->at + af->way * AF_STEP >= af->minimum && (int)af->at + af->way * AF_STEP <= af->maximum) {
 			af_go(device, af, (uint32_t)((int)af->at + af->way * AF_STEP));
 			return;
 		}
 		af->state = AF_FINE_SEARCH;
-		af->fine_to = af->best + 2 * AF_FINE > AF_FAR ? AF_FAR : af->best + 2 * AF_FINE;
-		af_go(device, af, af->best > 2 * AF_FINE + AF_NEAR ? af->best - 2 * AF_FINE : AF_NEAR);
+		af->fine_to = (int)af->best + 2 * AF_FINE > af->maximum ? af->maximum : af->best + 2 * AF_FINE;
+		af_go(device, af, (int)af->best > 2 * AF_FINE + af->minimum ? af->best - 2 * AF_FINE : af->minimum);
 		return;
 	case AF_FINE_SEARCH:
 		if (sharpness > af->best_sharpness) {
@@ -1323,6 +1346,11 @@ worker(void *context)
 		say("no %s (%s): no frames", HAKIOS_CAMERA_DEVICE, strerror(errno));
 		return NULL;
 	}
+	uint64_t opened_at = mach_absolute_time();
+	struct hakios_camera_command select = { .command = HAKIOS_CAMERA_SENSOR, .a = s->camera->sensor, .b = ~0u };
+
+	/* Request the lens before the first read can start the previously selected sensor. */
+	(void)write(device, &select, sizeof(select));
 	isp_init(&isp);
 	while (s->running && failures < 5) {
 		ssize_t n;
@@ -1350,7 +1378,15 @@ worker(void *context)
 			}
 			bytes = sizeof(head) + (size_t)head.stride * head.height;
 			buffer = malloc(bytes);
-			say("frames of %ux%u from the kernel (the %s)", head.width, head.height, s->camera->name);
+			if (buffer == NULL) {
+				say("no memory for a frame from the %s", s->camera->name);
+				break;
+			}
+			mach_timebase_info_data_t timebase;
+			mach_timebase_info(&timebase);
+			double first_ms = (double)(mach_absolute_time() - opened_at) * timebase.numer / timebase.denom / 1e6;
+			say("frames of %ux%u from the kernel (the %s), first frame after %.0f ms",
+			    head.width, head.height, s->camera->name, first_ms);
 			continue;
 		}
 		n = read(device, buffer, bytes);
@@ -1381,10 +1417,15 @@ worker(void *context)
 		lux = lux < 0 ? lux_index(&isp, f) : lux * 0.9f + lux_index(&isp, f) * 0.1f;
 		cct = cct < 0 ? colour_temperature(&isp) : cct * 0.97f + colour_temperature(&isp) * 0.03f;
 		isp_tune(&isp, lux, cct);
+		pthread_mutex_lock(&s->lock);
+		isp.exposure_bias = log2f((float)s->exposure_bias / 256);
+		pthread_mutex_unlock(&s->lock);
 		isp.zoom = s->zoom;
 		isp.turned = s->camera->turned;
 		if (isp_ae(&isp, f, &st, &c)) {
-			(void)write(device, &c, sizeof(c));
+			if (write(device, &c, sizeof(c)) != (ssize_t)sizeof(c)) {
+				isp.asked = false;
+			}
 		}
 		if (s->af_now) {
 			s->af_now = false;
@@ -1646,6 +1687,7 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	s->torch = -1;
 	s->min_fps = 2;
 	s->zoom = 1;
+	s->exposure_bias = 256;
 	s->af_window[0] = s->af_window[1] = 0.3f;
 	s->af_window[2] = s->af_window[3] = 0.7f;
 	s->max_fps = 30;

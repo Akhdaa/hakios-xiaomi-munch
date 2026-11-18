@@ -10,6 +10,7 @@
  *   - exits boot services, turns the MMU off and jumps to the kernel entry
  */
 #include "efi.h"
+#include "filemap.h"
 #include "identity.h"         /* who Darwin shall think we are: from the iPhone's own device tree (mkidentity.py) */
 
 /* ------------------------------------------------------------------------ */
@@ -261,6 +262,12 @@ clean_dcache(uint64_t start, uint64_t end)
 /* ------------------------------------------------------------------------ */
 /* Log persistence: raw write to a GPT partition (phone only)               */
 
+/*
+ * The platform's log_partition, once it is known: a phone whose storage is not ours to write
+ * (munch) never gets its "logdump" partition looked up, let alone written.
+ */
+static int log_partition_allowed;
+
 static efi_block_io *
 find_log_partition(void)
 {
@@ -270,6 +277,9 @@ find_log_partition(void)
 	efi_handle *handles;
 	uint64_t count;
 
+	if (!log_partition_allowed) {
+		return NULL;
+	}
 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
 		return NULL;
 	}
@@ -554,8 +564,10 @@ struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
 	uint64_t gic_dist, gic_redist;   /* GICv3 */
+	uint64_t restart_reason;         /* the word in the SoC's IMEM the boot loader reads after a reset (0: not known) */
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
+	int log_partition;               /* the log may be written into the "logdump" partition (see write_logs) */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
 	int cores;                       /* at most this many processor cores, numbered from 0 ... */
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
@@ -578,13 +590,29 @@ static const struct platform platform_qemu_virt = {
 static const struct platform platform_redwood = {
 	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
 	.name = "redwood", .io_base = 0x00400000, .io_size = 0x3FC00000,
-	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_partition = 1, .log_other_cpu = 1,
 	.cores = 8, .core_shift = 8,
 	/*
 	 * Cores 0-3 are Cortex-A55s (1.8 GHz at most), 4-7 Cortex-A78s (2.4 GHz): a big one is about
 	 * 2.5 times as fast. The kernel uses the small ones only when the big ones are all busy
 	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
 	 */
+	.small_cores = 0x0f,
+};
+
+static const struct platform platform_munch = {
+	/* POCO F4, SM8250-AC: the GIC and the peripheral window are where redwood has them */
+	.name = "munch", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0,
+	/*
+	 * Nothing is written to this phone's storage: the log stays in RAM and comes back over USB
+	 * (xl log). Its notes while a kernel starts on another core still go on the screen.
+	 */
+	.log_partition = 0, .log_other_cpu = 1,
+	/* dt qcom,msm-imem@146bf000, restart_reason@65c: what Android's msm-poweroff writes for "reboot bootloader" */
+	.restart_reason = 0x146BF65C,
+	.cores = 8, .core_shift = 8,
+	/* cores 0-3 Cortex-A55s, 4-6 Cortex-A77s, 7 the prime A77 */
 	.small_cores = 0x0f,
 };
 
@@ -599,6 +627,7 @@ reboot(void)
 	for (;;) {
 	}
 }
+
 
 /*
  * Return-from-kernel support.
@@ -1619,6 +1648,7 @@ static struct loader_block block_shared __attribute__((aligned(0x2000)));
 static void block_io2_probe(efi_handle h, efi_block_io *bio);
 static int block_probe_requested;       /* ufs_probe=1: block_io2_probe() at block_start() */
 static efi_block_io *block_bios[BLOCK_MAX_PARTS];
+static const struct filemap *storage_map;
 static int block_enabled;
 static int block_write_requested;       /* ufs_write=1 on the command line */
 static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
@@ -2124,7 +2154,93 @@ block_io2_probe(efi_handle h, efi_block_io *bio)
 	    t_sync * 1000000 / freq, t_issue * 1000000 / freq, returned_done, t_all * 1000000 / freq, pending);
 }
 
-/* one request, if there is one: called from core 0's watch loop while the kernel runs */
+static int
+block_start_file(const struct filemap *map, uint32_t size)
+{
+	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	efi_handle *handles;
+	uint64_t count;
+	efi_block_io *source = NULL;
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+		return 0;
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		efi_partition_info *info;
+		efi_block_io *bio;
+		char name[40];
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2 ||
+		    EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
+			continue;
+		}
+		ufs_name(info, name, sizeof(name));
+		if (!str_eq(name, "userdata") || !bio->media->logical || bio->media->block_size != FILEMAP_BLOCK_SIZE ||
+		    bio->media->io_align > FILEMAP_BLOCK_SIZE ||
+		    !filemap_valid(map, size, bio->media->last_block + 1)) {
+			continue;
+		}
+		if (source != NULL) {
+			source = NULL;
+			break;
+		}
+		source = bio;
+	}
+	BS->free_pool(handles);
+	if (source == NULL) {
+		return 0;
+	}
+	memset(&block_shared, 0, sizeof(block_shared));
+	block_bios[0] = source;
+	block_shared.parts = 1;
+	memcpy(block_shared.part[0].name, "system_image", sizeof("system_image"));
+	block_shared.part[0].blocks = map->image_blocks;
+	block_shared.part[0].block_size = FILEMAP_BLOCK_SIZE;
+	block_shared.part[0].unit = 0xffff;
+	block_shared.part[0].lun = 0xff;
+	block_shared.magic = BLOCK_MAGIC;
+	block_shared.version = BLOCK_VERSION;
+	block_shared.size = sizeof(block_shared);
+	block_shared.buffer_size = BLOCK_BUFFER_SIZE;
+	block_shared.buffer_pa = (uint64_t)(uintptr_t)block_buffer;
+	storage_map = map;
+	clean_dcache((uint64_t)(uintptr_t)&block_shared, (uint64_t)(uintptr_t)&block_shared + sizeof(block_shared));
+	block_enabled = 1;
+	print("ufs: read-only system image, %d blocks\n", map->image_blocks);
+	return 1;
+}
+
+static efi_status
+block_read_file(efi_block_io *bio, uint64_t lba, uint64_t count)
+{
+	const uint32_t *checksums = (const uint32_t *)(storage_map->extents + storage_map->extent_count);
+	uint8_t *out = block_buffer;
+	uint64_t total = count * FILEMAP_BLOCK_SIZE;
+	while (count != 0) {
+		uint64_t physical;
+		uint64_t run = filemap_run(storage_map, lba, count, &physical);
+		uint64_t bytes = run * FILEMAP_BLOCK_SIZE;
+		if (run == 0 || EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, physical, bytes, out))) {
+			goto failed;
+		}
+		flush_dcache((uint64_t)(uintptr_t)out, (uint64_t)(uintptr_t)out + bytes);
+		for (uint64_t i = 0; i < run; i++) {
+			if (ufs_crc32(out + i * FILEMAP_BLOCK_SIZE, FILEMAP_BLOCK_SIZE) != checksums[lba + i]) {
+				print("ufs: system image checksum mismatch at block %d\n", lba + i);
+				goto failed;
+			}
+		}
+		out += bytes;
+		lba += run;
+		count -= run;
+	}
+	return 0;
+failed:
+	memset(block_buffer, 0, total);
+	clean_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + total);
+	return 0x800000000000000aULL;
+}
+
+/* Serve one request from core 0 while the kernel runs. */
 static void
 block_poll(void)
 {
@@ -2157,6 +2273,8 @@ block_poll(void)
 			}
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
+		} else if (storage_map != NULL) {
+			s = op == BLOCK_OP_READ ? block_read_file(bio, lba, count) : 0x800000000000000fULL;
 		} else if (op == BLOCK_OP_WRITE || op == BLOCK_OP_WRITE_FAST || op == BLOCK_OP_FLUSH) {
 			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
 				/* not darwin, or not past what the build writes from the computer: never */
@@ -2555,6 +2673,8 @@ install_exception_hook(void)
 /* Payload                                                                  */
 
 struct payload_info {
+	const struct filemap *filemap;
+	uint32_t filemap_size;
 	const uint8_t *kernel;
 	uint32_t kernel_size;           /* the kernel entry's size: what its Mach-O header may point into */
 	const uint8_t *ramdisk;
@@ -2625,7 +2745,13 @@ parse_payload(struct payload_info *pi, int verbose)
 			print("payload entry is larger than the payload (size %x): not used\n", (uint64_t)e->size);
 			return 0;
 		}
-		if (str_eq(e->name, "ramdisk")) {
+		if (str_eq(e->name, "filemap")) {
+			if (pi->filemap != NULL || e->size < sizeof(struct filemap)) {
+				return 0;
+			}
+			pi->filemap = (const struct filemap *)text;
+			pi->filemap_size = e->size;
+		} else if (str_eq(e->name, "ramdisk")) {
 			pi->ramdisk = p + sizeof(*e);             /* becomes /dev/md0, the root device */
 			pi->ramdisk_size = e->size;
 		} else if (str_eq(e->name, "kernel")) {
@@ -2714,8 +2840,20 @@ static char last_result[64] = "idle";
 static void
 set_result(const char *what, uint64_t a, uint64_t b)
 {
+	/*
+	 * Formatted in the log's buffer, at the end of what it holds -- but never past the room the
+	 * result needs: a log that is full (a run that returned leaves it so) took no character, and
+	 * the result came out empty. The host reads an empty result as a run that is over, stops
+	 * following it, and the second kernel of a session looked as if it died at once.
+	 */
+	char keep[sizeof(last_result)];
 	uint32_t saved = log_len;
 	uint32_t start = log_len;
+	if (start > sizeof(log_buf) - sizeof(last_result) - 1) {
+		start = sizeof(log_buf) - sizeof(last_result) - 1;
+	}
+	memcpy(keep, log_buf + start, sizeof(keep));
+	log_len = start;
 	print("%s %d %x", what, a, b);
 	uint32_t n = log_len - start;
 	if (n > sizeof(last_result) - 1) {
@@ -2723,6 +2861,7 @@ set_result(const char *what, uint64_t a, uint64_t b)
 	}
 	memcpy(last_result, log_buf + start, n);
 	last_result[n] = 0;
+	memcpy(log_buf + start, keep, sizeof(keep));
 	log_len = saved;
 }
 
@@ -3012,6 +3151,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	hc_requested = 0;
 	block_probe_requested = 0;
 	block_enabled = 0;
+	storage_map = NULL;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
@@ -3020,6 +3160,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[9] == 0 || c[9] == ' ');
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
+		/* (the POCO F4's: devices/munch/drivers/camera/hakios.munch_torch.c, from 3 on the light is Darwin's) */
+		torch_requested |= starts_with(c, "munch_torch=") && (c == pi.cmdline || c[-1] == ' ') && c[12] >= '3' && c[12] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
 		if (starts_with(c, "ufs=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '1' && c[4] <= '2' &&
@@ -3035,7 +3177,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (battery_requested) {
 		charger_start();
 	}
-	if (ufs_requested >= 2) {
+	if (pi.filemap != NULL) {
+		if (PLAT != &platform_munch || block_write_requested || hc_requested || ufs_requested ||
+		    !block_start_file(pi.filemap, pi.filemap_size)) {
+			print("ufs: system image mapping refused\n");
+			return 0;
+		}
+	} else if (ufs_requested >= 2) {
 		hc_init();              /* (ufs_native=: UEFI's transfer list kept, before anything reads) */
 	}
 	if (ufs_requested >= 1) {
@@ -3146,6 +3294,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			ba->commandLine[n++] = *c;
 		}
 	}
+	/* which device this is: the kernel's drivers of one phone's hardware look (bsd/dev/redwood_input.c) */
+	for (const char *c = "hw="; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+		ba->commandLine[n++] = *c;
+	}
+	for (const char *c = PLAT->name; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+		ba->commandLine[n++] = *c;
+	}
+	if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
 	if (block_enabled) {
 		static const char prefix[] = "ufs_shared_pa=0x";
 		static const char hex[] = "0123456789abcdef";
@@ -3963,6 +4119,18 @@ fb_command(char *cmd)
 				memset((void *)(uintptr_t)SCREEN.base, 0, (size_t)SCREEN.stride * SCREEN.height);
 			}
 			fb_reply("OKAY", "");
+		} else if (str_eq(cmd, "oem storagecheck")) {
+			struct payload_info pi;
+			int ok = PLAT == &platform_munch && parse_payload(&pi, 0) && pi.filemap != NULL &&
+			    block_start_file(pi.filemap, pi.filemap_size);
+			if (ok) {
+				ok = !EFI_ERROR(block_read_file(block_bios[0], 0, 1)) &&
+				    memcmp(block_buffer + 32, "NXSB", 4) == 0 &&
+				    !EFI_ERROR(block_read_file(block_bios[0], storage_map->image_blocks - 1, 1));
+			}
+			block_enabled = 0;
+			storage_map = NULL;
+			fb_reply(ok ? "OKAY" : "FAIL", ok ? "APFS header and last block verified" : "storage mapping or APFS read failed");
 		} else if (starts_with(cmd, "oem run") || starts_with(cmd, "oem selftest")) {
 			int selftest = starts_with(cmd, "oem selftest");
 			const char *arg = cmd + 7;
@@ -3995,6 +4163,19 @@ fb_command(char *cmd)
 				compose_logs(NULL, 0);
 			}
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem reboot-bootloader") || starts_with(cmd, "reboot-bootloader")) {
+			/*
+			 * Into the phone's own bootloader (fastboot) instead of Android, as Android's `reboot bootloader` does it: the
+			 * magic word in the SoC's IMEM, on-chip memory that a reset keeps and nothing else. Nothing is written to a PMIC
+			 * or to storage. A phone whose word is not known is reset as by "reboot".
+			 */
+			fb_reply("OKAY", "");
+			BS->stall(200000);
+			if (PLAT->restart_reason != 0) {
+				*(volatile uint32_t *)(uintptr_t)PLAT->restart_reason = 0x77665500;
+				__asm__ volatile("dsb sy" ::: "memory");
+			}
+			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
 			fb_reply("OKAY", "");
 			BS->stall(200000);
@@ -4345,12 +4526,18 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
+		} else if (SCREEN.base == 0x9C000000ULL) {
+			PLAT = &platform_munch;     /* 1080 x 2400, the "Display Reserved" region of its UEFI */
 		} else {
 			ramfb_phone_screen();
 		}
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	log_partition_allowed = PLAT->log_partition;
+	if (!log_partition_allowed && PLAT != &platform_qemu_virt) {
+		print("log: kept in RAM only (xl log); nothing is written to storage\n");
+	}
 
 	install_exception_hook();
 	wdt_arm();

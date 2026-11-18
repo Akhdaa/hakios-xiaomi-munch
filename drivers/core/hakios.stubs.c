@@ -64,8 +64,35 @@ int hakios_battery_temperature(void) { return -273; }      /* "not known", as th
 void hakios_battery_report(__unused const struct hakios_battery_state *state) {}
 #endif
 
+/* the POCO F4's amplifiers (devices/munch/drivers/audio), which hakios.sound.c plays on that phone */
+#ifndef HAKIOS_MUNCH_AMP
+bool hakios_munch_amp_prepare(__unused const uint8_t *cnt, __unused uint64_t size) { return false; }
+void hakios_munch_amp_slots(__unused uint32_t bits) {}
+bool hakios_munch_amp_start(void) { return false; }
+bool hakios_munch_amp_volume(__unused uint32_t below, __unused uint32_t step_ms) { return false; }
+bool hakios_munch_amp_healthy(void) { return false; }
+void hakios_munch_amp_scale(__unused int16_t *frames, __unused uint32_t count) {}
+void hakios_munch_amp_stop(void) {}
+void hakios_munch_amp_quiesce(void) {}
+#endif
+
+/* the POCO F4's QCA6390 on PCIe and MHI (devices/munch/drivers/wifi), which hakios.wifi.c and hakios.lx.c run on that phone */
+#ifndef HAKIOS_MUNCH_WIFI
+int hakios_munch_wifi_up(void) { return ENODEV; }
+void hakios_munch_wifi_down(void) {}
+void hakios_munch_wifi_quiesce(void) {}
+void *hakios_munch_wifi_registers(unsigned long *size) { if (size != NULL) { *size = 0; } return NULL; }
+int hakios_munch_qrtr_send(__unused const void *data, __unused uint32_t length) { return ENODEV; }
+#endif
+
+/* an SM8250 phone's charger, read by the buttons' driver for the POCO F4's fuel gauge */
+#ifndef HAKIOS_BUTTONS
+bool hakios_munch_charger(__unused uint8_t *input_status, __unused uint8_t *port_kind, __unused uint8_t *charger_state) { return false; }
+#endif
+
 #ifndef HAKIOS_CPUFREQ
 void hakios_cpufreq_init(void) {}
+void hakios_cpufreq_hot(bool hot) { (void)hot; }      /* (the thermal driver's slowing down: nothing to slow) */
 void hakios_ddr_quiesce(void) {}
 #endif
 
@@ -74,6 +101,7 @@ void hakios_adreno_init(void) {}
 void hakios_adreno_quiesce(void) {}
 void hakios_adreno_stop(void) {}
 void hakios_adreno_minute(void) {}
+void hakios_adreno_hot(bool hot) { (void)hot; }
 #endif
 
 #ifndef HAKIOS_WIFI

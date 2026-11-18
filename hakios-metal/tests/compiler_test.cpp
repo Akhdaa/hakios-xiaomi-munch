@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <string>
 #include <vector>
 
 #include "hakios-metal/compiler.hpp"
@@ -39,7 +41,13 @@
 #include "fixtures/tri_upos_vs_air.hpp"
 #include "fixtures/tri_dpos_vs_air.hpp"
 #include "fixtures/tri_flat_vs_air.hpp"
+#include "fixtures/var_a_vs_air.hpp"
+#include "fixtures/var_ab_vs_air.hpp"
+#include "fixtures/var_ac_fs_air.hpp"
+#include "fixtures/var_b_fs_air.hpp"
+#include "fixtures/var_ba_fs_air.hpp"
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/render.hpp"
 #include "test.hpp"
 
 using namespace hakios::metal;
@@ -773,9 +781,8 @@ TEST(compiler_matches_the_stage_fixtures) {
         CHECK_EQ(s->stage.k.numUbos, 0u);
         CHECK_EQ(s->stage.k.numTextureSlots, 0u);
     }
-    // the varyings' names: the VS side carries the mangled name the front end recorded, VAR0 first; the FS side is
-    // left empty because air_shader_info only has air.arg_name ("color") for it, which cannot match the VS's string
-    // (src/compiler.cpp says so; air-vs-fs.md's varying-names gap)
+    // the varyings' names: the VS side carries the mangled name the front end recorded, VAR0 first; on this (default)
+    // chip the FS side is left empty and the link is by slot (3.8); only an A650 stage records the FS's names
     if (colorVs != nullptr) {
         CHECK_EQ(colorVs->varyingNames.size(), size_t(1));
         if (!colorVs->varyingNames.empty()) CHECK(colorVs->varyingNames[0] == "generated(5colorDv4_f)");
@@ -783,6 +790,31 @@ TEST(compiler_matches_the_stage_fixtures) {
     if (flatVs != nullptr) CHECK(flatVs->varyingNames.empty());
     if (colorFs != nullptr) CHECK(colorFs->varyingNames.empty());
     if (flatFs != nullptr) CHECK(flatFs->varyingNames.empty());
+}
+
+// A stage carries the chip it was compiled for; an A650 fragment stage records its inputs' link names (the string
+// after air.fragment_input, the same one the VS side records), and the default chip's stays empty
+TEST(compiler_records_the_chip_and_a650_fragment_link_names) {
+    if (!hasCompiler()) return;
+    std::vector<uint8_t> vs = bitcodeOf("tri_color_vs"), fs = bitcodeOf("tri_color_fs"), flat = bitcodeOf("tri_flat_fs");
+    CHECK(!vs.empty() && !fs.empty() && !flat.empty());
+    std::string why;
+    std::unique_ptr<CompiledStage> fsA650 = compileStageForChip(fs.data(), fs.size(), a6xx::kA650ChipId, &why);
+    std::unique_ptr<CompiledStage> vsA650 = compileStageForChip(vs.data(), vs.size(), a6xx::kA650ChipId, &why);
+    std::unique_ptr<CompiledStage> flatA650 = compileStageForChip(flat.data(), flat.size(), a6xx::kA650ChipId, &why);
+    std::unique_ptr<CompiledStage> fsDefault = compileStage(fs.data(), fs.size(), &why);
+    CHECK(fsA650 != nullptr && vsA650 != nullptr && flatA650 != nullptr && fsDefault != nullptr);
+    if (fsA650 == nullptr || vsA650 == nullptr || flatA650 == nullptr || fsDefault == nullptr) {
+        std::printf("       %s\n", why.c_str());
+        return;
+    }
+    CHECK_EQ(fsA650->chipId, a6xx::kA650ChipId);
+    CHECK_EQ(vsA650->chipId, a6xx::kA650ChipId);
+    CHECK_EQ(fsDefault->chipId, a6xx::kChipId);
+    CHECK(fsA650->varyingNames == std::vector<std::string>({"generated(5colorDv4_f)"}));
+    CHECK(vsA650->varyingNames == fsA650->varyingNames);
+    CHECK(flatA650->varyingNames.empty());   // no user varyings
+    CHECK(fsDefault->varyingNames.empty());  // 3.8
 }
 
 // a kernel through compileStage and a stage through compileAir: each refused by name, not compiled into the other shape
@@ -1441,4 +1473,86 @@ TEST(a_compiled_stage_comes_back_from_the_cache_and_from_a_seed) {
         rmdir(d.c_str());
     }
     rmdir(base);
+}
+
+// Preservation off the A650 (.kiro/specs/metal-var1-linkage-crash-fix, Property 2): the synthetic varying pairs
+// compiled for the default chip link by slot through linkProgram, as their fixtures do, the unmatched one is refused
+// with the phone's sentence, no fragment names are recorded, and the link's other refusals keep their text.
+// **Validates: Requirements 3.1, 3.2, 3.6, 3.8**
+TEST(compiler_links_the_synthetic_pairs_by_slot_off_the_a650) {
+    if (!hasCompiler()) {
+        std::printf("       (no compiler in this build: the default-chip synthetic pairs did not run)\n");
+        return;
+    }
+    std::map<std::string, std::shared_ptr<CompiledStage>> s;
+    for (const char* name : {"var_ab_vs", "var_a_vs", "var_ba_fs", "var_b_fs", "var_ac_fs"}) {
+        std::vector<uint8_t> bc = bitcodeOf(name);
+        CHECK(!bc.empty());
+        std::string why;
+        s[name] = bc.empty() ? nullptr : compileStage(bc.data(), bc.size(), &why);
+        CHECK(s[name] != nullptr);
+        if (s[name] == nullptr) {
+            std::printf("       %s: %s\n", name, bc.empty() ? "no bitcode" : why.c_str());
+            return;
+        }
+    }
+    // the VS side's identities, the FS side's none (3.8)
+    CHECK(s["var_ab_vs"]->varyingNames == std::vector<std::string>({"generated(1aDv4_f)", "generated(1bDv4_f)"}));
+    CHECK(s["var_a_vs"]->varyingNames == std::vector<std::string>({"generated(1aDv4_f)"}));
+    for (const char* name : {"var_ba_fs", "var_b_fs", "var_ac_fs"}) CHECK(s[name]->varyingNames.empty());
+    std::string why;
+    CHECK(linkProgram(s["var_a_vs"], s["var_ac_fs"], PixelFormat::kRGBA8Unorm, &why) == nullptr);
+    expectRefusal(why, "the fragment stage reads varying slot 33 (VAR1), which the vertex stage does not write");
+    // the linked two: the same Linkage as the fixtures' (0x06030500's) by slot, field for field
+    const struct {
+        const char *vs, *fs;
+        const Stage &fvs, &ffs;
+    } pairs[] = {{"var_ab_vs", "var_ba_fs", kernels::var_ab_vs_air, kernels::var_ba_fs_air},
+                 {"var_ab_vs", "var_b_fs", kernels::var_ab_vs_air, kernels::var_b_fs_air}};
+    for (const auto& p : pairs) {
+        auto prog = linkProgram(s[p.vs], s[p.fs], PixelFormat::kRGBA8Unorm, &why);
+        CHECK(prog != nullptr);
+        if (prog == nullptr) {
+            std::printf("       %s+%s: %s\n", p.vs, p.fs, why.c_str());
+            continue;
+        }
+        Linkage want{};
+        std::string w;
+        CHECK(render::link(p.fvs, p.ffs, &want, &w));
+        const Linkage& l = prog->program.link;
+        CHECK_EQ(l.cnt, want.cnt);
+        CHECK_EQ(l.maxLoc, want.maxLoc);
+        CHECK_EQ(l.positionLoc, want.positionLoc);
+        CHECK_EQ(l.psizeLoc, want.psizeLoc);
+        CHECK_EQ(l.mrtComponents, want.mrtComponents);
+        CHECK(std::memcmp(l.var, want.var, sizeof l.var) == 0);
+        CHECK(std::memcmp(l.varmask, want.varmask, sizeof l.varmask) == 0);
+        CHECK(std::memcmp(l.interpMode, want.interpMode, sizeof l.interpMode) == 0);
+        CHECK(std::memcmp(l.psReplMode, want.psReplMode, sizeof l.psReplMode) == 0);
+        // and the program keeps the fragment stage it was given (no remap off the A650)
+        CHECK(std::memcmp(prog->program.fs.inputs, s[p.fs]->stage.inputs, sizeof prog->program.fs.inputs) == 0);
+    }
+    // the link's other refusals over the same stages, word for word (3.6)
+    auto m = copyOf(s["var_ab_vs"]);
+    m->stage.positionRegid |= 0x100;
+    CHECK(linkProgram(m, s["var_ba_fs"], PixelFormat::kRGBA8Unorm, &why) == nullptr);
+    expectRefusal(why, "var_ab_vs writes its position in a half register: not served");
+    m = copyOf(s["var_ab_vs"]);
+    m->stage.positionRegid = a6xx::kRegidNone;
+    CHECK(linkProgram(m, s["var_ba_fs"], PixelFormat::kRGBA8Unorm, &why) == nullptr);
+    expectRefusal(why, "var_ab_vs writes no position: nothing to rasterize");
+    CHECK(linkProgram(s["var_ba_fs"], s["var_ba_fs"], PixelFormat::kRGBA8Unorm, &why) == nullptr);
+    expectRefusal(why, "var_ba_fs is not a vertex stage");
+    CHECK(linkProgram(s["var_ab_vs"], s["var_ab_vs"], PixelFormat::kRGBA8Unorm, &why) == nullptr);
+    expectRefusal(why, "var_ab_vs is not a fragment stage");
+    // 32 varyings, each written: no room for the position
+    auto v = copyOf(s["var_ab_vs"]);
+    auto f = copyOf(s["var_ba_fs"]);
+    v->stage.numOutputs = kMaxStageOutputs;
+    for (uint32_t i = 0; i < kMaxStageOutputs; i++) v->stage.outputs[i] = StageOutput{uint8_t(32 + i), uint8_t(i), 0, 0};
+    f->stage.numInputs = kMaxStageOutputs;
+    for (uint32_t i = 0; i < kMaxStageOutputs; i++) f->stage.inputs[i] = StageInput{uint8_t(32 + i), a6xx::kRegidNone, 0x1, uint8_t(i), 0, 1, 0, 0};
+    f->stage.totalIn = kMaxStageOutputs;
+    CHECK(linkProgram(v, f, PixelFormat::kRGBA8Unorm, &why) == nullptr);
+    expectRefusal(why, "the link holds 32 entries and has no room left for the position");
 }

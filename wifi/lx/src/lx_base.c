@@ -755,8 +755,8 @@ iounmap(void *address)
  * or the other way round. The first part of it is handed out for good, a stretch at a time
  * (rings); the rest is slots of one size, taken and given back (buffers).
  */
-#define POOL_SIZE	(44u << 20)
-#define POOL_RINGS	(12u << 20)		/* (the data path's rings and link descriptors come to about 6 MB) */
+#define POOL_SIZE	(60u << 20)
+#define POOL_RINGS	(28u << 20)		/* (the data path's rings and link descriptors come to about 6 MB; the QCA6390's firmware asks for more of its own) */
 #define POOL_SLOT	4096u
 #define POOL_SLOTS	((POOL_SIZE - POOL_RINGS) / POOL_SLOT)
 
@@ -795,16 +795,21 @@ void *
 linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle, gfp_t flag)
 {
 	uint32_t at;
+	/*
+	 * Aligned as Linux's would be: to its page, and what is big to more (the QCA6390's firmware is given
+	 * megabytes of this for itself, and Android's cnss_wlan_region is aligned to 4 MB).
+	 */
+	uint32_t align = size >= (1u << 20) ? 4u << 20 : size >= 4096 ? 4096 : 64;
 
 	size = roundup2(size, 64);
 	lx_os_lock();
-	at = pool.rings_used;
+	at = roundup2(pool.rings_used, align);
 	if (pool.memory == NULL || at + size > POOL_RINGS) {
 		lx_os_unlock();
 		printf("lx: no room for %zu more bytes of rings\n", size);
 		return (NULL);
 	}
-	pool.rings_used += size;
+	pool.rings_used = at + size;
 	lx_os_unlock();
 	bzero(pool.memory + at, size);
 	*dma_handle = pool.address + at;

@@ -20,32 +20,31 @@
  *
  * What it does with them.
  *   - every thermal_poll milliseconds (default 2000) it reads all sensors;
- *   - sysctl kern.hakios.thermal_max_mc (the hottest, in millidegrees), thermal_hottest (its name),
- *     thermal_sensors ("cpu-0-0=41.2 ... " in degrees), thermal_reads;
+ *   - sysctl kern.hakios.thermal_max_mc (the hottest, in millidegrees), thermal_hottest (its name), thermal_sensors and
+ *     thermal ("cpu-0-0=41.2 ... " in degrees), thermal_reads, thermal_running, and thermal_pressure, iOS's own scale, which
+ *     userland/src/thermald.c passes on to apps: 1 moderate from 80 degrees, 2 heavy from 90, 3 trapping from 100;
  *   - a line in the log (and the loader's log) every thermal_log seconds (default 60) and at once when the
  *     hottest sensor crosses a multiple of 5 degrees upwards from 60;
+ *   - the slowing down, on the POCO F4: from thermal_slow degrees (default 90) the prime core goes back to its old limit
+ *     of 2361 MHz and stays there until the hottest sensor is under thermal_slow - 10 (hakios_cpufreq_hot()). That limit
+ *     is what the phone ran at for days; cpufreq_prime_mhz above it is what this is here for. Nothing else is slowed:
+ *     the GPU runs at its one speed, and for that the stop is the protection;
  *   - the stop: when the hottest valid sensor reads at least thermal_stop degrees three times in a row (default
  *     105; thermal_stop=0 turns the stop off), it says so and hands control back to the boot loader the way
- *     "xl stop" does (the GPU, Wi-Fi and audio DSP given back first). The vendor starts to slow the CPU at 108 to
- *     112 degrees; 105 is below that on purpose, because nothing here slows anything down: the stop is the whole
- *     protection, and it is for a phone left running unattended. It is a stop of the run, not a repair: a hot phone
- *     is hot for minutes after.
+ *     "xl stop" does (the GPU, Wi-Fi and audio DSP given back first). The vendor slows the big cores at 110 degrees and the
+ *     GPU at 95 on the F4; a hot phone is hot for minutes after.
  *
- * Status (what has and has not been seen): RUN ON THE PHONE (POCO X5 Pro, 2026-10-27, four runs): the status-word layout
- * (from Linux's tsens-v2.c as remembered, the same as drivers/gpu/hakios.adreno.c reads for the GPU's two sensors) is right:
- * 27 of 27 sensors have a reading, 33.3 to 39.5 degrees on a phone at rest, the CPU cores a degree or two above the rest, the
- * values move between runs; kern.hakios.thermal_* are read from user space (userland/src/hello.c with hello_wait=). NOT yet
- * seen: the stop (thermal_stop) firing, a phone under load, a reading above 40 degrees. The sensors are the device tree's; whether
- * the phone's own tree is the reference one (devices/redwood/prebuilt/device-tree.dtb) was not compared sensor by sensor.
- * Not run in QEMU, and thermal=1 must not be given there: it has no such blocks, and a load from an address it does not map faults.
+ * Status: from hackios-xnu-kernel's hakios.thermal.c, RUN THERE on the POCO X5 Pro (27 of 27 sensors read; the stop never seen
+ * firing). The POCO F4's blocks are at the same addresses (dt tsens0 and tsens1, 0xc263000 and 0xc265000, compatible
+ * qcom,tsens24xx) with another list of sensors, its kona-thermal.dtsi. Not yet seen on that phone. Not run in QEMU, and
+ * thermal=1 must not be given there: it has no such blocks, and a load from an address it does not map faults.
  *
  * Boot-args:
  *   thermal=1          read the sensors
  *   thermal_poll=<ms>  how often (200 to 60000; 2000)
  *   thermal_log=<s>    a summary line this often (0: only on a rise; 60)
  *   thermal_stop=<C>   stop the run at this temperature (0: never; 105)
- *   thermal_tm0=<pa>, thermal_tm1=<pa>  the two blocks' readings, when this is not the reference phone
- *                      (0xc263000 and 0xc265000)
+ *   thermal_slow=<C>   slow the prime core from this temperature (0: never; 90)
  */
 #include <stdint.h>
 #include <kern/clock.h>
@@ -56,6 +55,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
+#include <sys/hakios.version.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
@@ -64,6 +64,8 @@ extern void hakios_var_save_on_return(void);
 extern void hakios_adreno_stop(void);
 extern void hakios_wifi_stop(void);
 extern void hakios_adsp_stop(void);
+extern void hakios_cpufreq_hot(bool hot);
+extern void hakios_adreno_hot(bool hot);
 
 SYSCTL_DECL(_kern_hakios);
 
@@ -91,13 +93,15 @@ say(const char *format, ...)
 #define TEMP_MAX_TENTHS         1600
 
 /* made by tools/dt-thermal.py from the phone's device tree: name, block, sensor, slow down at, gives up at (millidegrees) */
-static const struct sensor_info {
+struct sensor_info {
 	const char *    name;
 	uint32_t        tm;
 	uint32_t        number;
 	int32_t         slow_mc;
 	int32_t         limit_mc;
-} sensors[] = {
+};
+
+static const struct sensor_info sensors_sc7280[] = {
 	{ "aoss-0", 0xc263000, 0, 115000, 125000 },
 	{ "cpu-0-0", 0xc263000, 1, 110000, 125000 },
 	{ "cpu-0-1", 0xc263000, 2, 110000, 125000 },
@@ -126,22 +130,53 @@ static const struct sensor_info {
 	{ "mdmss-3", 0xc265000, 10, 95000, 125000 },
 	{ "camera-0", 0xc265000, 11, 100000, 125000 },
 };
-#define NSENSORS        ((unsigned)(sizeof(sensors) / sizeof(sensors[0])))
+/* the SM8250 family's (the POCO F4's kona-thermal.dtsi), by hand: the zones "-usr" for the numbers, "-step" for where the vendor slows down */
+static const struct sensor_info sensors_sm8250[] = {
+	{ "aoss-0", 0xc263000, 0, 115000, 125000 },
+	{ "cpu-0-0", 0xc263000, 1, 110000, 125000 },
+	{ "cpu-0-1", 0xc263000, 2, 110000, 125000 },
+	{ "cpu-0-2", 0xc263000, 3, 110000, 125000 },
+	{ "cpu-0-3", 0xc263000, 4, 110000, 125000 },
+	{ "cpuss-0", 0xc263000, 5, 115000, 125000 },
+	{ "cpuss-1", 0xc263000, 6, 115000, 125000 },
+	{ "cpu-1-0", 0xc263000, 7, 110000, 125000 },
+	{ "cpu-1-1", 0xc263000, 8, 110000, 125000 },
+	{ "cpu-1-2", 0xc263000, 9, 110000, 125000 },
+	{ "cpu-1-3", 0xc263000, 10, 110000, 125000 },
+	{ "cpu-1-4", 0xc263000, 11, 110000, 125000 },
+	{ "cpu-1-5", 0xc263000, 12, 110000, 125000 },
+	{ "cpu-1-6", 0xc263000, 13, 110000, 125000 },
+	{ "cpu-1-7", 0xc263000, 14, 110000, 125000 },
+	{ "gpuss-0", 0xc263000, 15, 95000, 125000 },
+	{ "aoss-1", 0xc265000, 0, 115000, 125000 },
+	{ "cwlan", 0xc265000, 1, 100000, 125000 },
+	{ "video", 0xc265000, 2, 100000, 125000 },
+	{ "ddr", 0xc265000, 3, 95000, 125000 },
+	{ "q6-hvx", 0xc265000, 4, 100000, 125000 },
+	{ "camera", 0xc265000, 5, 100000, 125000 },
+	{ "cmpss", 0xc265000, 6, 100000, 125000 },
+	{ "npu", 0xc265000, 7, 100000, 125000 },
+	{ "gpuss-1", 0xc265000, 8, 95000, 125000 },
+};
+#define MAX_SENSORS     27
+
+static const struct sensor_info *sensors = sensors_sc7280;
+static unsigned nsensors = sizeof(sensors_sc7280) / sizeof(sensors_sc7280[0]);
 #define REFERENCE_TM0   0xc263000u
 #define REFERENCE_TM1   0xc265000u
 
 static vm_offset_t tm_va[2];
 static uint32_t tm_pa[2] = { REFERENCE_TM0, REFERENCE_TM1 };
-static int32_t tenths[NSENSORS];                /* the last good reading; INT32_MIN: none yet */
-static uint32_t poll_ms = 2000, log_seconds = 60, stop_celsius = 105;
+static int32_t tenths[MAX_SENSORS];                /* the last good reading; INT32_MIN: none yet */
+static uint32_t poll_ms = 2000, log_seconds = 60, stop_celsius = 105, slow_celsius = 90;
 static uint64_t last_log, reads;
 static int strikes, last_step;
-static bool stopping;
+static bool stopping, slowed;
 
 static int thermal_max_mc = -273000;
 static char thermal_hottest[16] = "";
-static char thermal_list[NSENSORS * 16 + 8];
-static int thermal_reads_value;
+static char thermal_list[MAX_SENSORS * 16 + 8];
+static int thermal_reads_value, thermal_running, thermal_pressure;
 
 SYSCTL_INT(_kern_hakios, OID_AUTO, thermal_max_mc, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_max_mc, 0,
     "the hottest valid temperature sensor of the SoC, in millidegrees (-273000: none read)");
@@ -149,6 +184,11 @@ SYSCTL_STRING(_kern_hakios, OID_AUTO, thermal_hottest, CTLFLAG_RD | CTLFLAG_LOCK
 SYSCTL_STRING(_kern_hakios, OID_AUTO, thermal_sensors, CTLFLAG_RD | CTLFLAG_LOCKED, thermal_list, 0,
     "every sensor and its temperature in degrees: \"cpu-0-0=41.2 gpuss-0=38.0 ...\"");
 SYSCTL_INT(_kern_hakios, OID_AUTO, thermal_reads, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_reads_value, 0, "how many times the sensors were read");
+
+SYSCTL_STRING(_kern_hakios, OID_AUTO, thermal, CTLFLAG_RD | CTLFLAG_LOCKED, thermal_list, 0, "the same, for thermald show");
+SYSCTL_INT(_kern_hakios, OID_AUTO, thermal_running, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_running, 0, "1: the sensors are being read");
+SYSCTL_INT(_kern_hakios, OID_AUTO, thermal_pressure, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_pressure, 0,
+    "iOS's scale: 0 nominal, 1 moderate, 2 heavy, 3 trapping");
 
 /* For other drivers (a GPU or modem that wants to back off): the hottest temperature, in millidegrees; -273000: not read. */
 int
@@ -175,7 +215,7 @@ look(void)
 	char list[sizeof(thermal_list)], one[16];
 
 	list[0] = 0;
-	for (unsigned i = 0; i < NSENSORS; i++) {
+	for (unsigned i = 0; i < nsensors; i++) {
 		uint32_t status = *(volatile uint32_t *)(tm_va[sensors[i].tm == REFERENCE_TM0 ? 0 : 1] + TM_STATUS(sensors[i].number));
 		int32_t value = (int32_t)(status << 20) >> 20;
 
@@ -212,10 +252,24 @@ look(void)
 	seconds /= NSEC_PER_SEC;
 	if (step > last_step || last_log == 0 || (log_seconds != 0 && seconds >= log_seconds)) {
 		text_of(one, sizeof(one), hottest);
-		say("thermal: %u of %u sensors read; hottest %s at %s C; %s\n", good, NSENSORS, sensors[hot].name, one, thermal_list);
+		say("thermal: %u of %u sensors read; hottest %s at %s C; %s\n", good, nsensors, sensors[hot].name, one, thermal_list);
 		last_log = now;
 	}
 	last_step = step;
+	thermal_pressure = hottest >= 1000 ? 3 : hottest >= 900 ? 2 : hottest >= 800 ? 1 : 0;
+	if (slow_celsius != 0 && !slowed && hottest >= (int32_t)slow_celsius * 10) {
+		slowed = true;
+		text_of(one, sizeof(one), hottest);
+		say("thermal: %s reads %s C, at or above thermal_slow=%u: the prime core is slowed\n", sensors[hot].name, one, slow_celsius);
+		hakios_cpufreq_hot(true);
+		hakios_adreno_hot(true);
+	} else if (slowed && hottest < ((int32_t)slow_celsius - 10) * 10) {
+		slowed = false;
+		text_of(one, sizeof(one), hottest);
+		say("thermal: %s reads %s C: the prime core goes back up\n", sensors[hot].name, one);
+		hakios_cpufreq_hot(false);
+		hakios_adreno_hot(false);
+	}
 
 	if (stop_celsius != 0 && hottest >= (int32_t)stop_celsius * 10) {
 		strikes++;
@@ -254,11 +308,15 @@ thermal_init(void)
 	if (!PE_parse_boot_argn("thermal", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
-	for (unsigned i = 0; i < NSENSORS; i++) {
+	if (hakios_soc_is("sm8250")) {
+		sensors = sensors_sm8250;
+		nsensors = sizeof(sensors_sm8250) / sizeof(sensors_sm8250[0]);
+	} else if (!hakios_soc_is("sc7280")) {
+		return;                                 /* (another device's sensors are elsewhere, or there are none) */
+	}
+	for (unsigned i = 0; i < nsensors; i++) {
 		tenths[i] = INT32_MIN;
 	}
-	(void)PE_parse_boot_argn("thermal_tm0", &tm_pa[0], sizeof(tm_pa[0]));
-	(void)PE_parse_boot_argn("thermal_tm1", &tm_pa[1], sizeof(tm_pa[1]));
 	if (PE_parse_boot_argn("thermal_poll", &value, sizeof(value)) && value >= 200 && value <= 60000) {
 		poll_ms = value;
 	}
@@ -268,6 +326,9 @@ thermal_init(void)
 	if (PE_parse_boot_argn("thermal_stop", &value, sizeof(value)) && value <= 160) {
 		stop_celsius = value;
 	}
+	if (PE_parse_boot_argn("thermal_slow", &value, sizeof(value)) && value <= 160) {
+		slow_celsius = value;
+	}
 	for (unsigned b = 0; b < 2; b++) {
 		tm_va[b] = ml_io_map(tm_pa[b], TM_SIZE);
 		if (tm_va[b] == 0) {
@@ -275,8 +336,9 @@ thermal_init(void)
 			return;
 		}
 	}
-	say("thermal: %u sensors in two blocks (%#x, %#x), every %u ms; stop at %u C%s\n", NSENSORS, tm_pa[0], tm_pa[1], poll_ms,
+	say("thermal: %u sensors in two blocks (%#x, %#x), every %u ms; stop at %u C%s\n", nsensors, tm_pa[0], tm_pa[1], poll_ms,
 	    stop_celsius, stop_celsius ? "" : " (off)");
+	thermal_running = 1;
 	call = thread_call_allocate(tick, NULL);
 	tick(NULL, NULL);
 }

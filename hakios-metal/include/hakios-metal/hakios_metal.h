@@ -65,10 +65,47 @@ typedef struct hakios_metal_sampler hakios_metal_sampler;
 const char *hakios_metal_error(void);
 
 hakios_metal_device *hakios_metal_open(void);
+/* Opens the A650 for the isolated Metal.framework blit probe. */
+hakios_metal_device *hakios_metal_open_a650_blit_probe(void);
 /* whether this driver's tables are for a GPU of that chip ID (hakios_metal_open() refuses any other, with hakios_metal_error()) */
 bool hakios_metal_chip_known(uint32_t chip);
 /* (for the tests: a device on the fake GPU, which runs the packets in this process) */
 hakios_metal_device *hakios_metal_open_fake(void);
+/* (for the tests: the same, the fake answering CHIP as its chip id -- 0x06050002 the A650, 0 a kernel that does not say)
+ * and the fake's own surfaces and record, which every call below refuses (-1 with the reason) on a device that is not
+ * the fake's: IOSurface ID of WIDTH x HEIGHT pixels ROW_BYTES apart, FourCC FOURCC, one plane; its whole memory as it
+ * is now into OUT (at most SIZE bytes; the surface's size is returned); BYTES written into it at OFFSET as another
+ * program would; submissions held back until resume */
+hakios_metal_device *hakios_metal_open_fake_chip(uint64_t chip);
+int hakios_metal_fake_add_surface(hakios_metal_device *device, unsigned id, unsigned width, unsigned height, unsigned row_bytes, uint32_t fourcc);
+int64_t hakios_metal_fake_surface_bytes(hakios_metal_device *device, unsigned id, void *out, size_t size);
+int hakios_metal_fake_write_surface(hakios_metal_device *device, unsigned id, uint64_t offset, const void *bytes, size_t size);
+int hakios_metal_fake_pause(hakios_metal_device *device);
+int hakios_metal_fake_resume(hakios_metal_device *device);
+/* the last submission's buffers as the kernel took them: GPU address, size, the read (1) / write (2) flags, the IOSurface
+ * whose memory it is (0 none). Into BOS at most MAX of them, its fence into *FENCE; the count is returned */
+struct hakios_metal_fake_bo {
+	uint64_t gpu_address, size;
+	unsigned flags;
+	unsigned surface;
+};
+int hakios_metal_fake_last_submission(hakios_metal_device *device, unsigned *fence, struct hakios_metal_fake_bo *bos, unsigned max);
+/* the 2D engine's writes the fake carried out since the record was last cleared, in order: the submission's fence, fill
+ * (a Clear) or copy, the destination's base and pitch, its bytes a pixel and rectangle (X1, Y1 inclusive). At most MAX
+ * into OUT; the count is returned; CLEAR empties the record */
+struct hakios_metal_fake_write {
+	unsigned submission;
+	int fill;
+	uint64_t base, pitch;
+	unsigned bytes_per_pixel, x0, y0, x1, y1;
+};
+int hakios_metal_fake_writes(hakios_metal_device *device, struct hakios_metal_fake_write *out, unsigned max, int clear);
+/* every command-stream word the fake's CP read since the record was last cleared, each stream whole as it was entered
+ * (a submission's, then an indirect buffer's): at most MAX into OUT; the count is returned; CLEAR empties the record */
+int64_t hakios_metal_fake_words(hakios_metal_device *device, uint32_t *out, size_t max, int clear);
+/* hakios_metal_fake_add_surface of PLANES planes (2: a second plane of half the rows after the first, as '420f' has) */
+int hakios_metal_fake_add_surface_planes(hakios_metal_device *device, unsigned id, unsigned width, unsigned height, unsigned row_bytes,
+    uint32_t fourcc, unsigned planes);
 void hakios_metal_close(hakios_metal_device *device);
 /* the chip id (0x06030500 on the phone: the kernel's GPU_ID is 0, the chip id is what names the GPU) */
 uint64_t hakios_metal_gpu_id(hakios_metal_device *device);
@@ -151,6 +188,32 @@ unsigned hakios_metal_texture_samples(hakios_metal_texture *texture);   /* 1, or
  * a depth format. */
 hakios_metal_texture *hakios_metal_texture_new_iosurface(hakios_metal_device *device, unsigned surface_id, unsigned plane,
     unsigned pixel_format, unsigned width, unsigned height, unsigned usage);
+/* whether a surface qualifies for a target (design: the glossary's qualifying surface): CHIP 0x06050002, BLIT_ON, plane 0
+ * of a surface of one plane, a 4-byte colour format the 2D engine copies 1:1 (80, 81, 70, 71; 552 and 554 when served
+ * at 4 bytes), rotation 0, rows a multiple of 64 bytes, the descriptor's size the surface's. Pure. */
+bool hakios_metal_surface_target_wanted(uint64_t chip, int blit_on, unsigned pixel_format, unsigned width, unsigned height,
+    unsigned surface_width, unsigned surface_height, unsigned planes, unsigned plane, unsigned rotation, uint64_t bytes_per_row);
+/* the same as hakios_metal_texture_new_iosurface for a CoreAnimation surface the plug-in draws into (plane 0): with
+ * BLIT_ON, a qualifying surface on the A650 and room in the device's 128 MiB for targets, a texture over a target of
+ * the driver's that stands in for the surface's memory, *TARGETED 1. One target per surface ID, shared by every texture
+ * made over it so and freed with the last of them; a new one is filled from the surface (a 2D copy on a queue of the
+ * device's own, committed at once). hakios_metal_cb_resolve_surface_targets copies it into the surface. Otherwise
+ * hakios_metal_texture_new_iosurface's texture, *TARGETED 0. */
+hakios_metal_texture *hakios_metal_texture_new_iosurface_target(hakios_metal_device *device, unsigned surface_id, unsigned pixel_format,
+    unsigned width, unsigned height, unsigned usage, int blit_on, int *targeted);
+/* for a texture over a surface target, the texture over the surface's own pages (what -replaceRegion: writes through
+ * to as well), alive while TEXTURE is; NULL for any other texture */
+hakios_metal_texture *hakios_metal_texture_surface_of(hakios_metal_texture *texture);
+/* the device's surface targets: *LIVE of them in *BYTES now, and since the last call *MADE made, *FILLED filled from
+ * their surface, *COPIES copies into surfaces, *OVER_BUDGET surfaces drawn straight for want of room (any may be NULL) */
+void hakios_metal_surface_target_stats(hakios_metal_device *device, unsigned *live, uint64_t *bytes, unsigned *made, unsigned *filled,
+    unsigned *copies, unsigned *over_budget);
+/* metal_damage: ON 1 (the default) copies only a target's damage into its surface at commit, ON 0 every copy whole (the
+ * stalefix run's commit copy) */
+void hakios_metal_surface_target_set_damage(hakios_metal_device *device, int on);
+/* the next commit copy of TEXTURE's surface target whole whatever was written since the last one (the surface's seed
+ * moved: something wrote it from outside); nothing for a texture over no target */
+void hakios_metal_surface_target_mark_whole(hakios_metal_texture *texture);
 /* the same for a two-plane format (YCbCr8_420_2P, 500) over a '420f' or '420v' surface: CHROMA_OFFSET where the surface's
  * second plane starts in its memory (IOSurfaceGetBaseAddressOfPlane(s, 1) less IOSurfaceGetBaseAddress(s)) and
  * CHROMA_ROW_BYTES its rows; both planes are sampled as one texture. */
@@ -288,10 +351,43 @@ hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base
     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length);
 /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
+/* STAGE 0 = vertex, 1 = fragment: how its compiled stage was come by (metal-ca-perf's record): *SOURCE 0 compiled, 1 from
+ * the writable cache (HAKIOS_METAL_CACHE), 2 from a seed (HAKIOS_METAL_CACHE_SEED); *DIGEST FNV-1a 64 of its instruction
+ * words and immediates; *MICROSECONDS what the request took; NAME (SIZE bytes, may be NULL) its cache file's name, "" when
+ * it has none. 0, or -1 for no such stage. Any pointer may be NULL. */
+int hakios_metal_program_stage_info(hakios_metal_program *program, unsigned stage, unsigned *source, uint64_t *digest, uint64_t *microseconds,
+    char *name, size_t size);
+/* what the compiled-stage cache's key is made of besides a stage's own inputs, "BUILD STAGE/KERNEL": the compiler's build
+ * (the Makefile's IOS_CACHE_BUILD) and sizeof(Stage), sizeof(Kernel); "" in a build without the compiler */
+const char *hakios_metal_cache_build(void);
+/* Every stage request of the render-pipeline calls (hakios_metal_program_new_bitcode*, hakios_metal_program_specialize),
+ * told as it is answered, on the caller's thread: what was asked (the bitcode as compiled, its constants, the IBO base,
+ * the known buffer of a specialisation: BINDING and LENGTH bytes, NULL for none) and how it was answered (as
+ * hakios_metal_program_stage_info's, WORDS its instruction words). OBSERVER NULL stops it. */
+typedef struct hakios_metal_stage_event {
+    unsigned stage;                     /* 0 vertex, 1 fragment */
+    const void *bitcode;
+    size_t size;
+    const hakios_metal_constant *constants;
+    unsigned constant_count;
+    unsigned ibo_base;
+    unsigned known_binding;
+    const void *known;                  /* NULL: no known buffer */
+    size_t known_length;
+    int compiled;                       /* 0: refused (the rest below is 0) */
+    unsigned source;
+    uint64_t digest, microseconds;
+    unsigned words;
+    const char *cache_name;
+} hakios_metal_stage_event;
+void hakios_metal_set_stage_observer(void (*observer)(const hakios_metal_stage_event *event, void *context), void *context);
 void hakios_metal_program_free(hakios_metal_program *program);
 /* the buffers made from the kernel and those taken again from a queue's pool since the last call, and the bytes made */
 void hakios_metal_buffer_counts(unsigned *made, unsigned *reused, unsigned long long *bytes);
 const char *hakios_metal_program_name(hakios_metal_program *program);   /* "vs+fs" */
+/* one line about the link, "" when there is none: on the A650, the fragment inputs whose varying identity no vertex
+ * output has (they read zeros, which Metal's validation would refuse) and the inputs slot-linked for want of a name */
+const char *hakios_metal_program_link_note(hakios_metal_program *program);
 /* STAGE 0 = vertex, 1 = fragment: the resources that stage binds, as hakios_metal_kernel_resource reports a kernel's */
 unsigned hakios_metal_program_resource_count(hakios_metal_program *program, unsigned stage);
 int hakios_metal_program_resource(hakios_metal_program *program, unsigned stage, unsigned i,
@@ -461,6 +557,21 @@ int hakios_metal_cb_blit(hakios_metal_cb *cb, hakios_metal_texture *from, unsign
  * a TO of FROM's sides swapped, 2 a half turn, 4 and 5 the flips): one pixel format, copied pixel for pixel. A
  * framebuffer CoreAnimation renders landscape over the portrait display surface goes into it so. -1 with the reason. */
 int hakios_metal_cb_blit_rotated(hakios_metal_cb *cb, hakios_metal_texture *from, hakios_metal_texture *to, unsigned rotation);
+/* at commit: each surface target CB wrote since the last call copied into its surface, after everything recorded so far,
+ * in CB's own submission: its damage since the last call (CommandBuffer::damageOf) aligned outward to 16 pixels by 4
+ * rows and clamped, or the whole target when the damage is the whole or not known, when the device's damage copy is off
+ * (hakios_metal_surface_target_set_damage 0) or the target was marked (hakios_metal_surface_target_mark_whole). The
+ * number of copies (0 when CB wrote none), -1 with the reason. A target whose last texture was freed before this call is
+ * not copied. */
+int hakios_metal_cb_resolve_surface_targets(hakios_metal_cb *cb);
+/* What the last hakios_metal_cb_resolve_surface_targets of CB copied, against what its command buffer wrote into the
+ * targets (metal-ca-perf's measurement, counted whether the damage copy is on or off): *COPIES targets copied,
+ * *TARGET_PIXELS their pixels, *DAMAGE_PIXELS the pixels written since their last copy -- per target the union of its
+ * draws' areas (render::drawArea) and copies' destinations widened to 16 pixels by 4 rows, the whole target for a Clear
+ * or DontCare load and for any other write --, *SMALLEST and *LARGEST the least and the most of one target, in
+ * thousandths of it. Any pointer may be NULL. */
+void hakios_metal_cb_damage_stats(hakios_metal_cb *cb, unsigned *copies, uint64_t *target_pixels, uint64_t *damage_pixels, unsigned *smallest,
+    unsigned *largest);
 /* What a refused draw, dispatch, copy or clear does to CB (CommandBuffer::setSkipRefused): 0, the default, ends CB in
  * error with the reason; 1 leaves that piece of work out and runs the rest, as Apple's driver runs a frame whatever is
  * wrong in it. hakios_metal_cb_refuse is the caller's own refusal of a piece of work, by the same rule; it returns -1,

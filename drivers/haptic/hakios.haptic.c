@@ -16,6 +16,12 @@
  *              eleven of them, 1..10 short (Android's effects 0..9), 11 the one looped for a
  *              vibration of some length
  *
+ * The POCO F4 (munch) has the same chip behind the same address, Android's same driver and a file of the same
+ * eleven waveforms, wired elsewhere: the serial engine 15 (i2c@884000, function qup15 on GPIO 44 data and 45
+ * clock, the bus Android calls 3; the addresses 0x18, 0x51 and 0x66 are on it too), reset GPIO 130, interrupt GPIO
+ * 129, all four in the south tile of the TLMM (0x0f500000). Its motor: f0 169.0 Hz, calibration data 0x3e; the
+ * registers Android leaves in the chip differ from the X5 Pro's by munch_regs below, read from sysfs, read-only.
+ *
  * Nothing here is done unless a boot-arg asks for it:
  *
  *   haptic=1   a look, reading only: the pins, and whether the chip answers (its ID and registers,
@@ -55,6 +61,7 @@
 #include <miscfs/devfs/devfs.h>
 #include <sys/conf.h>
 #include <sys/systm.h>
+#include <sys/hakios.version.h>
 #include <sys/uio.h>
 #include <sys/hakios.audio.h>
 #include <sys/hakios.input.h>
@@ -124,22 +131,30 @@ wait_ms(uint32_t ms)
 
 /* ---- pins ------------------------------------------------------------------------------------------ */
 
-#define TLMM_PHYS               0x0f100000UL
-#define TLMM_SIZE               0x100000UL
+struct haptic_board {
+	vm_offset_t tlmm_phys;                  /* the tile the four pins are in */
+	vm_size_t tlmm_size;
+	unsigned sda, scl, reset, irq;          /* the serial engine's first pin is the data line, the second the clock */
+};
+
+static const struct haptic_board board_redwood = { 0x0f100000UL, 0x100000UL, 36, 37, 35, 18 };
+static const struct haptic_board board_munch = { 0x0f500000UL, 0x83000UL, 44, 45, 130, 129 };
+static const struct haptic_board *board = &board_redwood;
+
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
 #define CFG_PULL_UP             3
 #define CFG_OUTPUT              (1u << 9)
 
-#define PIN_SDA                 36      /* the serial engine's first pin is the data line, the second the clock */
-#define PIN_SCL                 37
-#define PIN_RESET               35
-#define PIN_INT                 18
+#define PIN_SDA                 board->sda
+#define PIN_SCL                 board->scl
+#define PIN_RESET               board->reset
+#define PIN_INT                 board->irq
 
 static void
 show_pins(void)
 {
-	static const struct {
+	const struct {
 		unsigned pin;
 		const char *what;
 	} pins[] = { { PIN_SDA, "I2C data" }, { PIN_SCL, "I2C clock" }, { PIN_RESET, "reset" }, { PIN_INT, "interrupt" } };
@@ -415,7 +430,7 @@ healthy(const char *when)
 }
 
 /* Android's registers as its driver leaves them, read from the phone's sysfs (fw-haptic/android/haptic-sysfs.txt) */
-static const uint8_t android_regs[0x7d] = {
+static uint8_t android_regs[0x7d] = {
 	[0x00] = 0x82, [0x01] = 0x10, [0x02] = 0x11, [0x03] = 0x59, [0x04] = 0x09, [0x05] = 0x00, [0x06] = 0x47, [0x07] = 0x80,
 	[0x08] = 0x07, [0x09] = 0x00, [0x0a] = 0x0b, [0x12] = 0xf0, [0x18] = 0x1e, [0x19] = 0x8d, [0x1a] = 0x71, [0x1b] = 0x06,
 	[0x1c] = 0x58, [0x1d] = 0xcf, [0x1e] = 0x28, [0x1f] = 0x04, [0x20] = 0x06, [0x21] = 0x08, [0x22] = 0x0c, [0x23] = 0x0c,
@@ -426,6 +441,18 @@ static const uint8_t android_regs[0x7d] = {
 	[0x5d] = 0xf5, [0x5e] = 0x0d, [0x5f] = 0xf5, [0x60] = 0x41, [0x61] = 0xf6, [0x62] = 0x5c, [0x63] = 0x0e, [0x64] = 0xf9,
 	[0x68] = 0x05, [0x69] = 0x21, [0x6b] = 0x02, [0x6c] = 0x15, [0x6d] = 0x89, [0x6e] = 0xc2, [0x6f] = 0x48, [0x70] = 0x0f,
 	[0x71] = 0x93, [0x72] = 0x69, [0x73] = 0xa4, [0x74] = 0x89, [0x75] = 0x88, [0x77] = 0x40, [0x79] = 0x0d,
+};
+
+/*
+ * ... and where the F4's differ (fw-haptic/android/haptic-sysfs.txt of that phone), from what its driver sets. Not here: what
+ * Android's last play left behind and its measurements (0x08, 0x0a, 0x12, 0x26, 0x28..0x2c, 0x48, 0x4d, 0x4f..0x51, 0x5a,
+ * 0x61, 0x64), and the trigger pins' 0x33, 0x36, 0x39, 0x3a: they stay off here on both phones.
+ */
+static const uint8_t munch_regs[][2] = {
+	{ 0x1a, 0x6a },         /* CONTCFG3 */
+	{ 0x1d, 0xff },         /* CONTCFG6: f0 tracking on, the first drive level 0x7f */
+	{ 0x1e, 0x36 },         /* CONTCFG7: the second drive level */
+	{ 0x79, 0x3e },         /* the f0 calibration of this motor (its f0_save: 62) */
 };
 
 /* What the chip holds now, against Android's (registers 0x00..0x7c; 0x32 and 0x42 are data ports, not read). */
@@ -474,26 +501,26 @@ chip_answers(void)
  * tracking found under Android; 0x4f, 0x51, 0x59, 0x5a likewise), and what is set for each playing (0x08 the mode,
  * 0x0a/0x12 the waveform and its repeats). The values are all read from the chip as Android leaves it.
  */
-static const uint8_t android_config[][2] = {
-	{ 0x03, 0x59 },         /* the interrupt mask */
-	{ 0x06, 0x47 },         /* PLAYCFG1: the boost in bypass, its voltage setting 0x47 (Android's vmax 7938 mV) */
-	{ 0x1a, 0x71 },         /* CONTCFG3 */
-	{ 0x1d, 0xcf },         /* CONTCFG6: f0 tracking on, the first drive level 0x4f */
-	{ 0x1e, 0x28 },         /* CONTCFG7: the second drive level */
-	{ 0x2f, 0x46 },         /* the FIFO's thresholds */
-	{ 0x36, 0x02 }, { 0x37, 0x02 }, { 0x38, 0x02 },  /* the trigger pins' waveforms (the triggers stay off) */
-	{ 0x39, 0x00 }, { 0x3a, 0x00 },  /* ... and off */
-	{ 0x46, 0x09 },         /* SYSCTRL4: 24 kHz waveforms, the gain applied as it is */
-	{ 0x47, 0x5a },
+static const uint8_t android_config[] = {
+	0x03,                   /* the interrupt mask */
+	0x06,                   /* PLAYCFG1: the boost in bypass, its voltage setting 0x47 (Android's vmax 7938 mV) */
+	0x1a,                   /* CONTCFG3 */
+	0x1d,                   /* CONTCFG6: f0 tracking on, the first drive level */
+	0x1e,                   /* CONTCFG7: the second drive level */
+	0x2f,                   /* the FIFO's thresholds */
+	0x36, 0x37, 0x38,       /* the trigger pins' waveforms (the triggers stay off) */
+	0x39, 0x3a,             /* ... and off */
+	0x46,                   /* SYSCTRL4: 24 kHz waveforms, the gain applied as it is */
+	0x47,
 };
 /*
  * ... and the analog ones, behind AW_TMCFG (the boost: skip mode, peak current 3.45 A, peak back, slew).
  * These too are Android's: what the phone's registers hold under Android (they differ from the chip's
  * own after a reset, so Android's driver set them); mainline Linux's aw86927.c sets the same values.
  */
-static const uint8_t android_analog[][2] = {
-	{ 0x70, 0x0f }, { 0x71, 0x93 }, { 0x72, 0x69 }, { 0x74, 0x89 }, { 0x75, 0x88 },
-	{ AW_TRIM_LRA, 0x0d },  /* Android's f0 calibration of this motor (its log: "f0_cali_data = 0x0D") */
+static const uint8_t android_analog[] = {
+	0x70, 0x71, 0x72, 0x74, 0x75,
+	AW_TRIM_LRA,            /* Android's f0 calibration of this motor (the X5 Pro's log: "f0_cali_data = 0x0D") */
 };
 
 /* The analog registers opened or closed for writing (AW_TMCFG reads back as 0 either way: what tells is that the writes stick). */
@@ -514,16 +541,16 @@ static bool
 configure(void)
 {
 	say("haptic: Android's configuration is written\n");
-	for (unsigned i = 0; i < sizeof(android_config) / sizeof(android_config[0]); i++) {
-		if (!put(android_config[i][0], android_config[i][1])) {
+	for (unsigned i = 0; i < sizeof(android_config); i++) {
+		if (!put(android_config[i], android_regs[android_config[i]])) {
 			return false;
 		}
 	}
 	if (!unlock(true)) {
 		return false;
 	}
-	for (unsigned i = 0; i < sizeof(android_analog) / sizeof(android_analog[0]); i++) {
-		if (!put(android_analog[i][0], android_analog[i][1])) {
+	for (unsigned i = 0; i < sizeof(android_analog); i++) {
+		if (!put(android_analog[i], android_regs[android_analog[i]])) {
 			(void)unlock(false);
 			return false;
 		}
@@ -939,7 +966,7 @@ haptic_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	bool loaded = false;
 
-	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
+	tlmm = ml_io_map(board->tlmm_phys, board->tlmm_size);
 	say("haptic: level %u: %s\n", level, level == 1 ? "a look, reading only" : level == 2 ? "the reset released, registers read" :
 	    level == 3 ? "the chip configured and its waveforms loaded, nothing played" : level == 4 ? "one effect played" :
 	    "the motor for Darwin");
@@ -986,6 +1013,14 @@ hakios_haptic_init(void)
 {
 	thread_t thread;
 
+	if (hakios_soc_is("sm8250")) {
+		board = &board_munch;
+		for (unsigned i = 0; i < sizeof(munch_regs) / sizeof(munch_regs[0]); i++) {
+			android_regs[munch_regs[i][0]] = munch_regs[i][1];
+		}
+	} else if (!hakios_soc_is("sc7280")) {
+		return;                 /* (the addresses are the POCO X5 Pro's and the F4's) */
+	}
 	if (!PE_parse_boot_argn("haptic", &level, sizeof(level)) || level == 0) {
 		return;
 	}

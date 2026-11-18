@@ -1485,14 +1485,14 @@ make_io_var(struct air_ctx *c, nir_variable_mode mode, const struct air_type *t,
  * the runtime links the two sides by name (docs/air.md section 7.5)
  */
 static void
-add_varying(struct air_ctx *c, const char *name, unsigned slot, unsigned comps,
-            const struct air_md *node)
+add_varying(struct air_ctx *c, const char *name, const char *link_name, unsigned slot,
+            unsigned comps, const struct air_md *node)
 {
    struct air_shader_info *info = c->info;
    info->varyings = reralloc(c->mem_ctx, info->varyings, struct air_varying,
                              info->num_varyings + 1);
    info->varyings[info->num_varyings++] = (struct air_varying) {
-      .name = name, .slot = slot, .components = comps,
+      .name = name, .link_name = link_name, .slot = slot, .components = comps,
       .flat = md_key(node, "air.flat") >= 0,
       .centroid = md_key(node, "air.centroid") >= 0,
       .sample = md_key(node, "air.sample") >= 0,
@@ -2523,8 +2523,11 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          var->data.interpolation = INTERP_MODE_SMOOTH;
       var->data.centroid = md_key(node, "air.centroid") >= 0;
       var->data.sample = md_key(node, "air.sample") >= 0;
-      if (c->nir->info.stage == MESA_SHADER_FRAGMENT)
-         add_varying(c, name, slot, air_nir_components(t), node);
+      if (c->nir->info.stage == MESA_SHADER_FRAGMENT) {
+         int link_key = md_key(node, "air.fragment_input");
+         add_varying(c, name, link_key >= 0 ? md_str(node, link_key + 1) : NULL, slot,
+                     air_nir_components(t), node);
+      }
       nir_def *loaded = nir_load_var(&c->b, var);
       if (io_is_boolean(t))
          loaded = nir_ine_imm(&c->b, loaded, 0);   /* see io_is_boolean */
@@ -2586,8 +2589,8 @@ translate_output(struct air_ctx *c, const struct air_md *node, unsigned field,
       location = VARYING_SLOT_VIEWPORT;
    } else if (md_key(node, "air.vertex_output") >= 0) {
       location = VARYING_SLOT_VAR0 + (*next_varying)++;
-      add_varying(c, md_str(node, md_key(node, "air.vertex_output") + 1), location,
-                  air_nir_components(t), node);
+      const char *link_name = md_str(node, md_key(node, "air.vertex_output") + 1);
+      add_varying(c, link_name, link_name, location, air_nir_components(t), node);
    } else {
       for (unsigned i = 0; i < node->num_ops; i++) {
          const char *s = md_str(node, i);
@@ -6435,8 +6438,10 @@ keep_info(void *mem_ctx, struct air_shader_info *info)
    if (info->num_varyings) {
       info->varyings = ralloc_memdup(mem_ctx, info->varyings,
                                      info->num_varyings * sizeof(*info->varyings));
-      for (unsigned i = 0; i < info->num_varyings; i++)
+      for (unsigned i = 0; i < info->num_varyings; i++) {
          info->varyings[i].name = ralloc_strdup(mem_ctx, info->varyings[i].name);
+         info->varyings[i].link_name = ralloc_strdup(mem_ctx, info->varyings[i].link_name);
+      }
    }
    if (info->num_vertex_attributes) {
       info->vertex_attributes =

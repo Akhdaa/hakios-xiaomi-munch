@@ -41,7 +41,8 @@ struct hakios_camera_frame {
 	uint32_t        sensor;         /* which: 0 the macro, 1 the wide, 2 the front, 3 the ultra-wide camera */
 	uint32_t        focus;          /* the lens's position as last set, 0 (the furthest) to 1023: HAKIOS_CAMERA_NO_FOCUS where it
 	                                 * has no motor (or it does not answer) */
-	uint32_t        reserved[5];
+	uint32_t        focus_min, focus_max; /* usable DAC range, or both zero for older streams */
+	uint32_t        reserved[3];
 };
 
 #define HAKIOS_CAMERA_NO_FOCUS 0xffffffffu

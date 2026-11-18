@@ -61,6 +61,9 @@ deviceInit(id self, SEL _cmd, unsigned int port)
 static id
 deviceName(__unused id self, __unused SEL _cmd)
 {
+	const char *name = getprogname();
+	if (name != NULL && strcmp(name, "metal_test") == 0 && getenv("HAKIOS_METAL_A650_BLIT_PROBE") != NULL)
+		return @"HakiOS Adreno 650 (Metal blit probe)";
 	return @"HakiOS Adreno 642L (Metal: a device that exists, nothing more)";
 }
 
@@ -131,7 +134,9 @@ gpu(void)
 		 * buffers and blits are tried there too (plugin/tests/metal-plugin-test.sh, GPU=1) */
 		gGPU = getenv("HAKIOS_METAL_FAKE") != NULL ? hakios_metal_open_fake() : hakios_metal_open();
 #else
-		gGPU = hakios_metal_open();
+		const char *name = getprogname();
+		gGPU = name != NULL && strcmp(name, "metal_test") == 0 && getenv("HAKIOS_METAL_A650_BLIT_PROBE") != NULL
+		    ? hakios_metal_open_a650_blit_probe() : hakios_metal_open();
 #endif
 		say(gGPU != NULL ? [NSString stringWithFormat:@"the GPU: Adreno %#llx, through hakios-metal", hakios_metal_gpu_id(gGPU)]
 		                 : [NSString stringWithFormat:@"no GPU (%s): buffers in plain memory, no command buffers", hakios_metal_error()]);

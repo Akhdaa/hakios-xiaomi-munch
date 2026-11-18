@@ -92,6 +92,7 @@
  * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
  */
 #include <kern/clock.h>
+#include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -99,6 +100,7 @@
 #include <sys/hakios.input.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
+#include <sys/hakios.version.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -119,6 +121,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * as well, before the next register is touched.
  */
 extern void loader_log_putc(char c);
+extern kern_return_t thread_terminate(thread_t thread);
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -271,6 +274,92 @@ wait_for(struct block *b, uint32_t offset, uint32_t mask, uint32_t value, uint32
 	}
 	return (rd(b->base + offset) & mask) == value;
 }
+
+/* ---- the phones ---------------------------------------------------------------------------------------- */
+
+/*
+ * What differs between the two phones this driver is for, as far as the steps written for both go.
+ * The POCO F4 (munch, hw=munch) has an Adreno 650 (dt qcom,chipid 0x06050002) in an SM8250: the
+ * GPU block, its power switches and its SMMU are where redwood has them, and so are the GPU's
+ * clocks in the global clock controller (gcc-kona.c); its own clock controller (gpucc-kona.c) has
+ * the same offsets as far as it has the clocks, but no "cb" and no "hub" (an Adreno 660 thing),
+ * and puts the 3D core's domain register elsewhere (dt syscon@3d91508). The GMU (dt
+ * qcom,gmu@3d6a000, 0x30000 long), its RPMh channel (rscc 0x3de0000) and the SMMU (0x3da0000, but
+ * 0x10000 long) are as those steps look for them; what differs from step 12 on, firmware, chip,
+ * speeds and the 3D core's registers, is in struct gpu_board. Its PDC too is the always-on
+ * processor's to program (pdc_in_aop).
+ */
+/* A speed of the 3D core and the level of its rail (dt: qcom,gpu-pwrlevels, and the opp table on munch). */
+struct gpu_speed {
+	uint32_t khz, level;
+};
+static const struct gpu_speed speeds_redwood[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
+/* munch: dt gpu-opp-table_v2, all seven as E404's kgsl has them -- 305 MHz at level 64 up to 670 at 320; gpu_dcvs moves between them */
+static const struct gpu_speed speeds_munch[] = { { 0, 0 }, { 305000, 64 }, { 400000, 128 }, { 441600, 144 }, { 490000, 192 },
+	{ 525000, 224 }, { 587000, 256 }, { 670000, 320 } };
+#define GPU_SPEEDS_MAX          16
+
+struct gpu_board {
+	const char *name;
+	uint32_t steps;                         /* the last step written for this phone */
+	const char *fw_gmu, *fw_sqe, *fw_zap_header, *fw_zap;
+	uint32_t gmu_chip;                      /* the chip as the GMU's firmware wants it told */
+	uint64_t chip_id;                       /* dt: qcom,chipid */
+	uint32_t gpu_id;                        /* Mesa's number for it; 0: the chip id says it */
+	uint32_t rsc_tcs2;                      /* the third hidden command of the GMU's RPMh channel */
+	uint64_t zap_memory;                    /* dt: the zap shader's memory-region */
+	const struct gpu_speed *speeds;
+	uint32_t speed_count, speed_start;      /* how many (the first: off), and the one asked for at the start */
+	uint32_t ddr_wait;                      /* of the table of bus votes */
+	uint32_t gmem_size, highest_bank_bit, macrotile_mode;
+	/* registers that differ between the two (Linux's a6xx_set_ubwc_config, the vendor's a6xx_start) */
+	uint32_t pc_dbg_eco_cntl, hang_cycles, uche_client_pf;
+	uint32_t rb_nc_mode, tpl1_nc_mode, sp_nc_mode, uche_mode, rbbm_nc_mode;
+	uint32_t core_stream_mask;              /* see stream_mask() */
+	bool a660;                              /* the Adreno 660 family's own registers exist */
+	uint32_t gpucc_cx_hw_ctrl, gpucc_gx_domain_misc;
+	uint32_t gpucc_cb, gpucc_hub_aon, gpucc_hub_rcgr, gpucc_hub_cx_int;    /* 0: the phone has none */
+	uint32_t fuse_speed_bin, fuse_speed_bin_bits;   /* the cell in the error-corrected copy; bits from bit 5 */
+	/* the SoC's frequency counter (step 5): the crystal/4 time base, and what selects which clock it counts */
+	uint32_t gcc_xo_div4_cbcr, gcc_debug_gpucc;
+	uint8_t dbg_cxo_aon, dbg_gx_gfx3d, dbg_gx_gmu, dbg_ahb, dbg_cx_gmu, dbg_cxo, dbg_hub_cx_int, dbg_cb, dbg_hub_aon;
+};
+
+static const struct gpu_board board_redwood = {
+	.name = "redwood", .steps = 22,
+	.fw_gmu = "a660_gmu.bin", .fw_sqe = "a660_sqe.fw", .fw_zap_header = "a660_zap.mdt", .fw_zap = "a660_zap.b02",
+	.gmu_chip = 0x06035000, .chip_id = 0x06030500, .rsc_tcs2 = 0x80000021, .zap_memory = 0x8b71a000,
+	.speeds = speeds_redwood, .speed_count = 4, .speed_start = 3, .ddr_wait = 7, .gmem_size = 512 * 1024, .highest_bank_bit = 14, .macrotile_mode = 1,
+	.pc_dbg_eco_cntl = 0x00200200, .hang_cycles = 0x1fffff, .uche_client_pf = 1u << 7 | 1,
+	.rb_nc_mode = 1u << 11 | 1u << 4 | 1u << 1, .tpl1_nc_mode = 1u << 1, .sp_nc_mode = 2u << 4 | 1u << 1, .uche_mode = 1u << 21,
+	.rbbm_nc_mode = 1, .a660 = true, .core_stream_mask = 0x400,
+	.gpucc_cx_hw_ctrl = 0x1540, .gpucc_gx_domain_misc = 0x158c,
+	.gpucc_cb = 0x1170, .gpucc_hub_aon = 0x1178, .gpucc_hub_rcgr = 0x117c, .gpucc_hub_cx_int = 0x1204,
+	.fuse_speed_bin = 0x41e9, .fuse_speed_bin_bits = 8,
+	.gcc_xo_div4_cbcr = 0x6200c, .gcc_debug_gpucc = 0x146,         /* debugcc-yupik.c */
+	.dbg_cxo_aon = 0x0b, .dbg_gx_gfx3d = 0x0d, .dbg_gx_gmu = 0x11, .dbg_ahb = 0x12, .dbg_cx_gmu = 0x1a, .dbg_cxo = 0x1b,
+	.dbg_hub_cx_int = 0x1c, .dbg_cb = 0x26, .dbg_hub_aon = 0x27,
+};
+
+static const struct gpu_board board_munch = {
+	.name = "munch", .steps = 22,
+	.fw_gmu = "a650_gmu.bin", .fw_sqe = "a650_sqe.fw", .fw_zap_header = "a650_zap.mdt", .fw_zap = "a650_zap.b02",
+	/*
+	 * adreno-gpulist.h (adreno_gpu_core_a650v2), adreno_a6xx.c (a6xx_start), the live device tree: chipid
+	 * 0x6050002, highest bank bit 16 (LPDDR5), UBWC 4.0, minimum access 32 bytes.
+	 */
+	.gmu_chip = 0x06050200, .chip_id = 0x06050002, .gpu_id = 650, .rsc_tcs2 = 0x80000000, .zap_memory = 0x8681a000,
+	.speeds = speeds_munch, .speed_count = 8, .speed_start = 4, .ddr_wait = 1, .gmem_size = 1152 * 1024, .highest_bank_bit = 16, .macrotile_mode = 0,
+	.pc_dbg_eco_cntl = 0x00300200, .hang_cycles = 0xcfffff, .uche_client_pf = 1,
+	.rb_nc_mode = 1u << 11 | 1u << 4 | 3u << 1, .tpl1_nc_mode = 3u << 1, .sp_nc_mode = 2u << 4 | 3u << 1, .uche_mode = 3u << 21,
+	.rbbm_nc_mode = 0, .a660 = false, .core_stream_mask = 0x401,
+	.gpucc_cx_hw_ctrl = 0x1540, .gpucc_gx_domain_misc = 0x1508,     /* dt: syscon@3d91540, syscon@3d91508 */
+	.fuse_speed_bin = 0x419b, .fuse_speed_bin_bits = 3,              /* dt: gpu_speed_bin@419b, bits = <5 3> */
+	.gcc_xo_div4_cbcr = 0x4300c, .gcc_debug_gpucc = 0x163,         /* debugcc-kona.c: the time base is elsewhere */
+	.dbg_cxo_aon = 0x0a, .dbg_gx_gfx3d = 0x0b, .dbg_gx_gmu = 0x0f, .dbg_ahb = 0x10, .dbg_cx_gmu = 0x18, .dbg_cxo = 0x19,
+};
+
+static const struct gpu_board *board = &board_redwood;
 
 /* ---- step 1: the clocks from outside, and RPMh's names ------------------------------------------------ */
 
@@ -435,6 +524,14 @@ step_fuses(void)
 {
 	uint32_t bin, gaming;
 
+	if (board == &board_munch) {
+		announce("read the GPU's speed bin where the phone's device tree has it (qfprom 0x78419b, bits 5 to 7)");
+		bin = get8(&qfprom, "speed bin", board->fuse_speed_bin) >> 5 & ((1u << board->fuse_speed_bin_bits) - 1);
+		speed_bin = bin;
+		printf("adreno: %u: speed bin %u (the device tree's qcom,speed-bin of the power levels)\n", step, bin);
+		return true;
+	}
+
 	announce("read the GPU's fuses in the error-corrected copy (0x784000), which Linux reads");
 	bin = get8(&qfprom, "speed bin, low", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN);
 	bin |= get8(&qfprom, "speed bin, high", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN + 1) << 8;
@@ -471,12 +568,12 @@ static struct block gpucc = { "gpucc", 0x03d90000, 0x9000 };
 #define GPUCC_CX_GMU_CBCR       0x1098          /* gpu_cc_cx_gmu_clk: the GMU */
 #define GPUCC_CXO_CBCR          0x109c          /* gpu_cc_cxo_clk: the crystal, for the GMU's timers */
 #define GPUCC_GMU_RCGR          0x1120          /* gpu_cc_gmu_clk_src: +0 command, +4 source and divider */
-#define GPUCC_CB_CBCR           0x1170          /* gpu_cc_cb_clk: Linux keeps it on always */
-#define GPUCC_HUB_AON_CBCR      0x1178          /* gpu_cc_hub_aon_clk */
-#define GPUCC_HUB_RCGR          0x117c          /* gpu_cc_hub_clk_src */
-#define GPUCC_HUB_CX_INT_CBCR   0x1204          /* gpu_cc_hub_cx_int_clk */
-#define GPUCC_CX_HW_CTRL        0x1540          /* dt: gpu_cx_hw_ctrl: bit 31 is where the vendor's driver sees CX come on */
-#define GPUCC_GX_DOMAIN_MISC    0x158c          /* dt: gpu_gx_domain_addr */
+#define GPUCC_CB_CBCR           (board->gpucc_cb)       /* gpu_cc_cb_clk: Linux keeps it on always */
+#define GPUCC_HUB_AON_CBCR      (board->gpucc_hub_aon)  /* gpu_cc_hub_aon_clk */
+#define GPUCC_HUB_RCGR          (board->gpucc_hub_rcgr) /* gpu_cc_hub_clk_src */
+#define GPUCC_HUB_CX_INT_CBCR   (board->gpucc_hub_cx_int) /* gpu_cc_hub_cx_int_clk */
+#define GPUCC_CX_HW_CTRL        (board->gpucc_cx_hw_ctrl) /* dt: gpu_cx_hw_ctrl: bit 31 is where the vendor's driver sees CX come on */
+#define GPUCC_GX_DOMAIN_MISC    (board->gpucc_gx_domain_misc) /* dt: gpu_gx_domain_addr */
 #define GPUCC_SMMU_VOTE_CBCR    0x5000          /* gpu_cc_hlos1_vote_gpu_smmu_clk: our vote for the SMMU's clock */
 
 #define GDSC_SW_COLLAPSE        (1u << 0)       /* a power switch's control register (gdsc.c): off, by software */
@@ -506,16 +603,22 @@ step_gpucc(void)
 	get(&gpucc, "pll1 multiplier", GPUCC_PLL1_MODE + 4);
 	get(&gpucc, "gmu_clk_src command", GPUCC_GMU_RCGR);
 	get(&gpucc, "gmu_clk_src source", GPUCC_GMU_RCGR + 4);
-	get(&gpucc, "hub_clk_src command", GPUCC_HUB_RCGR);
-	get(&gpucc, "hub_clk_src source", GPUCC_HUB_RCGR + 4);
+	if (GPUCC_HUB_RCGR) {
+		get(&gpucc, "hub_clk_src command", GPUCC_HUB_RCGR);
+		get(&gpucc, "hub_clk_src source", GPUCC_HUB_RCGR + 4);
+	}
 	get(&gpucc, "cxo_aon", GPUCC_CXO_AON_CBCR);
 	get(&gpucc, "gx_gmu", GPUCC_GX_GMU_CBCR);
 	get(&gpucc, "ahb", GPUCC_AHB_CBCR);
 	get(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR);
 	get(&gpucc, "cxo", GPUCC_CXO_CBCR);
-	get(&gpucc, "cb", GPUCC_CB_CBCR);
-	get(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
-	get(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
+	if (GPUCC_CB_CBCR) {
+		get(&gpucc, "cb", GPUCC_CB_CBCR);
+	}
+	if (GPUCC_HUB_AON_CBCR) {
+		get(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
+		get(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
+	}
 	get(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR);
 	return true;
 }
@@ -667,18 +770,19 @@ step_clocks(void)
 		return false;
 	}
 
-	announce("in the GPU's clock controller: the GMU's clock to 200 MHz, the hub's to 150 MHz");
+	announce(GPUCC_HUB_RCGR ? "in the GPU's clock controller: the GMU's clock to 200 MHz, the hub's to 150 MHz" :
+	    "in the GPU's clock controller: the GMU's clock to 200 MHz");
 	if (!clock_source("gmu_clk_src", GPUCC_GMU_RCGR, RCG_GPLL0_DIV(3)) ||       /* 300 MHz / 1.5 */
-	    !clock_source("hub_clk_src", GPUCC_HUB_RCGR, RCG_GPLL0_DIV(4))) {       /* 300 MHz / 2 */
+	    (GPUCC_HUB_RCGR && !clock_source("hub_clk_src", GPUCC_HUB_RCGR, RCG_GPLL0_DIV(4)))) {   /* 300 MHz / 2 */
 		return false;
 	}
 
 	announce("in the GPU's clock controller: the clocks of the GMU and of the SMMU on");
-	if (!clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false) ||
+	if ((GPUCC_CB_CBCR && !clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false)) ||
 	    !clock_on(&gpucc, "cxo", GPUCC_CXO_CBCR, true) ||
 	    !clock_on(&gpucc, "ahb", GPUCC_AHB_CBCR, false) ||
-	    !clock_on(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR, true) ||
-	    !clock_on(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR, true) ||
+	    (GPUCC_HUB_AON_CBCR && !clock_on(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR, true)) ||
+	    (GPUCC_HUB_CX_INT_CBCR && !clock_on(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR, true)) ||
 	    !clock_on(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true) ||
 	    !clock_on(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR, false)) {
 		return false;
@@ -696,10 +800,10 @@ step_clocks(void)
  * clk-debug.c (mainline Linux has no counterpart).
  */
 #define GCC_DEBUG_MUX           0x62000         /* [9:0] which clock goes to the counter */
-#define GCC_DEBUG_MUX_GPUCC     0x146           /* ... the debug output of the GPU's clock controller */
+#define GCC_DEBUG_MUX_GPUCC     (board->gcc_debug_gpucc) /* ... the debug output of the GPU's clock controller */
 #define GCC_DEBUG_DIV           0x62004         /* [3:0] divider - 1; both controllers divide by 2 */
 #define GCC_DEBUG_CBCR          0x62008
-#define GCC_XO_DIV4_CBCR        0x6200c         /* the counter's time base: the crystal / 4, 4.8 MHz */
+#define GCC_XO_DIV4_CBCR        (board->gcc_xo_div4_cbcr) /* the counter's time base: the crystal / 4, 4.8 MHz */
 #define GCC_MEASURE_CTL         0x62038         /* [19:0] how many ticks of the time base to count for */
 #define MEASURE_RUN             (1u << 20)
 #define MEASURE_CLEAR           (1u << 21)
@@ -711,15 +815,15 @@ step_clocks(void)
 #define GPUCC_DEBUG_DIV         0x10fc
 #define GPUCC_DEBUG_CBCR        0x1100
 #define GPUCC_DEBUG_MUX         0x1568          /* [7:0] which of the GPU's clocks */
-#define GPUCC_DEBUG_CXO_AON     0x0b
-#define GPUCC_DEBUG_GX_GFX3D    0x0d            /* the 3D core's own clock */
-#define GPUCC_DEBUG_GX_GMU      0x11
-#define GPUCC_DEBUG_AHB         0x12
-#define GPUCC_DEBUG_CX_GMU      0x1a
-#define GPUCC_DEBUG_CXO         0x1b
-#define GPUCC_DEBUG_HUB_CX_INT  0x1c
-#define GPUCC_DEBUG_CB          0x26
-#define GPUCC_DEBUG_HUB_AON     0x27
+#define GPUCC_DEBUG_CXO_AON     (board->dbg_cxo_aon)
+#define GPUCC_DEBUG_GX_GFX3D    (board->dbg_gx_gfx3d)   /* the 3D core's own clock */
+#define GPUCC_DEBUG_GX_GMU      (board->dbg_gx_gmu)
+#define GPUCC_DEBUG_AHB         (board->dbg_ahb)
+#define GPUCC_DEBUG_CX_GMU      (board->dbg_cx_gmu)
+#define GPUCC_DEBUG_CXO         (board->dbg_cxo)
+#define GPUCC_DEBUG_HUB_CX_INT  (board->dbg_hub_cx_int)    /* 0: the phone has no such clock */
+#define GPUCC_DEBUG_CB          (board->dbg_cb)
+#define GPUCC_DEBUG_HUB_AON     (board->dbg_hub_aon)
 
 /* Let the counter run for so many ticks of its time base; what it counted of the clock on its input. */
 static uint32_t
@@ -800,7 +904,7 @@ measure_quietly(uint32_t select)
 static bool
 measure_clocks(void)
 {
-	static const struct {
+	const struct {
 		const char *name;
 		uint32_t select;
 	} clocks[] = {
@@ -811,7 +915,7 @@ measure_clocks(void)
 	uint32_t hz, ahb_hz = MEASURE_FAILED;
 
 	announce("measure the GPU block's clocks with the SoC's frequency counter (debug registers at gcc 0x162000.., "
-	    "gpucc 0x3d910fc, 0x3d91100, 0x3d91568)");
+	    "its time base, gpucc 0x3d910fc, 0x3d91100, 0x3d91568)");
 	hz = measure(GPUCC_DEBUG_CXO);
 	if (hz == MEASURE_FAILED) {
 		printf("adreno: %u: the counter did not finish: it cannot be used as it is set up here\n", step);
@@ -823,6 +927,9 @@ measure_clocks(void)
 		return false;
 	}
 	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
+		if (clocks[i].select == 0) {
+			continue;               /* (a clock this phone does not have) */
+		}
 		hz = measure_quietly(clocks[i].select);
 		if (hz == MEASURE_FAILED) {
 			printf("adreno: %u: measured: %s: the counter did not finish\n", step, clocks[i].name);
@@ -892,6 +999,11 @@ static struct block gmu = { "gmu", 0x03d6a000, 0x34000 };
 #define GMU_DTCM                GMU_WORD(0x1c00)        /* the processor's 16K of data memory (its code: 0x0c00) */
 #define GMU_DTCM_VERSIONS       GMU_WORD(0x1c00 + 0xff8) /* five words where loaded firmware carries its versions */
 #define GMU_CM3_SYSRESET        GMU_WORD(0x5000)        /* 1: the processor is held in reset */
+/* kgsl a6xx_reg.h 0x1f840..: the GMU's power counter 0 counts crystal ticks (19.2 MHz) while what select 0 names is so */
+#define GMU_POWER_COUNTER_ENABLE GMU_WORD(0x5040)
+#define GMU_POWER_COUNTER_SELECT_0 GMU_WORD(0x5041)     /* [7:0] 0x20: the GPU busy (kgsl adreno_a6xx.c) */
+#define GMU_POWER_COUNTER_XOCLK_0_L GMU_WORD(0x5044)
+#define GMU_POWER_COUNTER_XOCLK_0_H GMU_WORD(0x5045)
 #define GMU_CM3_BOOT_CONFIG     GMU_WORD(0x5001)
 #define GMU_CM3_FW_INIT_RESULT  GMU_WORD(0x501c)        /* 0xbabeface once firmware has started */
 #define GMU_CM3_CFG             GMU_WORD(0x502d)
@@ -1408,15 +1520,23 @@ space_faulted(const struct gpu_space *space)
 }
 
 /*
- * One more stream through a context that is on. A match is taken only as the device tree has
- * it, a stream and the mask 0x400: one entry for streams 0 and 1 (mask 0x401) reads back 0.
+ * The mask of a stream's match register. It is taken only as the device tree has it, the hypervisor
+ * reads back 0 for anything else: 0x400 on redwood for all of them; on munch 0x401 for stream 0
+ * (gfx3d_user: iommus <0x183 0 0x401>, streams 0 and 1 in one) and 0x400 for the GMU's.
  */
+static uint32_t
+stream_mask(uint32_t stream)
+{
+	return stream == 0 ? board->core_stream_mask : SMMU_STREAM_MASK;
+}
+
+/* One more stream through a context that is on. */
 static bool
 space_stream(struct gpu_space *space, uint32_t match, uint32_t stream)
 {
 	put(&smmu, "s2cr", SMMU_S2CR(match), space->context);
-	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream);
-	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream) ||
+	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | stream_mask(stream) << 16 | stream);
+	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | stream_mask(stream) << 16 | stream) ||
 	    (get(&smmu, "s2cr", SMMU_S2CR(match)) & 0x300ff) != space->context) {
 		printf("adreno: %u: the SMMU did not take what was written: stream %u is not going through context %u\n", step,
 		    stream, space->context);
@@ -1456,10 +1576,10 @@ space_on(struct gpu_space *space, uint32_t match, uint32_t stream)
 	}
 	put(&smmu, "cb sctlr", context + SMMU_CB_SCTLR, SMMU_SCTLR_ON | space->control);
 	put(&smmu, "s2cr", SMMU_S2CR(match), space->context);
-	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream);
+	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | stream_mask(stream) << 16 | stream);
 
 	/* the global ones are the hypervisor's to grant: see what it made of them */
-	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream) ||
+	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | stream_mask(stream) << 16 | stream) ||
 	    (get(&smmu, "s2cr", SMMU_S2CR(match)) & 0x300ff) != space->context ||
 	    (get(&smmu, "cbar", smmu_page + SMMU_CBAR(space->context)) & 0x30000) != (SMMU_CBAR_STAGE_1 & 0x30000) ||
 	    !(get(&smmu, "cb sctlr", context + SMMU_CB_SCTLR) & 1) ||
@@ -1648,7 +1768,7 @@ zap_header(uint64_t *phys)
 	uint64_t size = 0;
 	uint32_t segments, hashes;
 
-	header = image_file("fw", "a660_zap.mdt", &size);
+	header = image_file("fw", board->fw_zap_header, &size);
 	if (header == NULL) {
 		return false;
 	}
@@ -1682,7 +1802,7 @@ step_zap_signature(void)
 	uint64_t header = 0, answer = ~0ull;
 	int32_t result;
 
-	announce("find the zap shader's header, fw/a660_zap.mdt, in the small image that came with the kernel");
+	announce("find the zap shader's header in the small image that came with the kernel");
 	if (!zap_header(&header)) {
 		return false;
 	}
@@ -1743,8 +1863,8 @@ step_gmu_space(void)
 	if (!cx_ready()) {
 		return false;
 	}
-	announce("find the GMU's firmware, fw/a660_gmu.bin, in the small image, and make the memory it asks for");
-	gmu_firmware = image_file("fw", "a660_gmu.bin", &gmu_firmware_size);
+	announce("find the GMU's firmware in the small image, and make the memory it asks for");
+	gmu_firmware = image_file("fw", board->fw_gmu, &gmu_firmware_size);
 	if (gmu_firmware == NULL) {
 		return false;
 	}
@@ -1878,7 +1998,6 @@ step_gmu_firmware(void)
 #define GMU_RSCC_CONTROL_REQ    GMU_WORD(0x9307)
 #define GMU_AO_AHB_FENCE_CTRL   GMU_WORD(0x9310)
 #define GMU_AHB_FENCE_RANGE_0   GMU_WORD(0x9311)
-#define GMU_CHIP                0x06035000      /* dt qcom,chipid 0x06030500 the way the firmware wants it */
 #define GMU_STARTED_MASK        0x1ff           /* of fw_init_result, for firmware newer than core 0x20010004 */
 #define GMU_STARTED             0x100
 #define GMU_FAILED              0xe00
@@ -1960,7 +2079,7 @@ step_gmu_start(void)
 	put(&gmu, "cm3_cfg", GMU_CM3_CFG, 0x4052);
 	put(&gbif, "halt", GBIF_HALT, 0);
 	put(&gmu, "pwr_col_cp_resp", GMU_PWR_COL_CP_RESP, 0);
-	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, GMU_CHIP);
+	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, board->gmu_chip);
 	put(&gmu, "pwr_col_cp_msg", GMU_PWR_COL_CP_MSG, GMU_LOG_ADDRESS | (GMU_LOG_SIZE / 4096 - 1));
 	put(&gmu, "sys_bus_config", GMU_SYS_BUS_CONFIG, 1);
 	put(&gmu, "icache_config", GMU_ICACHE_CONFIG, 1);
@@ -2025,7 +2144,7 @@ step_gmu_queues(void)
 
 	announce("give the GMU's RPMh channel its sleep and wake program (rscc, 0x3de0000), unless it has it");
 	if (get(&rscc, "seq_mem_0_drv0", RSCC_SEQ_MEM_0_DRV0) == program[0] &&
-	    get(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4) == 0x80000021) {
+	    get(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4) == board->rsc_tcs2) {
 		goto programmed;
 	}
 	put(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0, 1u << 24);
@@ -2034,7 +2153,7 @@ step_gmu_queues(void)
 	put(&rscc, "hidden_tcs_cmd0_addr", RSCC_HIDDEN_TCS_CMD0_ADDR, 0);
 	put(&rscc, "hidden_tcs_cmd1_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 2, 0);
 	put(&rscc, "hidden_tcs_cmd1_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 2, 0);
-	put(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4, 0x80000021);    /* a650 and later */
+	put(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4, board->rsc_tcs2);
 	put(&rscc, "hidden_tcs_cmd2_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 4, 0);
 	put(&rscc, "override_start_addr", RSCC_OVERRIDE_START_ADDR, 0);
 	put(&rscc, "pdc_seq_start_addr", RSCC_PDC_SEQ_START_ADDR, 0x4520);
@@ -2195,6 +2314,8 @@ gmu_post_mortem(void)
 }
 
 /* Send a message whose first word is yet to be made and wait for the GMU's verdict on it. */
+static bool hfi_quiet;                  /* the speed votes of gpu_dcvs: one line in thirty seconds, not four a vote */
+
 static bool
 hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 {
@@ -2204,7 +2325,9 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 	bool answered = false;
 
 	message[0] = id | words << 8 | number << 20;
-	printf("adreno: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
+	if (!hfi_quiet) {
+		printf("adreno: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
+	}
 	snprintf(last_write, sizeof(last_write), "step %u sent the GMU message %u (%s)", step, id, what);
 	hold(true);
 	for (uint32_t i = 0; i < (words + 3) / 4 * 4; i++) {
@@ -2237,7 +2360,9 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 		}
 		return false;
 	}
-	printf("adreno: %u: the GMU accepts %s\n", step, what);
+	if (!hfi_quiet) {
+		printf("adreno: %u: the GMU accepts %s\n", step, what);
+	}
 	return true;
 }
 
@@ -2285,9 +2410,7 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 static bool
 step_core_power(void)
 {
-	static const struct {
-		uint32_t khz, level;
-	} speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
+	const struct gpu_speed *speeds = board->speeds;
 	static struct hfi_perf_table perf;
 	static struct hfi_bw_table bw;
 	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 3, HFI_NO_INDEX }, granted = 0, speed = 0;
@@ -2302,7 +2425,8 @@ step_core_power(void)
 		printf("adreno: %u: RPMh's list lacks one of the rails\n", step);
 		return false;
 	}
-	perf.gpu_levels = sizeof(speeds) / sizeof(speeds[0]);
+	perf.gpu_levels = board->speed_count <= GPU_SPEEDS_MAX ? board->speed_count : GPU_SPEEDS_MAX;
+	vote[2] = board->speed_start;
 	for (unsigned i = 0; i < perf.gpu_levels; i++) {
 		perf.gpu[i].khz = speeds[i].khz;
 		perf.gpu[i].acd = 0xffffffff;           /* no adaptive clocking */
@@ -2322,7 +2446,7 @@ step_core_power(void)
 
 	bw.levels = 1;
 	bw.ddr_commands = 3;
-	bw.ddr_wait = 7;
+	bw.ddr_wait = board->ddr_wait;
 	bw.ddr_address[0] = rpmh_resource("SH0", NULL, NULL);
 	bw.ddr_address[1] = rpmh_resource("MC0", NULL, NULL);
 	bw.ddr_address[2] = rpmh_resource("ACV", NULL, NULL);
@@ -2565,9 +2689,12 @@ step_core_space(void)
 	if (!cx_ready() || !core_is_on) {
 		return false;
 	}
+	if (board->core_stream_mask & 1) {
+		stream1 = 0;                    /* (the one match register has streams 0 and 1) */
+	}
 	PE_parse_boot_argn("adreno_stream1", &stream1, sizeof(stream1));
-	announce("make the 3D core's memory: its ring, its microcode (fw/a660_sqe.fw), a page to try writing to");
-	microcode = image_file("fw", "a660_sqe.fw", &size);
+	announce("make the 3D core's memory: its ring, its microcode, a page to try writing to");
+	microcode = image_file("fw", board->fw_sqe, &size);
 	if (microcode == NULL || size < 8 || size > 0x40000 ||
 	    !block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, PTE_CORE) ||
 	    !block_new(&core_space, &core_sqe, CORE_SQE_ADDRESS, (uint32_t)size - 4, PTE_CORE | PTE_READ_ONLY) ||
@@ -2623,7 +2750,7 @@ step_core_space(void)
  * (Step 21 is what tells whether the 3D core gets out of secure mode with it.) There was a
  * boot-arg adreno_zap=0 for the second and later runs of a started phone; nothing reads it now.
  */
-#define ZAP_MEMORY              0x8b71a000ull
+#define ZAP_MEMORY              (board->zap_memory)
 #define ZAP_MEMORY_SIZE         0x2000u
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_THREE_VALUES        3
@@ -2648,10 +2775,16 @@ step_zap_load(void)
 	if (!cx_ready() || !core_is_on) {
 		return false;
 	}
-	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
-	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
-	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
-	segment = image_file("fw", "a660_zap.b02", &size);
+	/*
+	 * Not on the F4: there the call did not come back, twice out of two, on a phone just come from Android, whose
+	 * zap shader TrustZone still holds (2 November). One kept from before is what the refused signature below is for.
+	 */
+	if (board != &board_munch) {
+		announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
+		printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
+		    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
+	}
+	segment = image_file("fw", board->fw_zap, &size);
 	if (segment == NULL || size == 0 || size > 0x1000) {
 		return false;
 	}
@@ -2729,25 +2862,36 @@ step_core_start(void)
 	put(&gpu, "uche_cache_ways", UCHE_CACHE_WAYS, 0x4);
 	put(&gpu, "cp_roq_thresholds_2", CP_ROQ_THRESHOLDS_2, 0x02000140);
 	put(&gpu, "cp_roq_thresholds_1", CP_ROQ_THRESHOLDS_1, 0x8040362c);
-	put(&gpu, "cp_lpac_prog_fifo_size", CP_LPAC_PROG_FIFO_SIZE, 0x20);
+	if (board->a660) {
+		put(&gpu, "cp_lpac_prog_fifo_size", CP_LPAC_PROG_FIFO_SIZE, 0x20);
+	}
 	put(&gpu, "cp_mem_pool_size", CP_MEM_POOL_SIZE, 128);
-	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, 0x00200200);
+	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, board->pc_dbg_eco_cntl);
 	put(&gpu, "cp_ahb_cntl", CP_AHB_CNTL, 1);
 	/*
 	 * How textures in the GPU's own tiled and compressed layouts are laid out in memory (Linux's
-	 * a6xx_calc_ubwc_config, a6xx_set_ubwc_config for this GPU: highest bank bit 14, and the
-	 * rest as below); Mesa is told the same (hakios_gpu_parameter()).
+	 * a6xx_calc_ubwc_config, a6xx_set_ubwc_config, per board); Mesa is told the same
+	 * (hakios_gpu_parameter()).
 	 */
-	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 1u << 11 | 1u << 4 | 1u << 1);
-	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), 1u << 1);
-	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 4 | 1u << 1);
-	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), 1u << 21);
-	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), 1);
+	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), board->rb_nc_mode);
+	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), board->tpl1_nc_mode);
+	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), board->sp_nc_mode);
+	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), board->uche_mode);
+	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), board->rbbm_nc_mode);
 	put(&gpu, "rbbm_perfctr_cntl", RBBM_PERFCTR_CNTL, 1);
-	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x1fffff);
-	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, 1u << 7 | 1);
-	put(&gpu, "cp_chicken_dbg", CP_CHICKEN_DBG, 1);
-	put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 0);
+	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | board->hang_cycles);
+	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, board->uche_client_pf);
+	if (board->a660) {
+		put(&gpu, "cp_chicken_dbg", CP_CHICKEN_DBG, 1);
+		put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 0);
+	} else {
+		/* (a6xx_start: the weights of bicubic filtering, the a650 family's) */
+		static const uint32_t bicubic[] = { 0, 0x3fe05ff4, 0x3fa0ebee, 0x3f5193ed, 0x3f0243f0 };
+
+		for (unsigned i = 0; i < 5; i++) {
+			put(&gpu, "tpl1_bicubic_weights_table", GPU_WORD(0xb608 + i), bicubic[i]);
+		}
+	}
 	put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 1u << 6 | 1u << 5 | 1u << 3 | 1u << 2 | 1u << 1);
 	put(&gpu, "rb_dbg_eco_cntl", RB_DBG_ECO_CNTL, 0x04100000);     /* Mesa's value for this GPU */
 	/*
@@ -3168,7 +3312,6 @@ hakios_adreno_quiesce(void)
  * far it has got (a "fence": a submission's number, written by the core when it is through
  * with it). The caller holds one lock around all of these.
  */
-#define GPU_CHIP_ID             0x06030500ull   /* dt: qcom,chipid */
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
 #define GPU_ADDRESSES_SIZE      0xe0000000ull
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
@@ -3212,6 +3355,209 @@ static void gpu_block_stop(void);
  * next kernel's step 4 takes it down (stale_stop()). Boot-arg adreno_dirty=1 makes every ending
  * a panic's in this respect, to see that work.
  */
+/*
+ * The 3D core's speed follows its load (boot-arg gpu_dcvs, on by default where the board has more
+ * than one speed to go between; gpu_dcvs=0 keeps the starting one): every DCVS_EVERY_MS the share of
+ * the time the GPU was busy, by the GMU's power counter 0 (as kgsl reads it). Busier than DCVS_UP %:
+ * one speed up; less busy than DCVS_DOWN % twice in a row: one speed down -- between the lowest
+ * (305 MHz on munch) and the highest the board has (670), or 490 while bsd/dev/hakios_thermal.c finds
+ * the phone hot (hakios_adreno_hot()). Each change is a GX_BW_PERF_VOTE to the GMU, as at the start,
+ * under HakiosGPU's lock (HakiosGPUTick()), so that it never meets a submission or the run's end.
+ */
+#define DCVS_EVERY_MS           50
+#include "hakios.dcvs.h"                /* DCVS_UP, DCVS_DOWN, DCVS_HOT_KHZ and the choice, dcvs_next() */
+#define DCVS_NOTE_SECONDS       30
+/*
+ * Boot-arg fb_stats=1 (the display driver's pacing line, MiniIOMobileFramebuffer.cpp): the note every
+ * DCVS_STATS_SECONDS instead, with the time spent at each speed, the windows busier than DCVS_UP % and
+ * the windows animating and floored (below); without it the note is as it was. Nothing of the speed's
+ * choice changes.
+ */
+#define DCVS_STATS_SECONDS      5
+#define DCVS_SPEEDS             16
+/*
+ * Boot-arg gpu_anim_floor=MHz: the lowest speed of the 3D core while the UI animates, munch only (0, the default: none).
+ * Rounded up to a speed of the board (speeds_munch), never above the thermal cap (DCVS_HOT_KHZ while hot: dcvs_next).
+ * Animating: DCVS_ANIM_SUBMISSIONS or more submissions of the user clients in a window (hakios.gpu.cpp counts them
+ * and HakiosGPUTick() passes the count), and for DCVS_ANIM_HOLD_MS after the last such window.
+ */
+#define DCVS_ANIM_SUBMISSIONS   2
+#define DCVS_ANIM_HOLD_MS       250
+static uint32_t dcvs_index, dcvs_low = 1, dcvs_high, dcvs_down_count, dcvs_changes, dcvs_samples;
+static uint32_t dcvs_stats, dcvs_busy_windows, dcvs_floor_index, dcvs_anim_windows, dcvs_floored_windows;
+static volatile bool dcvs_hot;
+static uint64_t dcvs_busy_before, dcvs_time_before, dcvs_last_note, dcvs_khz_sum, dcvs_busy_sum, dcvs_anim_last;
+static uint64_t dcvs_speed_ns[DCVS_SPEEDS];     /* fb_stats=1: the time at each speed since the last note */
+extern void HakiosGPUTick(void);        /* hakios.gpu.cpp: takes the clients' lock, then calls hakios_gpu_dcvs() */
+
+static uint64_t
+dcvs_busy_ticks(void)
+{
+	uint32_t high, low, again;
+
+	do {
+		high = rd(gmu.base + GMU_POWER_COUNTER_XOCLK_0_H);
+		low = rd(gmu.base + GMU_POWER_COUNTER_XOCLK_0_L);
+		again = rd(gmu.base + GMU_POWER_COUNTER_XOCLK_0_H);
+	} while (high != again);
+	return (uint64_t)high << 32 | low;
+}
+
+static bool
+dcvs_vote(uint32_t index)
+{
+	uint32_t vote[4] = { 0, 1, index, HFI_NO_INDEX };
+	bool done;
+
+	hfi_quiet = true;
+	done = hfi_send("a speed", HFI_GX_BW_PERF_VOTE, vote, 4);
+	hfi_quiet = false;
+	if (done) {
+		dcvs_index = index;
+		core_khz = board->speeds[index].khz;
+		dcvs_changes++;
+	}
+	return done;
+}
+
+/* From hakios.gpu.cpp, with the clients' lock held; SUBMISSIONS: the user clients' submissions since the last call. */
+void
+hakios_gpu_dcvs(uint32_t submissions)
+{
+	uint64_t busy, now, ticks, elapsed, since;
+	uint32_t percent, high = dcvs_high, next, khz[GPU_SPEEDS_MAX] = { 0 };
+	bool animating;
+
+	if (!gpu_kept) {
+		return;
+	}
+	busy = dcvs_busy_ticks();
+	now = mach_absolute_time();
+	absolutetime_to_nanoseconds(now - dcvs_time_before, &elapsed);
+	ticks = elapsed * 192 / 10000;                  /* crystal ticks in that time */
+	percent = ticks != 0 ? (uint32_t)((busy - dcvs_busy_before) * 100 / ticks) : 0;
+	percent = percent > 100 ? 100 : percent;
+	dcvs_busy_before = busy;
+	dcvs_time_before = now;
+	if (dcvs_stats) {
+		/* (the window just ended ran at the speed chosen before it) */
+		if (dcvs_index < DCVS_SPEEDS) {
+			dcvs_speed_ns[dcvs_index] += elapsed;
+		}
+		dcvs_busy_windows += percent > DCVS_UP;
+	}
+	for (uint32_t i = 0; i < board->speed_count && i < GPU_SPEEDS_MAX; i++) {
+		khz[i] = board->speeds[i].khz;
+	}
+	if (submissions >= DCVS_ANIM_SUBMISSIONS) {
+		dcvs_anim_last = now;
+	}
+	absolutetime_to_nanoseconds(now - dcvs_anim_last, &since);
+	/* (counted with the floor off too, for the fb_stats line; dcvs_next ignores it with floor index 0) */
+	animating = dcvs_anim_last != 0 && since <= (uint64_t)DCVS_ANIM_HOLD_MS * NSEC_PER_MSEC;
+	if (dcvs_stats && animating) {
+		/* floored: the floor chose a higher speed than the load alone would have */
+		uint32_t down_floor = dcvs_down_count, down_load = dcvs_down_count;
+
+		dcvs_anim_windows++;
+		dcvs_floored_windows += dcvs_next(khz, dcvs_index, percent, &down_floor, high, dcvs_low, dcvs_hot, true, dcvs_floor_index) >
+		    dcvs_next(khz, dcvs_index, percent, &down_load, high, dcvs_low, dcvs_hot, false, 0);
+	}
+	next = dcvs_next(khz, dcvs_index, percent, &dcvs_down_count, high, dcvs_low, dcvs_hot, animating, dcvs_floor_index);
+	if (next != dcvs_index) {
+		(void)dcvs_vote(next);
+	}
+	dcvs_khz_sum += core_khz;
+	dcvs_busy_sum += percent;
+	dcvs_samples++;
+	absolutetime_to_nanoseconds(now - dcvs_last_note, &elapsed);
+	if (dcvs_stats && elapsed >= (uint64_t)DCVS_STATS_SECONDS * NSEC_PER_SEC) {
+		char speeds[DCVS_SPEEDS * 24] = "";
+		size_t at = 0;
+
+		for (uint32_t i = dcvs_low; i < board->speed_count && i < DCVS_SPEEDS && at < sizeof(speeds); i++) {
+			at += (size_t)snprintf(speeds + at, sizeof(speeds) - at, "%s%u MHz %llu ms", i == dcvs_low ? "" : ", ",
+			    board->speeds[i].khz / 1000, dcvs_speed_ns[i] / NSEC_PER_MSEC);
+		}
+		printf("adreno: dcvs: the last %llu.%llu s: %llu MHz and %llu %% busy on average, %u changes, %u of %u windows past %u %% "
+		    "busy, %u animating (%u %%) and %u floored (%u %%) at gpu_anim_floor %u MHz; time at each speed: %s; now %u MHz\n",
+		    elapsed / NSEC_PER_SEC, elapsed % NSEC_PER_SEC / (NSEC_PER_SEC / 10),
+		    dcvs_khz_sum / dcvs_samples / 1000, dcvs_busy_sum / dcvs_samples, dcvs_changes, dcvs_busy_windows, dcvs_samples,
+		    DCVS_UP, dcvs_anim_windows, dcvs_anim_windows * 100 / dcvs_samples, dcvs_floored_windows,
+		    dcvs_floored_windows * 100 / dcvs_samples, dcvs_floor_index != 0 ? board->speeds[dcvs_floor_index].khz / 1000 : 0,
+		    speeds, core_khz / 1000);
+		dcvs_khz_sum = dcvs_busy_sum = 0;
+		dcvs_samples = dcvs_changes = dcvs_busy_windows = dcvs_anim_windows = dcvs_floored_windows = 0;
+		bzero(dcvs_speed_ns, sizeof(dcvs_speed_ns));
+		dcvs_last_note = now;
+	} else if (!dcvs_stats && elapsed >= (uint64_t)DCVS_NOTE_SECONDS * NSEC_PER_SEC) {
+		printf("adreno: dcvs: the last %u s: %llu MHz and %llu %% busy on average, %u changes; now %u MHz\n", DCVS_NOTE_SECONDS,
+		    dcvs_khz_sum / dcvs_samples / 1000, dcvs_busy_sum / dcvs_samples, dcvs_changes, core_khz / 1000);
+		dcvs_khz_sum = dcvs_busy_sum = 0;
+		dcvs_samples = dcvs_changes = 0;
+		dcvs_last_note = now;
+	}
+}
+
+static void
+dcvs_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	while (gpu_kept) {
+		sleep_ms(DCVS_EVERY_MS);
+		HakiosGPUTick();
+	}
+	thread_terminate(current_thread());
+}
+
+static void
+dcvs_start(void)
+{
+	uint32_t on = board->speed_count > 2;
+	thread_t thread;
+
+	PE_parse_boot_argn("gpu_dcvs", &on, sizeof(on));
+	if (!on) {
+		return;
+	}
+	PE_parse_boot_argn("fb_stats", &dcvs_stats, sizeof(dcvs_stats));
+	dcvs_index = board->speed_start;
+	dcvs_high = board->speed_count - 1;
+	if (hakios_soc_is("sm8250")) {
+		uint32_t floor_mhz = 0;
+
+		PE_parse_boot_argn("gpu_anim_floor", &floor_mhz, sizeof(floor_mhz));
+		if (floor_mhz != 0) {
+			/* rounded up to a speed of the board; past the highest, the highest */
+			dcvs_floor_index = dcvs_high;
+			for (uint32_t i = dcvs_low; i <= dcvs_high; i++) {
+				if (board->speeds[i].khz >= (uint64_t)floor_mhz * 1000) {
+					dcvs_floor_index = i;
+					break;
+				}
+			}
+			printf("adreno: dcvs: gpu_anim_floor=%u: at least %u MHz while the UI animates (%u+ submissions in %u ms, held %u ms), "
+			    "%u MHz at most while hot\n", floor_mhz, board->speeds[dcvs_floor_index].khz / 1000, DCVS_ANIM_SUBMISSIONS,
+			    DCVS_EVERY_MS, DCVS_ANIM_HOLD_MS, DCVS_HOT_KHZ / 1000);
+		}
+	}
+	wr(gmu.base + GMU_POWER_COUNTER_SELECT_0, (rd(gmu.base + GMU_POWER_COUNTER_SELECT_0) & ~0xffu) | 0x20);
+	wr(gmu.base + GMU_POWER_COUNTER_ENABLE, 1);
+	dcvs_busy_before = dcvs_busy_ticks();
+	dcvs_time_before = dcvs_last_note = mach_absolute_time();
+	if (kernel_thread_start(dcvs_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+		printf("adreno: dcvs: the 3D core's speed follows its load, %u to %u MHz, every %u ms (gpu_dcvs=0: kept at %u)\n",
+		    board->speeds[dcvs_low].khz / 1000, board->speeds[dcvs_high].khz / 1000, DCVS_EVERY_MS, core_khz / 1000);
+	}
+}
+
+/* From bsd/dev/hakios_thermal.c, beside the prime core's: the GPU at most DCVS_HOT_KHZ while the phone is hot. */
+void
+hakios_adreno_hot(bool hot)
+{
+	dcvs_hot = hot;
+}
+
 void
 hakios_gpu_stop(void)
 {
@@ -3257,7 +3603,9 @@ bool
 hakios_gpu_parameter(uint32_t which, uint64_t *value)
 {
 	switch (which) {
-	case 0x01:                              /* GPU_ID: none, the chip ID says it */
+	case 0x01:                              /* GPU_ID: on redwood none, the chip ID says it */
+		*value = board->gpu_id;
+		return true;
 	case 0x06:                              /* GMEM_BASE */
 	case 0x08:                              /* PP_PGTABLE */
 	case 0x09:                              /* FAULTS */
@@ -3266,10 +3614,10 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 0;
 		return true;
 	case 0x02:                              /* GMEM_SIZE */
-		*value = 512 * 1024;
+		*value = board->gmem_size;
 		return true;
 	case 0x03:                              /* CHIP_ID, with the speed bin above it */
-		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
+		*value = board->chip_id | (uint64_t)speed_bin << 32;
 		return true;
 	case 0x04:                              /* MAX_FREQ */
 		*value = core_khz * 1000ull;
@@ -3281,13 +3629,13 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 1;
 		return true;
 	case 0x10:                              /* HIGHEST_BANK_BIT */
-		*value = 14;
+		*value = board->highest_bank_bit;
 		return true;
 	case 0x12:                              /* UBWC_SWIZZLE */
 		*value = 6;
 		return true;
 	case 0x13:                              /* MACROTILE_MODE */
-		*value = 1;
+		*value = board->macrotile_mode;
 		return true;
 	default:                                /* among them VA_START, VA_SIZE: addresses are ours to give */
 		return false;
@@ -3725,7 +4073,7 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 static bool
 start_by_itself(void)
 {
-	static const char *const files[] = { "a660_gmu.bin", "a660_sqe.fw", "a660_zap.mdt", "a660_zap.b02" };
+	const char *const files[] = { board->fw_gmu, board->fw_sqe, board->fw_zap_header, board->fw_zap };
 	const char *missing = NULL;
 	uint64_t size;
 
@@ -3765,11 +4113,27 @@ hakios_adreno_init(void)
 	uint32_t only = 0, done = 0, failed = 0, keep = 0;
 	bool by_itself = false;
 
-	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
-		display_probe();
+	if (hakios_soc_is("sm8250")) {
+		board = &board_munch;
+		gmu.size = 0x30000;                     /* dt: qcom,gmu@3d6a000, kgsl_gmu_reg */
+		smmu.size = 0x10000;                    /* dt: kgsl-smmu@3da0000 */
+	} else if (!hakios_soc_is("sc7280")) {
+		return;                                 /* another device's GPU, if it has one, is somewhere else */
+	}
+
+	if (board == &board_redwood && PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
+		display_probe();                        /* (redwood's display controller) */
 	}
 	if (!PE_parse_boot_argn("adreno", &last_step, sizeof(last_step))) {
-		if (!(PE_parse_boot_argn("gpu", &only, sizeof(only)) && only) || !start_by_itself()) {
+		if (!(PE_parse_boot_argn("gpu", &only, sizeof(only)) && only)) {
+			return;
+		}
+		if (board->steps < 21) {
+			printf("adreno: THE GPU IS NOT STARTED: on %s only steps 1 to %u are written (adreno=N to try them)\n",
+			    board->name, board->steps);
+			return;
+		}
+		if (!start_by_itself()) {
 			return;
 		}
 		by_itself = true;
@@ -3791,6 +4155,11 @@ hakios_adreno_init(void)
 	}
 	if (last_step > STEPS) {
 		last_step = STEPS;
+	}
+	if (last_step > board->steps) {
+		printf("adreno: on %s only steps 1 to %u are written: not going beyond step %u\n", board->name, board->steps,
+		    board->steps);
+		last_step = board->steps;
 	}
 	PE_parse_boot_argn("adreno_watch", &watch_seconds, sizeof(watch_seconds));
 	for (newest_step = last_step; newest_step > 0 && (skip_steps & 1u << newest_step); newest_step--) {
@@ -3824,6 +4193,7 @@ hakios_adreno_init(void)
 			quiet = true;
 			printf("adreno: THE GPU STAYS ON for the system to draw with: the service HakiosGPU\n");
 			HakiosGPUStart();
+			dcvs_start();
 			return;
 		}
 		if (!by_itself) {

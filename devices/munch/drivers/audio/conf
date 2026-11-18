@@ -1,0 +1,10 @@
+# devices/munch/drivers/audio/conf: the POCO F4's own audio hardware (docs/porting/drivers.md, docs/drivers-config.md).
+
+driver MUNCH_AMP
+	file    bsd/dev/hakios.munch_amp.c
+	help    the POCO F4's two NXP TFA9874 amplifiers on QUP 0's serial engine 3, set up from Android's tfa98xx.cnt and played
+	help    by hakios.sound.c (sound=4; fw-audio/tfa98xx.cnt)
+
+driver MUNCH_SPEAKER
+	file    bsd/dev/hakios.munch_speaker.c
+	help    a look at the two amplifiers, read only (speaker_probe=N)

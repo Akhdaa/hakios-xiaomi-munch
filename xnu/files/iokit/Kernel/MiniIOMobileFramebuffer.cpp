@@ -37,8 +37,11 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include <IOKit/IOBufferMemoryDescriptor.h>
 
 #include "MiniIOSurface.h"
+#include "MiniFBStats.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
+extern "C" bool hakios_soc_is(const char * soc);
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (Darwin userland 16.5) */
 enum {
@@ -113,6 +116,122 @@ static TUNABLE(uint32_t, gFBHeight, "fbheight", kFBDefaultHeight);
 #define kFBDefaultScale         3
 static TUNABLE(uint32_t, gFBScale, "fbscale", 0);
 /*
+ * The glass. On the POCO F4 the panel's corners are round and its camera sits in a hole, and pixels lit along their edges show
+ * as a fringe (red, in the corner): Android keeps them black. Boot-args fb_corner=N, the corners' radius, and fb_hole=N, the
+ * hole's, in panel pixels, around fb_hole_x=, fb_hole_y=; 0: none, the default. A device's configuration gives them
+ * (devices/munch/configs/munch.config). Android's own numbers (dumpsys display): corners of 126, a hole of 23 around (540, 52). 126
+ * took away too much of the picture on the phone, and the fringe is along the very edge: 60. Those pixels are never drawn (black
+ * written over a finished frame showed as a flicker at 60 Hz, 2 November): they are black once, and the rows leave them out.
+ */
+static TUNABLE(uint32_t, gFBHoleX, "fb_hole_x", 540);
+static TUNABLE(uint32_t, gFBHoleY, "fb_hole_y", 52);
+#define kFBHoleX                ((int32_t) gFBHoleX)
+#define kFBHoleY                ((int32_t) gFBHoleY)
+
+/* A pixel at `weight' of 256 of its brightness */
+static inline uint32_t
+fade(uint32_t pixel, uint32_t weight)
+{
+	return ((pixel & 0xff00ff) * weight >> 8 & 0xff00ff) | ((pixel & 0x00ff00) * weight >> 8 & 0x00ff00) | (pixel & 0xff000000);
+}
+
+/* The largest n with n * n <= value */
+static uint32_t
+root_of(uint32_t value)
+{
+	uint32_t n = 0;
+
+	while ((n + 1) * (n + 1) <= value) {
+		n++;
+	}
+	return n;
+}
+
+static TUNABLE(uint32_t, gFBCorner, "fb_corner", 0);
+static TUNABLE(uint32_t, gFBHole, "fb_hole", 0);
+/*
+ * Boot-arg fb_scan=1: where the panel's scan is, on the POCO F4, for fb_beam (hackios-xnu-kernel 2.3.3: frames written behind
+ * the line being read, the moving bands gone). Its panel is in command mode: the display controller sends a frame to the
+ * panel's own memory at each tearing signal, and what keeps the line count is a ping-pong block, not the interface, whose
+ * timing engine runs only for a panel in video mode. Read only, a minute after the start: the interface INTF_1 (DSI0) and
+ * ping-pongs 0 and 1 (dt qcom,sde-intf-off, qcom,sde-pp-off; registers as Android's sde_hw_pingpong.c has them), each
+ * read twice 3 ms apart, and its frame count a second apart.
+ */
+static TUNABLE(uint32_t, gScan, "fb_scan", 0);
+#define MUNCH_INTF1             0x0ae6b800UL
+#define MUNCH_PP0               0x0ae71000UL
+#define PP_TEAR_CHECK_EN        0x000
+#define PP_SYNC_CONFIG_VSYNC    0x004
+#define PP_SYNC_CONFIG_HEIGHT   0x008
+#define PP_INT_COUNT_VAL        0x014           /* [31:16] frames, [15:0] the read pointer's line */
+#define PP_LINE_COUNT           0x02c           /* [15:0] the write pointer's line */
+#define PP_AUTOREFRESH_CONFIG   0x030
+#define SCAN_INTF_ENGINE        0x000
+#define SCAN_INTF_FRAMES        0x0ac
+#define SCAN_INTF_LINE          0x0b0
+
+extern "C" void loader_log_putc(char c);
+
+/* A line in the kernel's log and in the loader's, which IOLog's do not reach */
+static void
+scanSay(const char * format, ...)
+{
+	char line[700];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char * c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	IOLog("%s", line);
+}
+
+static void
+scanProbe(__unused void * arg, __unused wait_result_t wr)
+{
+	vm_offset_t page = 0;
+	uint32_t a[2][6];
+
+	IOSleep(60000);
+	page = ml_io_map(MUNCH_INTF1 & ~0x3fffUL, 0x10000);
+	if (page == 0) {
+		return;
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		vm_offset_t intf = page + (MUNCH_INTF1 & 0x3fffUL), pp0 = page + (MUNCH_PP0 - (MUNCH_INTF1 & ~0x3fffUL));
+
+		a[i][0] = *(volatile uint32_t *)(intf + SCAN_INTF_FRAMES);
+		a[i][1] = *(volatile uint32_t *)(intf + SCAN_INTF_LINE);
+		a[i][2] = *(volatile uint32_t *)(pp0 + PP_INT_COUNT_VAL);
+		a[i][3] = *(volatile uint32_t *)(pp0 + PP_LINE_COUNT);
+		a[i][4] = *(volatile uint32_t *)(pp0 + 0x800 + PP_INT_COUNT_VAL);
+		a[i][5] = *(volatile uint32_t *)(pp0 + 0x800 + PP_LINE_COUNT);
+		IOSleep(i == 0 ? 3 : 0);
+	}
+	{
+		vm_offset_t intf = page + (MUNCH_INTF1 & 0x3fffUL), pp0 = page + (MUNCH_PP0 - (MUNCH_INTF1 & ~0x3fffUL));
+		uint32_t pp0_frames = *(volatile uint32_t *)(pp0 + PP_INT_COUNT_VAL) >> 16, pp1_frames, intf_frames;
+
+		pp1_frames = *(volatile uint32_t *)(pp0 + 0x800 + PP_INT_COUNT_VAL) >> 16;
+		intf_frames = *(volatile uint32_t *)(intf + SCAN_INTF_FRAMES);
+		scanSay("MiniIOMobileFramebuffer: fb_scan: intf1 engine %#x frames %u line %u then frames %u line %u; pp0 tear check %#x "
+		    "vsync %#x height %#x autorefresh %#x count %#x line %#x then %#x %#x; pp1 tear check %#x autorefresh %#x count %#x line "
+		    "%#x then %#x %#x\n", *(volatile uint32_t *)(intf + SCAN_INTF_ENGINE), a[0][0], a[0][1], a[1][0], a[1][1],
+		    *(volatile uint32_t *)(pp0 + PP_TEAR_CHECK_EN), *(volatile uint32_t *)(pp0 + PP_SYNC_CONFIG_VSYNC),
+		    *(volatile uint32_t *)(pp0 + PP_SYNC_CONFIG_HEIGHT), *(volatile uint32_t *)(pp0 + PP_AUTOREFRESH_CONFIG), a[0][2],
+		    a[0][3], a[1][2], a[1][3], *(volatile uint32_t *)(pp0 + 0x800 + PP_TEAR_CHECK_EN),
+		    *(volatile uint32_t *)(pp0 + 0x800 + PP_AUTOREFRESH_CONFIG), a[0][4], a[0][5], a[1][4], a[1][5]);
+		IOSleep(1000);
+		scanSay("MiniIOMobileFramebuffer: fb_scan: a second later: intf1 %u frames, pp0 %u, pp1 %u\n",
+		    *(volatile uint32_t *)(intf + SCAN_INTF_FRAMES) - intf_frames,
+		    ((*(volatile uint32_t *)(pp0 + PP_INT_COUNT_VAL) >> 16) - pp0_frames) & 0xffff,
+		    ((*(volatile uint32_t *)(pp0 + 0x800 + PP_INT_COUNT_VAL) >> 16) - pp1_frames) & 0xffff);
+	}
+}
+
+/*
  * Boot-arg fbsubtype=N with fbscale and fbwidth/fbheight: a screen of another iPhone's class -- its pixels (fbwidth x
  * fbheight, as given, not 375 x 812 points at fbscale), its scale and its artwork-device-subtype (the device tree's
  * /product, what MobileGestalt's screen class, corner radius and artwork come from). UIKit picks the status bar's look
@@ -123,6 +242,15 @@ static TUNABLE(uint32_t, gFBScale, "fbscale", 0);
 static TUNABLE(uint32_t, gFBSubtype, "fbsubtype", 0);
 /* Boot-arg fbtrace=N: log the first N calls of every selector (default 3). */
 static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
+/*
+ * Boot-arg fb_sleep (default 1): backboardd's power changes (IOMobileFramebufferRequestPowerChange: 0 off, else on, when it
+ * blanks and unblanks the screen) go to the panel, which a phone driver puts to sleep and wakes again (the POCO F4's:
+ * devices/munch/drivers/display/hakios.munch_panel.c). Until then a blanked screen was a lit panel shown black frames.
+ */
+static TUNABLE(uint32_t, gFBSleep, "fb_sleep", 1);
+extern "C" int hakios_munch_panel_power(bool on) __attribute__((weak));
+extern "C" bool hakios_munch_panel_queue_brightness(uint32_t value) __attribute__((weak));
+extern "C" void hakios_input_screen(bool on) __attribute__((weak));     /* drivers/input/hakios.input.c: Auto-Lock */
 
 /*
  * A recording of the screen, for a machine one cannot look at while it runs (the phone is
@@ -211,6 +339,23 @@ panel_thread_start(thread_continue_t continuation, void * parameter, thread_t * 
 SYSCTL_DECL(_kern_hakios);
 static uint32_t gShownSurface;
 SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_surface, CTLFLAG_RD | CTLFLAG_LOCKED, &gShownSurface, 0, "the IOSurface last put on the panel");
+/*
+ * kern.hakios.fb_brightness: what of 256 of its brightness each pixel keeps on its way to the panel (256: all). Set from
+ * the nits iOS asks the backlight service for (HakiosBacklight, below), or written by hand: a panel whose own brightness is
+ * not ours to set -- the POCO F4's, an OLED in command mode, takes it in a DSI command that froze it (2 November) --
+ * is dimmed in its pixels instead, which on an OLED is less light and less power alike. Never under FB_DIM_LEAST.
+ */
+static uint32_t gBrightness = 256;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_brightness, CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, &gBrightness, 0,
+    "what of 256 of its brightness a pixel keeps (iOS's brightness)");
+#define FB_DIM_LEAST            24
+static inline uint32_t
+dimWeight(void)
+{
+	uint32_t w = __atomic_load_n(&gBrightness, __ATOMIC_RELAXED);
+
+	return w >= 256 ? 256 : w < FB_DIM_LEAST ? FB_DIM_LEAST : w;
+}
 
 #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
 static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
@@ -245,6 +390,15 @@ micros(uint64_t absolute)
  * does not come back with the phone's log), in a thread of its own; off by default.
  */
 static TUNABLE(uint32_t, gMeasure, "fb_measure", 0);
+/*
+ * Boot-arg fb_stats=1: the pacing of the panel, every five seconds in which frames came, as a scanSay line ("fb: ..."),
+ * which reaches the loader's live log as printf's and IOLog's do not: frames put on the panel, the time from each to the next in buckets
+ * (rounded to the millisecond: to 17, to 34, to 50, past 50; half a second and more is a pause, not counted), median,
+ * 95th percentile and longest, what the frames waited for the GPU, what their copy into the panel's memory took, and the
+ * frames drawn again filtered. The GPU driver then writes its speed note every five seconds too (hakios.adreno.c).
+ * Off by default: nothing changes. The arithmetic is in MiniFBStats.h, tested on the host.
+ */
+static TUNABLE(uint32_t, gFBStats, "fb_stats", 0);
 #define DPU_SC7280_INTF1        0x0ae36000UL            /* SM7325 (sc7280): INTF_1, what the panel of redwood is on */
 #define INTF_TIMING_ENGINE_EN   0x000
 #define INTF_FRAME_COUNT        0x0ac
@@ -276,8 +430,12 @@ panelInterface(void)
 	char version[128] = "";
 	uint64_t physical = gIntfPhysical;
 
-	if (physical == 0 && PE_parse_boot_argn("hakios_kver", version, sizeof(version)) && strnstr(version, "-sc7280-", sizeof(version)) != NULL) {
-		physical = DPU_SC7280_INTF1;
+	if (physical == 0 && PE_parse_boot_argn("hakios_kver", version, sizeof(version))) {
+		if (strnstr(version, "-sc7280-", sizeof(version)) != NULL) {
+			physical = DPU_SC7280_INTF1;
+		} else if (strnstr(version, "-sm8250-", sizeof(version)) != NULL) {
+			physical = MUNCH_INTF1;         /* SM8250: INTF_1 (DSI0), what the POCO F4's panel is on (fb_scan) */
+		}
 	}
 	return physical != 0 ? ml_io_map((vm_offset_t) (physical & ~0x3fffULL), 0x4000) + (vm_offset_t) (physical & 0x3fffULL) : 0;
 }
@@ -387,6 +545,9 @@ public:
 	uint64_t        fBeamPeriod;            /* ... how long a scan takes */
 	uint64_t        fBeamScan;              /* ... when the scan that shows the frame being written begins */
 	uint64_t        fBeamShare;             /* ... how long a thread's share of the rows takes to write */
+	uint64_t        fBeamRead;              /* ... how long the scan takes over its lines (a panel in command mode: less than fBeamPeriod) */
+	uint64_t        fBeamAnchor;            /* ... when a scan was last seen to begin (a panel in command mode) */
+	bool            fBeamCommand;           /* ... a panel in command mode: its line count runs only while a frame is sent, then rests */
 	uint32_t        fStatScans, fStatScansMissed;   /* ... frames in time for the next scan, and those that were not */
 	/* ... for each thread's share of the rows: how many, their time, begun after the scan reached them or not done before it left them, and done after it reached them */
 	uint64_t        fStatShareTime[8];
@@ -407,12 +568,20 @@ public:
 	/* ... and how evenly: the time from each frame to the next, counted by the millisecond (the last count: longer) */
 	uint64_t        fLastFrame;
 	uint32_t        fFrameTimes[FRAME_TIMES + 1], fFramePauses, fFrameLongest;
+	/* boot-arg fb_stats=1: the "fb:" line's period, since fFBStatsSince, and when the last frame went on the panel */
+	struct fb_stats fFBStats;
+	uint64_t        fFBStatsSince, fFBStatsLast;
+	void reportFBStats(uint64_t now);
 	/* boot-arg fb_diff=1: which pixels of the panel each frame changed (it costs: the panel's memory is slow to read) */
 	bool            fDiff;
 	uint64_t        fDiffPixels;
 	uint32_t        fDiffLeft, fDiffTop, fDiffRight, fDiffBottom;
 	/* the screen recording, if one was asked for */
 	uint32_t *      fColumn;                /* drawLayer(): source column for every panel column */
+	uint32_t        fCorner, fHole;         /* drawGlass() */
+	uint16_t *      fGlassInset;            /* for each panel row, how many pixels at either end are not drawn */
+	uint16_t *      fGlassHole;             /* ... and half the width of the hole in it, + 1; 0: none */
+	bool            fGlassDrawn;
 	uint16_t *      fColumnWeight;          /* ... with fb_filter: how much of the column after it, of 256 */
 	uint32_t *      fBlendRow;              /* ... and a row of the picture blended from two (fBlendRowSize pixels) */
 	uint32_t        fBlendRowSize;
@@ -437,6 +606,8 @@ public:
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
+	void drawGlass(void);
+	void glassTables(void);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
 	static void helperMain(void * self, wait_result_t result);
 	static void beamProbeMain(void * self, wait_result_t result);
@@ -583,6 +754,9 @@ IOMobileFramebuffer::start(IOService * provider)
 	}
 	fLock = IOLockAlloc();
 	fSwapLock = IOLockAlloc();
+	if (gScan != 0 && hakios_soc_is("sm8250") && kernel_thread_start(scanProbe, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
 	if (panel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
 		IOLog("MiniIOMobileFramebuffer: no thread to put frames on the panel with\n");
 		return false;
@@ -603,6 +777,9 @@ IOMobileFramebuffer::start(IOService * provider)
 	fPanelWidth = vinfo.v_width;
 	fPanelHeight = vinfo.v_height;
 	fRowBytes = vinfo.v_rowbytes;
+	fCorner = gFBCorner;
+	fHole = gFBHole;
+	glassTables();
 	fWidth = gFBWidth ? gFBWidth : fPanelWidth;
 	fHeight = gFBHeight ? gFBHeight : fPanelHeight;
 	if (gFBScale != 0 && gFBScale != kFBDefaultScale) {
@@ -827,20 +1004,42 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 	const uint8_t * pixels = job->pixels;
 	uint32_t stride = job->stride;
 	int32_t sx = job->sx, sy = job->sy, sw = job->sw, sh = job->sh;
-	int32_t px0 = job->px0, py0 = job->py0, px1 = job->px1, py1 = job->py1, cx0 = job->cx0, cx1 = job->cx1;
+	int32_t px0 = job->px0, py0 = job->py0, px1 = job->px1, py1 = job->py1;
 	bool filter = job->filter;
+	uint32_t dim = dimWeight();             /* (one weight for the whole share: a frame is not dimmed in two steps) */
 
 	for (int32_t y = y0; y < y1; y++) {
 		const uint32_t * from;
 		uint32_t * to;
+		int32_t cx0 = job->cx0, cx1 = job->cx1, gap0 = 0, gap1 = 0;
 
 		if (y < 0 || (uint32_t) y >= fPanelHeight) {
 			continue;
 		}
 		to = (uint32_t *) (fBase + (size_t) y * fRowBytes);
-		if (job->unscaled) {
+		if (fGlassInset != NULL) {
+			cx0 = cx0 > fGlassInset[y] ? cx0 : fGlassInset[y];
+			cx1 = cx1 < (int32_t) fPanelWidth - fGlassInset[y] ? cx1 : (int32_t) fPanelWidth - fGlassInset[y];
+			if (fGlassHole[y] != 0) {
+				gap0 = kFBHoleX - (fGlassHole[y] - 1);
+				gap1 = kFBHoleX + fGlassHole[y];
+			}
+		}
+		if (cx0 >= cx1) {
+			continue;               /* (a layer that is all in a corner) */
+		}
+		if (job->unscaled && cx0 == px0 && cx1 == px1 && gap1 == 0) {
 			/* not scaled at all */
-			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
+			if (dim == 256) {
+				memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
+			} else {
+				const uint32_t * __restrict in = (const uint32_t *) (pixels + (size_t) (sy + y - py0) * stride) + sx;
+				uint32_t * __restrict out = to + px0;
+
+				for (int32_t i = 0; i < sw; i++) {
+					out[i] = fade(in[i], dim);
+				}
+			}
 			continue;
 		}
 		if (filter) {
@@ -888,11 +1087,33 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 			for (uint32_t i = 0, n = (uint32_t) (cx1 - cx0); i < n; i++) {
 				uint32_t c = column[i], w = weights[i], a = from[c];
 
+				if (gap1 != 0 && (int32_t) i + cx0 >= gap0 && (int32_t) i + cx0 < gap1) {
+					continue;
+				}
 				out[i] = w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w);
+				if (dim != 256) {
+					out[i] = fade(out[i], dim);
+				}
 			}
 		} else {
 			for (int32_t x = cx0; x < cx1; x++) {
-				to[x] = from[fColumn[x]];
+				if (gap1 == 0 || x < gap0 || x >= gap1) {
+					to[x] = dim == 256 ? from[fColumn[x]] : fade(from[fColumn[x]], dim);
+				}
+			}
+		}
+		/*
+		 * The corners' edge fades over three pixels, as Android's does: a hard edge on this panel's subpixels shows as a
+		 * thin line of red. Not around the camera, where it looked like a blur.
+		 */
+		if (fGlassInset != NULL && fGlassInset[y] != 0) {
+			for (int32_t k = 0; k < 3; k++) {
+				uint32_t w = (uint32_t) (k + 1) * 64;
+
+				if (fGlassInset[y] != 0 && cx0 + k < cx1 - k) {
+					to[cx0 + k] = fade(to[cx0 + k], w);
+					to[cx1 - 1 - k] = fade(to[cx1 - 1 - k], w);
+				}
 			}
 		}
 	}
@@ -962,10 +1183,14 @@ IOMobileFramebuffer::beamProbe(void)
 		IOLog("MiniIOMobileFramebuffer: fb_beam: no display interface known for this SoC (fb_intf=): frames stay on their beat\n");
 		return;
 	}
-	if (!(*(volatile uint32_t *)(intf + INTF_TIMING_ENGINE_EN) & 1)) {
-		IOLog("MiniIOMobileFramebuffer: fb_beam: the interface's timing engine is off: frames stay on their beat\n");
-		return;
-	}
+	/*
+	 * A panel in command mode (the POCO F4's): the timing engine is off, and the line count runs only while the display
+	 * controller sends a frame to the panel's own memory -- from the frame in memory, at the panel's rate, faster than
+	 * the beat -- and rests at 1 until the next (fb_scan, 6 November). Its scan is that sending: how long it takes is
+	 * measured below, from the line count crossing a quarter and three quarters of the panel, and where the scan is
+	 * while the count rests comes from when one was last seen to begin.
+	 */
+	fBeamCommand = !(*(volatile uint32_t *)(intf + INTF_TIMING_ENGINE_EN) & 1);
 	/* a whole number of scans, from one frame's start to another's */
 	first = *(volatile uint32_t *)(intf + INTF_FRAME_COUNT);
 	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &until);
@@ -976,10 +1201,23 @@ IOMobileFramebuffer::beamProbe(void)
 	first = *(volatile uint32_t *)(intf + INTF_FRAME_COUNT);
 	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &until);
 	until += began;
-	while (mach_absolute_time() < until) {
+	uint64_t now, quarter = 0, threeQuarters = 0;
+	uint32_t previous = ~0u;
+	while ((now = mach_absolute_time()) < until) {
 		line = *(volatile uint32_t *)(intf + INTF_LINE_COUNT);
 		lines = line > lines ? line : lines;
 		smallest = line < smallest ? line : smallest;
+		if (threeQuarters == 0) {
+			if (quarter != 0 && line < previous) {
+				quarter = 0;            /* (the scan ended or began again before three quarters: another) */
+			}
+			if (quarter == 0 && previous < fPanelHeight / 4 && line >= fPanelHeight / 4) {
+				quarter = now;
+			} else if (quarter != 0 && line >= fPanelHeight * 3 / 4) {
+				threeQuarters = now;
+			}
+		}
+		previous = line;
 	}
 	IOSleep(450);
 	frames = *(volatile uint32_t *)(intf + INTF_FRAME_COUNT);
@@ -996,9 +1234,24 @@ IOMobileFramebuffer::beamProbe(void)
 	}
 	fBeamLines = lines + 1;
 	fBeamPeriod = (ended - began) / frames;
+	fBeamRead = fBeamPeriod;
+	if (fBeamCommand) {
+		uint64_t half = threeQuarters - quarter;
+
+		if (quarter == 0 || threeQuarters == 0 || half == 0 ||
+		    half * fBeamLines / (fPanelHeight * 3 / 4 - fPanelHeight / 4) > fBeamPeriod) {
+			IOLog("MiniIOMobileFramebuffer: fb_beam: the interface's timing engine is off and no frame was seen being "
+			    "sent whole (lines %u to %u): frames stay on their beat\n", smallest, lines);
+			return;
+		}
+		fBeamRead = half * fBeamLines / (fPanelHeight * 3 / 4 - fPanelHeight / 4);
+		fBeamAnchor = quarter - fBeamRead * (fPanelHeight / 4) / fBeamLines;
+	}
 	absolutetime_to_nanoseconds(fBeamPeriod, &began);
-	IOLog("MiniIOMobileFramebuffer: fb_beam: the panel's scan is %u lines, %llu us: frames are written behind it from now on\n",
-	    fBeamLines, began / NSEC_PER_USEC);
+	absolutetime_to_nanoseconds(fBeamRead, &ended);
+	IOLog("MiniIOMobileFramebuffer: fb_beam: the panel's scan is %u lines, %llu us%s (%llu us of it sending): frames are "
+	    "written behind it from now on\n", fBeamLines, began / NSEC_PER_USEC, fBeamCommand ? ", a panel in command mode" : "",
+	    ended / NSEC_PER_USEC);
 	__atomic_thread_fence(__ATOMIC_RELEASE);
 	fBeamIntf = intf;
 }
@@ -1008,13 +1261,24 @@ uint64_t
 IOMobileFramebuffer::beamNextScan(uint64_t now)
 {
 	uint32_t line = *(volatile uint32_t *)(fBeamIntf + INTF_LINE_COUNT);
-	uint64_t scan = now - fBeamPeriod * (line < fBeamLines ? line : fBeamLines - 1) / fBeamLines + fBeamPeriod;
+	uint64_t scan;
+
+	if (!fBeamCommand) {
+		scan = now - fBeamPeriod * (line < fBeamLines ? line : fBeamLines - 1) / fBeamLines + fBeamPeriod;
+	} else if (line > 1 && line < fBeamLines) {
+		/* a frame being sent: where it began, and the next one a period later */
+		fBeamAnchor = now - fBeamRead * line / fBeamLines;
+		scan = fBeamAnchor + fBeamPeriod;
+	} else {
+		/* resting: the next sending is a whole number of periods after the last seen to begin */
+		scan = fBeamAnchor + ((now - fBeamAnchor) / fBeamPeriod + 1) * fBeamPeriod;
+	}
 	/*
 	 * The first share is written from its top down about as fast as the scan reads it, so it may begin just before the
 	 * scan does: by what it takes longer than the scan takes over the same rows, and a little. (Its whole time as a
 	 * margin lost a frame in eight: each too late for one scan waits for the next, and all behind it with it.)
 	 */
-	uint64_t over = fThreads != 0 ? fBeamPeriod / fThreads : 0;
+	uint64_t over = fThreads != 0 ? fBeamRead / fThreads : 0;
 	uint64_t margin = (fBeamShare > over ? fBeamShare - over : 0) + fBeamPeriod / 16;
 	bool missed = false;
 
@@ -1038,7 +1302,7 @@ IOMobileFramebuffer::beamWait(const struct RowJob * job, int32_t lastRow)
 	if (job->scan != 0) {
 		/* (the lines of the blanking are counted before the first row, as far as one can tell: taken as a margin either way) */
 		uint64_t lines = (uint64_t) lastRow + (fBeamLines - fPanelHeight);
-		uint64_t passed = job->scan - fBeamPeriod + fBeamPeriod * lines / fBeamLines;
+		uint64_t passed = job->scan - fBeamPeriod + fBeamRead * lines / fBeamLines;
 
 		if (mach_absolute_time() < passed) {
 			clock_delay_until(passed);
@@ -1056,8 +1320,8 @@ IOMobileFramebuffer::beamShareDone(const struct RowJob * job, unsigned share, in
 	__atomic_fetch_add(&fStatShares[share], 1, __ATOMIC_RELAXED);
 	if (job->scan != 0) {
 		uint64_t blank = fBeamLines - fPanelHeight;
-		uint64_t top = job->scan + fBeamPeriod * ((uint64_t) firstRow + blank) / fBeamLines;
-		uint64_t bottom = job->scan + fBeamPeriod * ((uint64_t) lastRow + blank) / fBeamLines;
+		uint64_t top = job->scan + fBeamRead * ((uint64_t) firstRow + blank) / fBeamLines;
+		uint64_t bottom = job->scan + fBeamRead * ((uint64_t) lastRow + blank) / fBeamLines;
 
 		if (began > top || now > bottom) {
 			__atomic_fetch_add(&fStatShareTorn[share], 1, __ATOMIC_RELAXED);
@@ -1213,6 +1477,70 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
 	}
 	IOLockUnlock(fHelperLock);
+}
+
+/* Which pixels of each row are not drawn (drawRows()). */
+void
+IOMobileFramebuffer::glassTables(void)
+{
+	if (fCorner == 0 && fHole == 0) {
+		return;
+	}
+	fGlassInset = IONew(uint16_t, fPanelHeight);
+	fGlassHole = IONew(uint16_t, fPanelHeight);
+	if (fGlassInset == NULL || fGlassHole == NULL) {
+		fGlassInset = NULL;
+		return;
+	}
+	bzero(fGlassInset, fPanelHeight * sizeof(uint16_t));
+	bzero(fGlassHole, fPanelHeight * sizeof(uint16_t));
+	for (uint32_t r = 0; r < fCorner && r < fPanelHeight / 2; r++) {
+		uint32_t up = fCorner - r;
+
+		fGlassInset[r] = fGlassInset[fPanelHeight - 1 - r] = (uint16_t) (fCorner - root_of(fCorner * fCorner - up * up));
+	}
+	for (int32_t dy = -(int32_t) fHole; dy <= (int32_t) fHole && fHole != 0; dy++) {
+		int32_t y = kFBHoleY + dy;
+
+		if (y >= 0 && (uint32_t) y < fPanelHeight) {
+			fGlassHole[y] = (uint16_t) (root_of(fHole * fHole - (uint32_t) (dy * dy)) + 1);
+		}
+	}
+}
+
+/* Black where there is no glass to look through, once: no frame draws there afterwards. */
+void
+IOMobileFramebuffer::drawGlass(void)
+{
+	if (fGlassDrawn) {
+		return;
+	}
+	fGlassDrawn = true;
+	for (uint32_t r = 0; r < fCorner && r < fPanelHeight / 2; r++) {
+		uint32_t up = fCorner - r, inset = fCorner - root_of(fCorner * fCorner - up * up);
+
+		inset = inset > fPanelWidth / 2 ? fPanelWidth / 2 : inset;
+		for (unsigned bottom = 0; bottom < 2; bottom++) {
+			uint32_t * row = (uint32_t *) (fBase + (size_t) (bottom ? fPanelHeight - 1 - r : r) * fRowBytes);
+
+			for (uint32_t x = 0; x < inset; x++) {
+				row[x] = 0;
+				row[fPanelWidth - 1 - x] = 0;
+			}
+		}
+	}
+	for (int32_t dy = -(int32_t) fHole; dy <= (int32_t) fHole && fHole != 0; dy++) {
+		int32_t half = (int32_t) root_of(fHole * fHole - (uint32_t) (dy * dy)), y = kFBHoleY + dy;
+
+		if (y < 0 || (uint32_t) y >= fPanelHeight) {
+			continue;
+		}
+		for (int32_t x = kFBHoleX - half; x <= kFBHoleX + half; x++) {
+			if (x >= 0 && (uint32_t) x < fPanelWidth) {
+				((uint32_t *) (fBase + (size_t) y * fRowBytes))[x] = 0;
+			}
+		}
+	}
 }
 
 /*
@@ -1421,6 +1749,7 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fSettling = false;
 	fStatSettled++;
+	fFBStats.settled++;             /* (fb_stats=1; counted either way, printed only then) */
 }
 
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
@@ -1428,18 +1757,20 @@ void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
-	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
-	uint32_t layers = 0;
+	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn, waited, waitNanos;
+	uint32_t layers = 0, timeouts = 0;
 	MiniIOSurface * recorded = NULL;
 	bool report;
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
+			timeouts++;
 			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
 			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
 		}
 	}
-	fStatWaiting += mach_absolute_time() - began;
+	waited = mach_absolute_time() - began;
+	fStatWaiting += waited;
 	began = ready = mach_absolute_time();
 	fBeamScan = fBeamIntf != 0 ? beamNextScan(began) : 0;
 	if (fBeamIntf != 0) {
@@ -1543,6 +1874,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
+	drawGlass();
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
 		record(recorded);
@@ -1626,6 +1958,52 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatSince = 0;
 	}
 	IOLockUnlock(fLock);
+	if (gFBStats) {
+		/* (the presenter's thread alone shows and settles frames: fFBStats needs no lock) */
+		uint64_t ns;
+
+		if (fFBStatsLast != 0) {
+			absolutetime_to_nanoseconds(shown - fFBStatsLast, &ns);
+			fb_stats_interval(&fFBStats, ns / NSEC_PER_USEC > UINT32_MAX ? UINT32_MAX : (uint32_t) (ns / NSEC_PER_USEC));
+		}
+		fFBStatsLast = shown;
+		absolutetime_to_nanoseconds(waited, &waitNanos);
+		absolutetime_to_nanoseconds(drawn - shown, &ns);
+		fb_stats_frame(&fFBStats, (uint32_t) (waitNanos / NSEC_PER_USEC), timeouts, (uint32_t) (ns / NSEC_PER_USEC));
+		if (fFBStatsSince == 0) {
+			fFBStatsSince = shown;
+		}
+		reportFBStats(mach_absolute_time());
+	}
+}
+
+/* fb_stats=1: the "fb:" line, once five seconds have passed since the period began (one frame at least came in it). */
+void
+IOMobileFramebuffer::reportFBStats(uint64_t now)
+{
+	struct fb_stats * s = &fFBStats;
+	uint64_t ns;
+	uint32_t median, most;
+
+	absolutetime_to_nanoseconds(now - fFBStatsSince, &ns);
+	if (ns < 5 * NSEC_PER_SEC || s->frames == 0) {
+		return;
+	}
+	fb_stats_sort(s);
+	median = fb_stats_percentile(s, 50);
+	most = fb_stats_percentile(s, 95);
+	/* through scanSay (loader_log_putc): a plain printf reaches only the kernel's message buffer, not the live log */
+	scanSay("fb: %u frames on the panel in %llu.%llu s; intervals to 17 ms %u, to 34 %u, to 50 %u, past 50 %u; "
+	    "median %u.%u ms, 95th %u.%u ms, longest %u.%u ms; waiting for the GPU %u.%u ms on average, %u.%u at most "
+	    "(%u timeouts); the CPU copy %u.%u ms on average, %u.%u at most; settle redraws %u; %u pauses of 500 ms or more\n",
+	    s->frames, ns / NSEC_PER_SEC, ns % NSEC_PER_SEC / (NSEC_PER_SEC / 10), s->bucket[0], s->bucket[1], s->bucket[2],
+	    s->bucket[3], median / 1000, median % 1000 / 100, most / 1000, most % 1000 / 100, s->longest_us / 1000,
+	    s->longest_us % 1000 / 100, (uint32_t) (s->wait_us / s->frames / 1000), (uint32_t) (s->wait_us / s->frames % 1000 / 100),
+	    s->wait_max_us / 1000, s->wait_max_us % 1000 / 100, s->timeouts, (uint32_t) (s->copy_us / s->frames / 1000),
+	    (uint32_t) (s->copy_us / s->frames % 1000 / 100), s->copy_max_us / 1000, s->copy_max_us % 1000 / 100, s->settled,
+	    s->pauses);
+	fb_stats_reset(s);
+	fFBStatsSince = now;
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -1883,9 +2261,27 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		}
 		return kIOReturnSuccess;
 	case kFBMethodSwapSignal:
+	case kFBMethodRequestPowerChange: {     /* in: the state wanted (0: off) */
+		uint64_t state = args->scalarInputCount > 0 ? in[0] : ~0ULL;
+		int error = -1;
+		char procname[32] = "?";
+
+		proc_selfname(procname, sizeof(procname));
+
+		if (gFBSleep && state != ~0ULL && hakios_munch_panel_power != NULL) {
+			error = hakios_munch_panel_power(state != 0);
+		}
+		if (state != ~0ULL && hakios_input_screen != NULL) {
+			hakios_input_screen(state != 0);
+		}
+		IOLog("MiniIOMobileFramebuffer: %s[%d] asks for power state %llu: the panel %s\n", procname, proc_selfpid(), state,
+		    error == 0 ? (state != 0 ? "woken" : "put to sleep") : error < 0 ? "left as it is (no panel driver, or fb_sleep=0)" :
+		    "NOT CHANGED (its driver failed)");
+		return kIOReturnSuccess;
+	}
+
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:
-	case kFBMethodRequestPowerChange:
 	case kFBMethodChangeFrameInfo:
 		return kIOReturnSuccess;
 
@@ -2034,6 +2430,132 @@ publishAccelerator(IOService * provider)
 }
 
 /*
+ * The display's brightness, as iOS's BrightnessControl.framework looks for it: a service with backlight-control (its
+ * IOServiceFirstMatch on IOPropertyMatch), whose IODisplayParameters give brightness and BrightnessMilliNits as
+ * { min, max, value }, and to which IORegistryEntrySetCFProperties hands brightness-nits (16.16 fixed point). With
+ * it IOMobileFramebuffer finds a brightness control for the built-in panel (IOMobileFramebufferGetBrightnessControl-
+ * Capabilities, "matched IOMFB to BC for embedded panel") and the brightness sliders work; without it they did not
+ * move at all (the POCO F4, 7 November). What it is told goes onto the pixels (kern.hakios.fb_brightness, above):
+ * the share of light kept is nits over the most, its square root the share of each pixel's value (about the panel's
+ * gamma), FB_DIM_LEAST of 256 at the least.
+ */
+#define BACKLIGHT_MILLINITS_LEAST       2000u
+#define BACKLIGHT_MILLINITS_MOST        500000u
+#define BACKLIGHT_USER_MOST             1024u
+
+class HakiosBacklight : public IOService
+{
+	OSDeclareDefaultStructors(HakiosBacklight);
+public:
+	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
+	void publish(uint32_t milliNits);
+};
+
+OSDefineMetaClassAndStructors(HakiosBacklight, IOService);
+
+static OSDictionary *
+backlightRange(uint32_t least, uint32_t most, uint32_t value)
+{
+	OSDictionary * range = OSDictionary::withCapacity(3);
+	OSNumber * n;
+
+	if (range == NULL) {
+		return NULL;
+	}
+	if ((n = OSNumber::withNumber(least, 32)) != NULL) {
+		range->setObject("min", n);
+		n->release();
+	}
+	if ((n = OSNumber::withNumber(most, 32)) != NULL) {
+		range->setObject("max", n);
+		n->release();
+	}
+	if ((n = OSNumber::withNumber(value, 32)) != NULL) {
+		range->setObject("value", n);
+		n->release();
+	}
+	return range;
+}
+
+void
+HakiosBacklight::publish(uint32_t milliNits)
+{
+	OSDictionary * parameters = OSDictionary::withCapacity(2);
+	OSDictionary * range;
+	uint32_t user = (uint32_t) ((uint64_t) (milliNits - BACKLIGHT_MILLINITS_LEAST) * BACKLIGHT_USER_MOST /
+	    (BACKLIGHT_MILLINITS_MOST - BACKLIGHT_MILLINITS_LEAST));
+
+	if (parameters == NULL) {
+		return;
+	}
+	if ((range = backlightRange(0, BACKLIGHT_USER_MOST, user)) != NULL) {
+		parameters->setObject("brightness", range);
+		range->release();
+	}
+	if ((range = backlightRange(BACKLIGHT_MILLINITS_LEAST, BACKLIGHT_MILLINITS_MOST, milliNits)) != NULL) {
+		parameters->setObject("BrightnessMilliNits", range);
+		range->release();
+	}
+	setProperty("IODisplayParameters", parameters);
+	parameters->release();
+}
+
+IOReturn
+HakiosBacklight::setProperties(OSObject * properties)
+{
+	static uint32_t told;
+	OSDictionary * dictionary = OSDynamicCast(OSDictionary, properties);
+	OSNumber * nits = dictionary != NULL ? OSDynamicCast(OSNumber, dictionary->getObject("brightness-nits")) : NULL;
+	uint64_t milliNits;
+	uint32_t weight, panelLevel;
+	bool hardware;
+
+	if (nits == NULL) {
+		return kIOReturnUnsupported;
+	}
+	milliNits = (uint64_t) (uint32_t) nits->unsigned32BitValue() * 1000 >> 16;
+	milliNits = milliNits < BACKLIGHT_MILLINITS_LEAST ? BACKLIGHT_MILLINITS_LEAST :
+	    milliNits > BACKLIGHT_MILLINITS_MOST ? BACKLIGHT_MILLINITS_MOST : milliNits;
+	panelLevel = 1 + (uint32_t) ((milliNits - BACKLIGHT_MILLINITS_LEAST) * 2046 /
+	    (BACKLIGHT_MILLINITS_MOST - BACKLIGHT_MILLINITS_LEAST));
+	hardware = hakios_munch_panel_queue_brightness != NULL && hakios_munch_panel_queue_brightness(panelLevel);
+	weight = hardware ? 256 : root_of((uint32_t) (milliNits * 65536 / BACKLIGHT_MILLINITS_MOST));
+	__atomic_store_n(&gBrightness, weight, __ATOMIC_RELAXED);
+	publish((uint32_t) milliNits);
+	if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 6) {
+		IOLog("MiniIOMobileFramebuffer: brightness: %llu.%03llu nits asked for: %s %u\n",
+		    milliNits / 1000, milliNits % 1000, hardware ? "panel level" : "pixel weight", hardware ? panelLevel : dimWeight());
+	}
+	return kIOReturnSuccess;
+}
+
+/*
+ * Boot-arg fb_backlight=1: publish the brightness service. On munch, the
+ * backboardd injection must check in the EDR server for this configuration.
+ */
+static TUNABLE(uint32_t, gBacklight, "fb_backlight", 0);
+
+static void
+publishBacklight(IOService * provider)
+{
+	HakiosBacklight * backlight;
+
+	if (gBacklight == 0) {
+		return;
+	}
+	backlight = OSTypeAlloc(HakiosBacklight);
+	if (backlight != NULL && backlight->init() && backlight->attach(provider)) {
+		backlight->setName("backlight");
+		backlight->setProperty("backlight-control", kOSBooleanTrue);
+		backlight->publish(BACKLIGHT_MILLINITS_MOST);
+		backlight->registerService();
+		IOLog("MiniIOMobileFramebuffer: a backlight service for iOS's brightness (%u to %u nits)\n",
+		    BACKLIGHT_MILLINITS_LEAST / 1000, BACKLIGHT_MILLINITS_MOST / 1000);
+	}
+	OSSafeReleaseNULL(backlight);
+}
+
+/*
  * A picture from inside the kernel (the GPU driver's first ones): rows of 32-bit pixels, put at
  * the top left corner of the panel as they are and cut to its size.
  */
@@ -2064,6 +2586,7 @@ MiniIOMobileFramebufferStart(IOService * provider)
 	if (fb->start(provider)) {
 		publishDisplayNode();
 		publishAccelerator(provider);
+		publishBacklight(provider);
 	} else {
 		fb->detach(provider);
 	}

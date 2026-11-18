@@ -36,7 +36,25 @@ import struct
 import sys
 
 
+def v2(data):
+    """CamX's older module files ("Parameter Parser V2.0.0", the POCO F4's SM8250): the same structures, every field 64 bits."""
+    return b'Parameter Parser V2.0.0' in data[:0x60]
+
+
 def symbols(data):
+    if v2(data):
+        count = struct.unpack_from('<I', data, 0x9c)[0]
+        entries = [struct.unpack_from('<3Q', data, 0xa0 + 24 * i) for i in range(count)]
+        table, pool = entries[0][1], entries[1][1]
+        syms, order, at = {}, [], table
+        while at + 0x48 <= pool:
+            sid = struct.unpack_from('<Q', data, at)[0]
+            name = data[at + 8:at + 0x28].split(b'\0')[0].decode('latin1')
+            _, _, ref, size = struct.unpack_from('<4q', data, at + 0x28)
+            syms[sid] = (name, ref, size)
+            order.append(sid)
+            at += 0x48
+        return syms, order, pool
     count = struct.unpack_from('<I', data, 0xa4)[0]
     entries = [struct.unpack_from('<3I', data, 0xa8 + 12 * i) for i in range(count)]
     table, pool = entries[0][1], entries[1][1]
@@ -55,9 +73,11 @@ def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     data = open(sys.argv[1], 'rb').read()
-    if not data.startswith(b'QTI Chromatix Header') or b'Parameter Parser V3.0.1' not in data[:0x60]:
+    if not data.startswith(b'QTI Chromatix Header') or (b'Parameter Parser V3.0.1' not in data[:0x60] and not v2(data)):
         sys.exit('camsensor.py: not a module file of the kind known here')
     syms, order, pool = symbols(data)
+    if v2(data):
+        return main_v2(data, syms, order, pool)
 
     def value(sid):
         _, ref, size = syms[sid]
@@ -139,6 +159,104 @@ def main():
 
 
 TYPES = {0: 'MCLK', 1: 'VANA', 2: 'VDIG', 3: 'VIO', 4: 'VAF', 8: 'RESET', 9: 'STANDBY'}
+# CamX V2's power kinds (0 MCLK, 1 VANA, 2 VDIG, 3 VIO, 4 VAF, 9 RESET) as the kernel's table has them (8 RESET)
+V2_KINDS = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 9: 8}
+
+
+def main_v2(data, syms, order, pool):
+    """The same table out of a V2 module file: the structures of V3, each field a 64-bit word."""
+    def value(sid):
+        _, ref, size = syms[sid]
+        return data[pool + ref:pool + ref + size]
+
+    def qwords(sid):
+        v = value(sid)
+        return struct.unpack('<%dQ' % (len(v) // 8), v)
+
+    def regsetting_v2(sid):
+        _, ref, size = syms[sid]
+        writes = []
+        for k in range(size // 80):
+            (has_slave, slave_sid, address, count, data_sid, address_bytes, data_bytes, operation, has_delay,
+             delay_sid) = struct.unpack_from('<10Q', data, pool + ref + 80 * k)
+            values = qwords(data_sid)
+            delay = qwords(delay_sid)[0] if has_delay else 0
+            for v in values[:max(count, 1)]:
+                writes.append((address, v, address_bytes, data_bytes, operation, delay))
+        return writes
+
+    driver_sid = next(s for s in order if syms[s][0] == 'sensorDriverData')
+    driver = qwords(driver_sid)
+    slave, address_bytes, data_bytes, id_address, chip_id, id_mask = driver[5:11]
+    power = {}
+    for name, (count, sid) in (('pwrup', driver[12:14]), ('pwrdn', driver[14:16])):
+        w = qwords(sid)
+        power[name] = [(V2_KINDS.get(w[i], w[i]), w[i + 1], w[i + 2]) for i in range(0, min(len(w), 3 * count), 3)]
+    res_sid = next(s for s in order if syms[s][0] == 'resolutionData')
+    raw = value(res_sid)
+    regsettings = {s for s in order if syms[s][0] == 'regSetting'}
+    modes, mode_tables, cfa, mode_sids = [], [], [], set()
+    for k in range(len(raw) // 304):
+        q = struct.unpack_from('<38Q', raw, 304 * k)
+        fps = struct.unpack_from('<d', raw, 304 * k + 80)[0]
+        stream = qwords(q[2])
+        data_type, x, y, width, height = stream[1:6]
+        lanes, settle, cphy = q[11], q[14], q[15]
+        writes_sid = next(w for w in q[16:] if w in regsettings)
+        mode_sids.add(writes_sid)
+        modes.append((width, height, x, y, lanes, cphy, settle, q[7], q[3], q[4], int(fps * 1000), data_type))
+        cfa.append(CFA.get(q[0], str(q[0])))
+        mode_tables.append(('res%d' % k, regsetting_v2(writes_sid)))
+    lane_sid = next((s for s in order if syms[s][0] == 'laneAssign'), None)
+    lane_assign = qwords(lane_sid)[0] & 0xffff if lane_sid is not None and syms[lane_sid][2] == 8 else 0
+
+    roles = {'regToRealGain': ['on', 'off', 'holdon', 'holdoff'], 'initSettings': ['init'], 'testPatternData': ['tpgoff', 'tpgon']}
+    tables, after, used = [], '', {}
+    for sid in order:
+        name = syms[sid][0]
+        if name != 'regSetting':
+            if name not in ('slaveAddr', 'registerData', 'delayUs'):
+                after = name
+            continue
+        if sid in mode_sids:
+            continue
+        names = roles.get(after, [])
+        n = used.get(after, 0)
+        used[after] = n + 1
+        if n < len(names):
+            tables.append((names[n], regsetting_v2(sid)))
+    write_table(slave, address_bytes, data_bytes, id_address, chip_id, id_mask, lane_assign, modes, cfa, power,
+                mode_tables + tables)
+
+
+def write_table(slave, address_bytes, data_bytes, id_address, chip_id, id_mask, lane_assign, modes, cfa, power, tables):
+    print(f'camsensor.py: slave {slave:#x}, id {chip_id:#x} at {id_address:#x} ({address_bytes}/{data_bytes} bytes, mask {id_mask:#x}), '
+          f'lane assignment {lane_assign:#x}')
+    for name in ('pwrup', 'pwrdn'):
+        print(f'  {name}: ' + ' '.join(f'{TYPES.get(t, t)}={v}+{d}ms' for t, v, d in power[name]))
+    for k, m in enumerate(modes):
+        print(f'  mode {k}: {m[0]}x{m[1]} at {m[2]},{m[3]} dt {m[11]:#x}, {m[4]} {"trio(s), C-PHY" if m[5] else "lane(s), D-PHY"}, '
+              f'settle {m[6]}, pixel clock {m[7]}, line {m[8]}, frame {m[9]}, {m[10] / 1000:.2f} fps, {cfa[k]}')
+    for name, writes in tables:
+        print(f'  {name}: {len(writes)} writes: ' + ' '.join(f'{a:x}={v:x}' + (f'+{d}us' if d else '') for a, v, _, _, _, d in writes[:10]) +
+              (' ...' if len(writes) > 10 else ''))
+    if sys.argv[2] == '-':
+        return
+    out = bytearray(b'RWCTAB02')
+    out += struct.pack('<8I', slave, address_bytes, data_bytes, id_address, chip_id, id_mask, lane_assign, len(modes))
+    for m in modes:
+        out += struct.pack('<12I', *m)
+    for name in ('pwrup', 'pwrdn'):
+        out += name.encode().ljust(8, b'\0') + struct.pack('<I', len(power[name]))
+        for t, v, d in power[name]:
+            out += struct.pack('<HHBBBBI', t, v // 1000 if t == 0 else v, 0, 0, 0, 0, d * 1000)
+    out += struct.pack('<I', len(tables))
+    for name, writes in tables:
+        out += name.encode().ljust(8, b'\0') + struct.pack('<I', len(writes))
+        for a, v, ab, db, op, d in writes:
+            out += struct.pack('<HHBBBBI', a, v, ab, db, op, 0, d)
+    open(sys.argv[2], 'wb').write(out)
+    print(f'camsensor.py: {sys.argv[2]}: {len(out)} bytes')
 CFA = {0: 'BGGR', 1: 'GBRG', 2: 'GRBG', 3: 'RGGB', 4: 'mono'}
 
 

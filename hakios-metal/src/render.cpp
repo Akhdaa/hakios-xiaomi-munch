@@ -1154,7 +1154,18 @@ void passStart(pm4::Stream& stream, uint32_t W, uint32_t H, uint64_t table, cons
         event(stream, CACHE_INVALIDATE);
         reg(stream, REG_A6XX_HLSQ_INVALIDATE_CMD, hlsqInvalidateCmdAll());
         stream.waitForIdle();
-        for (const RegWrite& w : kStaticState) reg(stream, w.reg, w.value);
+        for (const RegWrite& w : kStaticState) {
+            uint32_t value = w.value;
+            if (o.a650Sysmem) {
+                // Freedreno's A650 register table.
+                switch (w.reg) {
+                case REG_A6XX_SP_DBG_ECO_CNTL: value = 0x01000000; break;
+                case REG_A6XX_TPL1_DBG_ECO_CNTL: value = 0x01008000; break;
+                case REG_A6XX_UCHE_CLIENT_PF: value = 0x00000004; break;
+                }
+            }
+            reg(stream, w.reg, value);
+        }
         {
             uint32_t w[3] = {setDrawState0(0, CP_SET_DRAW_STATE__0_DISABLE_ALL_GROUPS, 0), 0, 0};
             stream.packet(CP_SET_DRAW_STATE, w, 3);
@@ -1170,7 +1181,8 @@ void passStart(pm4::Stream& stream, uint32_t W, uint32_t H, uint64_t table, cons
     // wrote at boot (hakios.adreno.c:2904) and Mesa never sets for this chip -- the switch is the bisect's
     if (o.ccuCntl) {
         stream.waitForIdle();
-        reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlSysmem() | (o.ccuConcurrentResolve ? A6XX_RB_CCU_CNTL_CONCURRENT_RESOLVE : 0u));
+        const uint32_t depthCacheSize = (o.a650Sysmem ? 3 : kNumCcu) * kSysmemPerCcuDepthCacheSize;
+        reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlSysmem(depthCacheSize) | (o.ccuConcurrentResolve ? A6XX_RB_CCU_CNTL_CONCURRENT_RESOLVE : 0u));
     }
     // fd6's LRZ_FLUSH at the start of a sysmem pass (fd6_gmem.cc:2001); turnip has none here. Under lrzOff with the LRZ
     // registers below, since it is the LRZ it flushes
@@ -2210,8 +2222,8 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
 
 bool gmemTiles(GmemPlan* plan, const uint32_t area[4]) {
     GmemPlan p = *plan;
-    p.x0 = area[0] & ~(kTileAlignW - 1);
-    p.y0 = area[1] & ~(kTileAlignH - 1);
+    p.x0 = area[0] / kTileAlignW * kTileAlignW;
+    p.y0 = area[1] / kTileAlignH * kTileAlignH;
     const uint32_t w = area[2] + 1 - p.x0, h = area[3] + 1 - p.y0;
     // The bin width is fixed once a plan has one: a framebuffer fetch's descriptor holds it as its pitch (encodeInPass,
     // written before the area was known), and a tile laid out narrower read through it as sheared rows (the screen in
@@ -2766,6 +2778,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     if (status_ > kEnqueued) {
         return fail("draw after commit");
     }
+    settleDamage();   // (what was named before this draw: its own damage)
     // A compressed texture whose rows this processor changed since the GPU last copied them in (Texture::staging): the
     // copy first, by the 2D engine into the UBWC layout, in a pass of its own before this draw's
     if (!freshen(vsBindings, options) || !freshen(fsBindings, options)) return false;
@@ -3081,6 +3094,31 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             }
         }
     }
+    // The damage (damageOf): the draw's area into each colour attachment of a pass that loads it (the pass's own load,
+    // the one it opened with), at level 0 and slice 0 of a texture whose level 0 starts its memory; every other
+    // attachment, and every other write the draw named, the whole of its object. (The words are not touched.)
+    {
+        uint32_t a[4];
+        const RenderPass& opened = open_ != nullptr ? open_->pass : pass;
+        const bool known = render::drawArea(pass, d, a) && pass.level == 0 && pass.slice == 0;
+        const Bo* drawn[kMaxColorOutputs];
+        size_t n = 0;
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            const Texture* t = i == 0 ? pass.color0 : pass.more[i - 1].texture;
+            if (t == nullptr || t->buffer() == nullptr) continue;
+            const Bo* bo = &t->buffer()->bo();
+            const LoadAction load = i == 0 ? opened.load : opened.more[i - 1].load;
+            const bool rect = known && load == LoadAction::kLoad && (i == 0 || (pass.more[i - 1].level == 0 && pass.more[i - 1].slice == 0)) &&
+                              t->levelAddress(0) == t->buffer()->gpuAddress();
+            if (!rect) {
+                damage_[bo].whole = true;
+            } else if (std::find(drawn, drawn + n, bo) == drawn + n) {
+                drawn[n++] = bo;
+            }
+        }
+        settleDamage(drawn, n);
+        for (size_t k = 0; k < n; k++) addDamage(drawn[k], a);
+    }
     return true;
 }
 
@@ -3117,6 +3155,7 @@ bool CommandBuffer::blitInto(const Texture& src, uint32_t srcLevel, render::Blit
         return fail("blit after commit");
     }
     closePass();   // the copy reads what the draws before it wrote: their pass's tail first
+    settleDamage();   // (what was named before this copy: its own damage)
     std::string why;
     // A copy of a level onto itself. Metal leaves it to the GPU, and an Apple GPU does it -- VectorKit (MapKit's snapshot
     // service) copies its glyph textures onto themselves, in place and shifted by part of their width. The rectangle onto
@@ -3157,6 +3196,15 @@ bool CommandBuffer::blitInto(const Texture& src, uint32_t srcLevel, render::Blit
     use(*dst.buffer(), true);
     keep(src.buffer());
     keep(dst.buffer());
+    // the damage (damageOf): rectangle D of DST's level 0 when that level starts its memory, else the whole of it
+    const Bo* to = &dst.buffer()->bo();
+    if (dstLevel == 0 && d.w != 0 && d.h != 0 && dst.levelAddress(0) == dst.buffer()->gpuAddress()) {
+        settleDamage(&to, 1);
+        const uint32_t a[4] = {d.x, d.y, d.x + d.w - 1, d.y + d.h - 1};
+        addDamage(to, a);
+    } else {
+        settleDamage();
+    }
     return true;
 }
 
@@ -3217,7 +3265,21 @@ bool CommandBuffer::append(CommandBuffer& other) {
     other.closePass();
     appendStream(stream_, other.stream_);
     other.stream_ = pm4::Stream{};
+    // the damage (damageOf): OTHER's merged into this one's, each side's writes not yet accounted the whole first
+    settleDamage();
+    other.settleDamage();
+    for (const auto& [bo, r] : other.damage_) {
+        Damage& m = damage_[bo];
+        m.whole = m.whole || r.whole;
+        if (!m.whole && r.x0 <= r.x1 && r.y0 <= r.y1) {
+            const uint32_t a[4] = {r.x0, r.y0, r.x1, r.y1};
+            addDamage(bo, a);
+        }
+    }
+    other.damage_.clear();
     uses_.insert(uses_.end(), other.uses_.begin(), other.uses_.end());
+    damageSeen_ = uses_.size();
+    other.damageSeen_ = 0;
     kept_.insert(kept_.end(), other.kept_.begin(), other.kept_.end());
     keptAny_.insert(keptAny_.end(), other.keptAny_.begin(), other.keptAny_.end());
     other.uses_.clear();

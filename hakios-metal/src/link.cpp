@@ -16,8 +16,11 @@
 // Where this port is stricter than Mesa: ir3_link_shaders gives an FS varying that no VS output serves the register
 // regid(63, 0) (default_regid with pack_vs_out) and the FS then reads zeros through it -- a quiet black. Here that is
 // refused by slot, so that a vertex function and a fragment function whose varyings do not match are told apart from
-// a draw that happened. The COL/BFC fallback of ir3_find_output (ir3_shader.h:1197-1215, GL's two-sided colour) is
-// not ported: hakios's front end assigns VARYING_SLOT_VAR0 + n to every Metal varying and never COL0/BFC0
+// a draw that happened. The one exception is the A650 path: matchVaryingsByName relinks the FS's varyings by their
+// Metal identity (air.vertex_output / air.fragment_input, which the slot numbers do not carry: the front end numbers
+// each stage in its own declaration order), and marks an input whose identity no VS output has kVaryingSlotUnserved;
+// link accepts that one as Mesa does, with no VS register, so that it reads zeros. The COL/BFC fallback of
+// ir3_find_output (ir3_shader.h:1197-1215, GL's two-sided colour) is not ported: hakios's front end assigns VARYING_SLOT_VAR0 + n to every Metal varying and never COL0/BFC0
 // (air_to_nir.c translate_output / translate_input), so the fallback could never fire on a Stage from it.
 #include "hakios-metal/render.hpp"
 
@@ -120,12 +123,14 @@ bool link(const Stage& vs, const Stage& fs, Linkage* out, std::string* why) {
             }
             continue;
         }
-        int k = findOutput(vs, in.slot);
-        if (k < 0) {
+        int k = in.slot == kVaryingSlotUnserved ? -1 : findOutput(vs, in.slot);
+        if (k < 0 && in.slot != kVaryingSlotUnserved) {
             return refuse(why, "the fragment stage reads varying slot " + std::to_string(in.slot) + " (" + slotName(in.slot) +
                                    "), which the vertex stage does not write");
         }
-        if (!linkAdd(l, in.slot, vs.outputs[k].regid, in.compmask, in.inloc)) {
+        // an unserved input (the A650 name match's): ir3_link_add with regid(63, 0), no var[] entry, varmask and maxLoc set
+        uint32_t vsRegid = k < 0 ? a6xx::kRegidNone : vs.outputs[k].regid;
+        if (!linkAdd(l, in.slot, vsRegid, in.compmask, in.inloc)) {
             return refuse(why, "the link holds " + std::to_string(kMaxStageOutputs) + " entries and the fragment stage reads more varyings than that");
         }
         // VPC_VARYING_INTERP_MODE: INTERP_FLAT for each component of a flat input, at two bits per location
@@ -172,6 +177,55 @@ bool link(const Stage& vs, const Stage& fs, Linkage* out, std::string* why) {
     // psReplMode is zero but for a [[point_coord]] input's (above); fd6 writes all eight registers so (render.hpp)
     *out = l;
     return true;
+}
+
+bool matchVaryingsByName(const Stage& vs, const std::vector<std::string>& vsNames, Stage* fs, const std::vector<std::string>& fsNames,
+                         std::vector<std::string>* unmatched, std::vector<std::string>* notes) {
+    auto note = [&](const std::string& text) {
+        if (notes != nullptr) notes->push_back(text);
+    };
+    // an empty VS identity: which VS output an FS name means cannot be told, so every input keeps the slot link
+    for (size_t k = 0; k < vsNames.size(); k++) {
+        if (vsNames[k].empty()) {
+            note("VS VAR" + std::to_string(k) + " has no identity: the varyings are linked by slot");
+            return false;
+        }
+    }
+    // each FS input's new slot, decided from the unchanged table, then written (two inputs never see each other's)
+    uint8_t slots[kMaxStageInputs];
+    bool changed = false;
+    for (uint32_t i = 0; i < fs->numInputs && i < kMaxStageInputs; i++) {
+        const StageInput& in = fs->inputs[i];
+        slots[i] = in.slot;
+        if (in.compmask == 0 || !in.bary || in.inloc >= fs->totalIn) continue;
+        if (in.slot < kVaryingSlotVar0 || in.slot >= kVaryingSlotVar0 + 32) continue;   // sysvals, POS, PNTC, unserved
+        uint32_t n = in.slot - kVaryingSlotVar0;
+        if (n >= fsNames.size() || fsNames[n].empty()) {
+            if (!fsNames.empty()) note("FS VAR" + std::to_string(n) + " has no identity: linked by slot");
+            continue;
+        }
+        const std::string& name = fsNames[n];
+        int first = -1;
+        for (size_t k = 0; k < vsNames.size() && k < 32; k++) {
+            if (vsNames[k] != name) continue;
+            if (first < 0) {
+                first = int(k);
+            } else {
+                note("VS VAR" + std::to_string(first) + " and VAR" + std::to_string(k) + " share the identity '" + name + "': VAR" +
+                     std::to_string(first) + " taken");
+                break;
+            }
+        }
+        // matched only when the VS does write that output: an identity without one serves nothing, and reads zeros
+        uint8_t want = first >= 0 && findOutput(vs, uint8_t(kVaryingSlotVar0 + first)) >= 0 ? uint8_t(kVaryingSlotVar0 + first) : kVaryingSlotUnserved;
+        if (want == kVaryingSlotUnserved && unmatched != nullptr) unmatched->push_back("VAR" + std::to_string(n) + " '" + name + "'");
+        if (want != in.slot) {
+            slots[i] = want;
+            changed = true;
+        }
+    }
+    for (uint32_t i = 0; i < fs->numInputs && i < kMaxStageInputs; i++) fs->inputs[i].slot = slots[i];
+    return changed;
 }
 
 }  // namespace hakios::metal::render

@@ -23,6 +23,13 @@
  * What the phone said, 13 October: all of that happens, 270 ms from the start of the bus to
  * "unified ready", with the copy engines looked at once a millisecond, and the scan hears the
  * networks around (drivers/wifi/hakios.wifi.c, step_driver(), has the account).
+ *
+ * The POCO F4's QCA6390 goes through the same functions (bus.pcie): the kernel has the card up as
+ * far as its firmware in mission mode and QRTR on MHI's channels (devices/munch/drivers/wifi/hakios.munch_pcie.c,
+ * hakios.munch_mhi.c, through lx_os_rproc_boot()), which takes the place of ath11k's pci.c and
+ * mhi.c. Of those, here is only what the core needs of a bus: BAR0 with its one sliding window
+ * (pci.c: ath11k_pci_window_read32()) and pcic.c's table of vectors for the chip. The chip keeps
+ * awake, for the kernel holds its wake doorbell for as long as it runs.
  */
 #define LX_QMI_AS_IT_IS				/* (this file is where the driver's requests go past) */
 #include <linux/kernel.h>
@@ -46,6 +53,9 @@
 
 static struct {
 	unsigned how;				/* wifi_lx */
+	bool pcie;				/* the QCA6390 behind PCIe, not the WCN6750 */
+	spinlock_t window_lock;
+	u32 window;				/* of BAR0's second half, what the chip's window register holds */
 	bool mission;				/* the firmware has been asked for mission mode, and for no other since */
 	bool closed;				/* the driver has stopped the bus: the registers are not touched again */
 	unsigned reads, writes, said, refused;
@@ -74,12 +84,26 @@ static struct ath11k_msi_user msi_users[] = {
 };
 static void irq_say(void);
 
-static const struct ath11k_msi_config msi_config = {
+static const struct ath11k_msi_config msi_config_wcn6750 = {
 	.total_vectors = 28,
 	.total_users = 2,
 	.users = msi_users,
 	.hw_rev = ATH11K_HW_WCN6750_HW10,
 };
+
+/* pcic.c: ath11k_msi_config[], the QCA6390's: the kernel's MHI has the first three, and looks at its rings instead */
+static struct ath11k_msi_user msi_users_qca6390[] = {
+	{ .name = "CE", .num_vectors = 10, .base_vector = 3 },
+	{ .name = "DP", .num_vectors = 18, .base_vector = 14 },
+};
+
+static const struct ath11k_msi_config msi_config_qca6390 = {
+	.total_vectors = 32,
+	.total_users = 2,
+	.users = msi_users_qca6390,
+	.hw_rev = ATH11K_HW_QCA6390_HW20,
+};
+static const struct ath11k_msi_config *msi_config = &msi_config_wcn6750;
 
 /* ---- what the driver says ---------------------------------------------------------------------- */
 
@@ -182,10 +206,10 @@ window(struct ath11k_base *ab, u32 offset)
 static bool
 refused(struct ath11k_base *ab, u32 offset)
 {
-	bool known = offset < ATH11K_PCI_WINDOW_START || (offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK ||
-	    (offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) < ATH11K_PCI_WINDOW_RANGE_MASK;
+	bool known = bus.pcie || offset < ATH11K_PCI_WINDOW_START || (offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) <
+	    ATH11K_PCI_WINDOW_RANGE_MASK || (offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) < ATH11K_PCI_WINDOW_RANGE_MASK;
 
-	if (known && bus.mission && !bus.closed) {
+	if (known && (bus.mission || bus.pcie) && !bus.closed) {
 		return (false);
 	}
 	if (bus.refused++ < 8) {
@@ -241,6 +265,46 @@ said_write(u32 offset, u32 value)
 	return (bus.said < SAID_FIRST);
 }
 
+/* pci.c: ath11k_pci_select_window(): with bus.window_lock held, unless the offset is below the window */
+static u8 *
+pcie_at(struct ath11k_base *ab, u32 offset)
+{
+	u32 chosen = FIELD_GET(ATH11K_PCI_WINDOW_VALUE_MASK, offset);
+
+	if (chosen != bus.window) {
+		iowrite32(ATH11K_PCI_WINDOW_ENABLE_BIT | chosen, (u8 *)ab->mem + ATH11K_PCI_WINDOW_REG_ADDRESS);
+		ioread32((u8 *)ab->mem + ATH11K_PCI_WINDOW_REG_ADDRESS);
+		bus.window = chosen;
+	}
+	return ((u8 *)ab->mem + ATH11K_PCI_WINDOW_START + (offset & ATH11K_PCI_WINDOW_RANGE_MASK));
+}
+
+static u32
+pcie_read32(struct ath11k_base *ab, u32 offset)
+{
+	u32 value;
+
+	if (offset < ATH11K_PCI_WINDOW_START) {
+		return (ioread32((u8 *)ab->mem + offset));
+	}
+	spin_lock_bh(&bus.window_lock);
+	value = ioread32(pcie_at(ab, offset));
+	spin_unlock_bh(&bus.window_lock);
+	return (value);
+}
+
+static void
+pcie_write32(struct ath11k_base *ab, u32 offset, u32 value)
+{
+	if (offset < ATH11K_PCI_WINDOW_START) {
+		iowrite32(value, (u8 *)ab->mem + offset);
+		return;
+	}
+	spin_lock_bh(&bus.window_lock);
+	iowrite32(value, pcie_at(ab, offset));
+	spin_unlock_bh(&bus.window_lock);
+}
+
 static u32
 bus_read32(struct ath11k_base *ab, u32 offset)
 {
@@ -251,7 +315,7 @@ bus_read32(struct ath11k_base *ab, u32 offset)
 	}
 	bus.reads++;
 	if (bus.how >= 2 && ab->mem != NULL) {
-		value = ioread32((u8 *)ab->mem + window(ab, offset));
+		value = bus.pcie ? pcie_read32(ab, offset) : ioread32((u8 *)ab->mem + window(ab, offset));
 	}
 	if (bus.said < SAID_FIRST) {
 		say_repeats();
@@ -276,7 +340,11 @@ bus_write32(struct ath11k_base *ab, u32 offset, u32 value)
 	}
 	if (bus.how >= 2 && ab->mem != NULL) {
 		__asm __volatile("dsb sy");	/* (what was written to a ring is in memory before the radio is told of it) */
-		iowrite32(value, (u8 *)ab->mem + window(ab, offset));
+		if (bus.pcie) {
+			pcie_write32(ab, offset, value);
+		} else {
+			iowrite32(value, (u8 *)ab->mem + window(ab, offset));
+		}
 	}
 }
 
@@ -360,6 +428,66 @@ bus_quiet(void)
 }
 
 /*
+ * What the QCA6390's phone firmware wants to be told, which is not what ath11k tells a card in a
+ * computer. ath11k's "host capabilities" say this is no Qualcomm platform and to run on the chip's
+ * internal sleep clock, and say nothing of where its memory may be; the firmware then dies on the
+ * memory it is given (1 November). So here the message goes as Android's cnss2 sends it
+ * (cnss_wlfw_host_cap_send_sync()): no such word, the wake vector, and the range of addresses the
+ * SMMU gives the card -- dt qcom,iommu-dma-addr-pool, and the 64 KB of smmu_iova_ipa behind it --
+ * in field 0x1f, which ath11k's description of the message does not have. (The number of clients
+ * stays 1: Android's second is its cnss-daemon, and there is none here.)
+ */
+#define HOST_DDR_RANGES		3
+#define HOST_DDR_START		0xa0000000ull
+#define HOST_DDR_SIZE		0x10010000ull
+#define WAKE_VECTOR		13		/* pcic.c: ath11k_msi_config[] */
+#define HOST_CAP_MAX_LEN	319
+
+struct host_ddr_range {
+	u64 start, size;
+};
+
+struct host_cap_phone {
+	u8 num_clients_valid;
+	u32 num_clients;
+	u8 wake_msi_valid;
+	u32 wake_msi;
+	u8 bdf_support_valid, bdf_support;
+	u8 m3_support_valid, m3_support;
+	u8 m3_cache_support_valid, m3_cache_support;
+	u8 cal_done_valid, cal_done;
+	u8 ddr_range_valid;
+	struct host_ddr_range ddr_range[HOST_DDR_RANGES];
+};
+
+static const struct qmi_elem_info host_ddr_range_ei[] = {
+	{ .data_type = QMI_UNSIGNED_8_BYTE, .elem_len = 1, .elem_size = sizeof(u64), .array_type = NO_ARRAY, .tlv_type = 0,
+	  .offset = offsetof(struct host_ddr_range, start) },
+	{ .data_type = QMI_UNSIGNED_8_BYTE, .elem_len = 1, .elem_size = sizeof(u64), .array_type = NO_ARRAY, .tlv_type = 0,
+	  .offset = offsetof(struct host_ddr_range, size) },
+	{ .data_type = QMI_EOTI, .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE },
+};
+
+#define OPTIONAL(tlv, valid)	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(u8), .array_type = NO_ARRAY, \
+				  .tlv_type = (tlv), .offset = offsetof(struct host_cap_phone, valid) }
+#define VALUE(tlv, kind, type, field) { .data_type = (kind), .elem_len = 1, .elem_size = sizeof(type), .array_type = NO_ARRAY, \
+				  .tlv_type = (tlv), .offset = offsetof(struct host_cap_phone, field) }
+
+static const struct qmi_elem_info host_cap_phone_ei[] = {
+	OPTIONAL(0x10, num_clients_valid), VALUE(0x10, QMI_UNSIGNED_4_BYTE, u32, num_clients),
+	OPTIONAL(0x11, wake_msi_valid), VALUE(0x11, QMI_UNSIGNED_4_BYTE, u32, wake_msi),
+	OPTIONAL(0x14, bdf_support_valid), VALUE(0x14, QMI_UNSIGNED_1_BYTE, u8, bdf_support),
+	OPTIONAL(0x16, m3_support_valid), VALUE(0x16, QMI_UNSIGNED_1_BYTE, u8, m3_support),
+	OPTIONAL(0x17, m3_cache_support_valid), VALUE(0x17, QMI_UNSIGNED_1_BYTE, u8, m3_cache_support),
+	OPTIONAL(0x1a, cal_done_valid), VALUE(0x1a, QMI_UNSIGNED_1_BYTE, u8, cal_done),
+	OPTIONAL(0x1f, ddr_range_valid),
+	{ .data_type = QMI_STRUCT, .elem_len = HOST_DDR_RANGES, .elem_size = sizeof(struct host_ddr_range),
+	  .array_type = STATIC_ARRAY, .tlv_type = 0x1f, .offset = offsetof(struct host_cap_phone, ddr_range),
+	  .ei_array = host_ddr_range_ei },
+	{ .data_type = QMI_EOTI, .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE },
+};
+
+/*
  * A request of the driver's to the firmware, on its way out (linux/soc/qcom/qmi.h, ours). One
  * matters here: the mode. With any mode but mission the radio's registers stop answering, and
  * the driver does not always let go of the copy engines first -- where its start fails late,
@@ -370,6 +498,28 @@ int
 lx_qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_txn *txn, int msg_id, size_t largest,
     const struct qmi_elem_info *ei, const void *structure)
 {
+	if (msg_id == QMI_WLANFW_HOST_CAP_REQ_V01 && bus.pcie) {
+		const struct qmi_wlanfw_host_cap_req_msg_v01 *theirs = structure;
+		struct ath11k_base *ab = container_of(qmi, struct ath11k_qmi, handle)->ab;
+		static struct host_cap_phone cap;
+
+		memset(&cap, 0, sizeof(cap));
+		cap.num_clients_valid = 1;
+		cap.num_clients = 1;
+		cap.wake_msi_valid = bus.irq;
+		cap.wake_msi = ab->pci.msi.ep_base_data + WAKE_VECTOR;
+		cap.bdf_support_valid = cap.bdf_support = 1;
+		cap.m3_support_valid = cap.m3_support = 1;
+		cap.m3_cache_support_valid = cap.m3_cache_support = 1;
+		cap.cal_done_valid = 1;
+		cap.cal_done = theirs->cal_done;
+		cap.ddr_range_valid = 1;
+		cap.ddr_range[0].start = HOST_DDR_START;
+		cap.ddr_range[0].size = HOST_DDR_SIZE;
+		lx_tell("lx: the host capabilities as a phone's: wake vector data %u, addresses %#llx + %#llx, no \"nm_modem\"\n",
+		    cap.wake_msi, HOST_DDR_START, HOST_DDR_SIZE);
+		return (qmi_send_request(qmi, sq, txn, msg_id, HOST_CAP_MAX_LEN, host_cap_phone_ei, &cap));
+	}
 	if (msg_id == QMI_WLANFW_WLAN_MODE_REQ_V01) {
 		u32 mode = ((const struct qmi_wlanfw_wlan_mode_req_msg_v01 *)structure)->mode;
 
@@ -421,6 +571,7 @@ irq_group(void *argument)
 static int
 irq_attach(struct ath11k_base *ab)
 {
+	const struct ath11k_msi_user *ce = &msi_config->users[0], *dp = &msi_config->users[1];
 	unsigned index = 0;
 	int ret;
 
@@ -434,7 +585,7 @@ irq_attach(struct ath11k_base *ab)
 		if (ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR) {
 			continue;
 		}
-		bus.ce_vector[i] = (int)(index++ % msi_users[0].num_vectors + msi_users[0].base_vector);
+		bus.ce_vector[i] = (int)(index++ % ce->num_vectors + ce->base_vector);
 		if ((ret = lx_os_irq_attach((unsigned)bus.ce_vector[i], irq_ce, &ab->ce.ce_pipe[i])) != 0) {
 			return (ret);
 		}
@@ -448,7 +599,7 @@ irq_attach(struct ath11k_base *ab)
 		    mask->rxdma2host[i] || mask->host2rxdma[i] || mask->rx_mon_status[i])) {
 			continue;
 		}
-		bus.group_vector[i] = (int)(i % msi_users[1].num_vectors + msi_users[1].base_vector);
+		bus.group_vector[i] = (int)(i % dp->num_vectors + dp->base_vector);
 		if ((ret = lx_os_irq_attach((unsigned)bus.group_vector[i], irq_group, &ab->ext_irq_grp[i])) != 0) {
 			return (ret);
 		}
@@ -462,25 +613,25 @@ irq_say(void)
 {
 	char line[400] = "";
 
-	for (unsigned v = 0; v < msi_config.total_vectors; v++) {
+	for (unsigned v = 0; v < msi_config->total_vectors; v++) {
 		unsigned long long count = lx_os_irq_count(v);
 
 		if (count != 0) {
 			snprintf(line + strlen(line), sizeof(line) - strlen(line), " %u: %llu,", v, count);
 		}
 	}
-	lx_tell("lx: the radio's interrupts by vector (copy engines 0-9, the data path's groups 10-27):%s the thread found %llu "
-	    "times work no interrupt had brought\n", line[0] ? line : " NONE", bus.late);
+	lx_tell("lx: the radio's interrupts by vector (the copy engines' first, then the data path's groups):%s the thread found "
+	    "%llu times work no interrupt had brought\n", line[0] ? line : " NONE", bus.late);
 }
 
 static int
 bus_get_user_msi_vector(struct ath11k_base *ab, char *user, int *count, u32 *user_base_data, u32 *base_vector)
 {
-	for (unsigned i = 0; i < nitems(msi_users); i++) {
-		if (strcmp(user, msi_users[i].name) == 0) {
-			*count = (int)msi_users[i].num_vectors;
-			*base_vector = msi_users[i].base_vector;
-			*user_base_data = msi_users[i].base_vector + ab->pci.msi.ep_base_data;
+	for (unsigned i = 0; i < msi_config->total_users; i++) {
+		if (strcmp(user, msi_config->users[i].name) == 0) {
+			*count = (int)msi_config->users[i].num_vectors;
+			*base_vector = msi_config->users[i].base_vector;
+			*user_base_data = msi_config->users[i].base_vector + ab->pci.msi.ep_base_data;
 			return (0);
 		}
 	}
@@ -582,7 +733,18 @@ bus_map_service_to_pipe(struct ath11k_base *ab, u16 service, u8 *up, u8 *down)
 static int
 bus_power_up(struct ath11k_base *ab)
 {
-	return (-lx_os_rproc_boot());
+	int ret = -lx_os_rproc_boot();
+
+	if (ret == 0 && bus.pcie) {
+		unsigned long size = 0;
+
+		ab->mem = lx_os_radio_bar(&size);
+		ab->mem_len = size;
+		bus.window = ~0u;		/* (the chip's global reset has cleared the register) */
+		printf("lx: the card is up, its registers mapped (%lu KB); hardware version %#x\n", size >> 10, ioread32((u8 *)ab->mem +
+		    0x224));
+	}
+	return (ret);
 }
 
 static void
@@ -746,8 +908,13 @@ lx_start(void)
 	device.of_node = &node;
 	device.kobj.name = "wifi";
 
-	/* ahb.c: ath11k_ahb_probe(), for this chip */
-	ab = ath11k_core_alloc(&device, 0, ATH11K_BUS_AHB);
+	/* ahb.c: ath11k_ahb_probe(), for this chip; or pci.c: ath11k_pci_probe() */
+	bus.pcie = lx_os_radio_is_pcie() != 0;
+	if (bus.pcie) {
+		msi_config = &msi_config_qca6390;
+		spin_lock_init(&bus.window_lock);
+	}
+	ab = ath11k_core_alloc(&device, 0, bus.pcie ? ATH11K_BUS_PCI : ATH11K_BUS_AHB);
 	if (ab == NULL) {
 		return (ENOMEM);
 	}
@@ -760,7 +927,7 @@ lx_start(void)
 		/* (pcic.c: ath11k_pcic_init_msi_config() and what ahb.c takes from the device tree for this chip) */
 		if (lx_os_irq_msi(&address, &data)) {
 			mutex_init(&bus.service);
-			ab->pci.msi.config = &msi_config;
+			ab->pci.msi.config = msi_config;
 			ab->pci.msi.addr_lo = (u32)address;
 			ab->pci.msi.addr_hi = (u32)(address >> 32);
 			ab->pci.msi.ep_base_data = data;
@@ -771,8 +938,14 @@ lx_start(void)
 			lx_tell("lx: wifi_irq: the radio cannot be shown where to raise an interrupt: the rings are looked at, as before\n");
 		}
 	}
-	ab->hw_rev = ATH11K_HW_WCN6750_HW10;
+	ab->hw_rev = bus.pcie ? ATH11K_HW_QCA6390_HW20 : ATH11K_HW_WCN6750_HW10;
 	ab->fw_mode = ATH11K_FIRMWARE_MODE_NORMAL;
+	if (bus.pcie) {
+		ab->id.vendor = 0x17cb;
+		ab->id.device = 0x1101;
+		ab->id.subsystem_vendor = 0x17cb;
+		ab->id.subsystem_device = 0x0108;
+	}
 	if ((ret = ath11k_core_pre_init(ab)) != 0 || (ret = ath11k_hal_srng_init(ab)) != 0 || (ret = ath11k_ce_alloc_pipes(ab)) != 0) {
 		lx_tell("lx: the driver does not get as far as its exchange with the firmware: %d\n", ret);
 		return (-ret);

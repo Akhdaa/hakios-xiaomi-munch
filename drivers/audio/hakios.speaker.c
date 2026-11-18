@@ -67,7 +67,9 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.input.h>
 #include <sys/systm.h>
+#include <sys/hakios.version.h>
 #include <sys/hakios.audio.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -1233,6 +1235,9 @@ hakios_speaker_init(void)
 {
 	thread_t thread;
 
+	if (!hakios_soc_is("sc7280")) {
+		return;                 /* (the addresses below are the POCO X5 Pro's) */
+	}
 	if (!PE_parse_boot_argn("speaker_probe", &probe_level, sizeof(probe_level)) || probe_level == 0) {
 		return;
 	}

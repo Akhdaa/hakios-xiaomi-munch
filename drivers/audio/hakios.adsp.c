@@ -90,6 +90,7 @@
 #include <sys/kauth.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
+#include <sys/hakios.version.h>
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
 #include <vm/vm_kern.h>
@@ -109,7 +110,7 @@ extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
 /* What the Wi-Fi's DSP and this one both use (hakios.wifi.c). */
 extern lck_mtx_t hakios_aop_mailbox_lock;
 extern lck_mtx_t hakios_smem_alloc_lock;
-extern lck_mtx_t hakios_rsc_lock;            /* RPMh's sequencer, shared with the other DSP's driver */
+extern lck_mtx_t hakios_rsc_lock;            /* RPMh's sequencer, shared with munch's supplies (hakios_munch_vreg()) */
 
 static LCK_GRP_DECLARE(adsp_lock_group, "hakios-adsp");
 
@@ -983,8 +984,16 @@ step_survey(void)
 
 /* ---- step 2: the firmware -------------------------------------------------------------------------- */
 
-#define ADSP_MEMORY             0x86700000u     /* dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000 */
-#define ADSP_MEMORY_SIZE        0x04000000u
+/*
+ * dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000. The POCO F4 (munch, hw=munch)
+ * has its audio DSP's memory at pil_adsp_region@8bb00000, 0x2500000 long (memory-region of
+ * qcom,lpass@17300000); the rest that steps 1 and 2 use is redwood's there too (IPCC client 3,
+ * signals 0 and 2; SMEM items 443 and 429; image 1; rails lcx.lvl and lmx.lvl).
+ */
+static uint32_t adsp_memory = 0x86700000u, adsp_memory_size = 0x04000000u;
+#define MUNCH_ADSP_STEPS        11
+#define ADSP_MEMORY             adsp_memory
+#define ADSP_MEMORY_SIZE        adsp_memory_size
 #define PAS_ADSP                1               /* dt: qcom,pas-id */
 
 
@@ -1041,6 +1050,17 @@ static bool from_root;                  /* the image is in memory of ours (root_
 const uint8_t *
 hakios_adsp_fw_file(const char *name, uint64_t *size)
 {
+	extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+	const uint8_t *image = hakios_image_file("fw", name, size, NULL);  /* (the small image's fw/ first: a copy of it) */
+
+	if (image != NULL && *size > 0) {
+		uint8_t *copy = kalloc_data(*size, Z_WAITOK);
+
+		if (copy != NULL) {
+			memcpy(copy, image, *size);
+			return copy;
+		}
+	}
 	return root_file(name, size);
 }
 
@@ -1079,6 +1099,7 @@ image_file(const char *name, uint64_t *size)
 
 
 #define MDT_HASH(flags)         (((flags) >> 24 & 7) == 2)
+#define MDT_RELOCATABLE(flags)  ((flags) & (1u << 27))    /* QCOM_MDT_RELOCATABLE */
 #define MAX_SEGMENTS            48
 
 struct elf_segment {
@@ -1126,7 +1147,7 @@ step_firmware(void)
 	struct elf_segment segment;
 	const uint8_t *header;
 	uint64_t size = 0, files = 0;
-	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
+	uint32_t count, hashes = 0, lowest = ~0u, highest = 0, base = ADSP_MEMORY;
 	uint8_t first[4] = { 0 };
 
 	announce("find the audio DSP's image in the small image or on the root, and check it against its own header");
@@ -1147,6 +1168,21 @@ step_firmware(void)
 		    first[1], first[2], first[3], count, size);
 		goto fail;
 	}
+	/*
+	 * A relocatable image (bit 27 of a segment's flags: munch's, linked at 0x89500000 for memory that
+	 * is at 0x8bb00000) goes where its memory is, each segment as far from the start as it is from the
+	 * image's lowest address (Linux's mdt_loader.c, mem_reloc); redwood's is linked where it is loaded.
+	 */
+	for (uint32_t i = 0; i < count; i++) {
+		memcpy(&segment, header + 52 + 32 * i, sizeof(segment));
+		if (segment.type == 1 && !MDT_HASH(segment.flags) && segment.memory_size != 0 && MDT_RELOCATABLE(segment.flags) &&
+		    segment.paddr < base) {
+			base = segment.paddr;
+		}
+	}
+	if (base != ADSP_MEMORY) {
+		printf("adsp: %u: the image is relocatable: linked at %#x, it goes to %#x\n", step, base, ADSP_MEMORY);
+	}
 	for (uint32_t i = 0; i < count; i++) {
 		char name[16];
 
@@ -1157,13 +1193,13 @@ step_firmware(void)
 		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
 			continue;
 		}
-		if (segment.paddr < ADSP_MEMORY || segment.file_size > segment.memory_size ||
-		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)ADSP_MEMORY + ADSP_MEMORY_SIZE) {
+		if (segment.paddr < base || segment.file_size > segment.memory_size ||
+		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)base + ADSP_MEMORY_SIZE) {
 			printf("adsp: %u: segment %u (%#x, %#x bytes) is not within the DSP's memory\n", step, i, segment.paddr,
 			    segment.memory_size);
 			goto fail;
 		}
-		image.segment[image.segments].at = segment.paddr - ADSP_MEMORY;
+		image.segment[image.segments].at = segment.paddr - base;
 		image.segment[image.segments].file_size = segment.file_size;
 		image.segment[image.segments].memory_size = segment.memory_size;
 		image.segment[image.segments].file = NULL;
@@ -1188,14 +1224,14 @@ step_firmware(void)
 		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
 		image.segments++;
 	}
-	if (image.segments == 0 || lowest != ADSP_MEMORY || 52 + 32 * count + (uint64_t)hashes != size) {
+	if (image.segments == 0 || lowest != base || 52 + 32 * count + (uint64_t)hashes != size) {
 		printf("adsp: %u: not what TrustZone takes: %u segments to load, the lowest at %#x; the header file has %llu bytes, "
 		    "the header %u and the hashes %u\n", step, image.segments, lowest, size, 52 + 32 * count, hashes);
 		goto fail;
 	}
 	image.header = header;
 	image.header_size = size;
-	image.size = ((highest + 0xfff) & ~0xfffu) - ADSP_MEMORY;
+	image.size = ((highest + 0xfff) & ~0xfffu) - base;
 	printf("adsp: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
 	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
 	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY);
@@ -1458,6 +1494,7 @@ step_header(void)
 /* ---- step 5: the image, in the DSP's memory --------------------------------------------------------- */
 
 static bool image_written;
+#define ROUND8(n)               (((n) + 7u) & ~7u)
 
 static uint64_t
 segment_word(unsigned s, uint32_t at)
@@ -1479,19 +1516,26 @@ step_image(void)
 	if (image.segments == 0) {
 		return false;
 	}
-	announce("put the image's segments into the audio DSP's memory (0x86700000, 64 MB: memory of nobody's until TrustZone "
-	    "starts the DSP), with zeroes where a segment is longer than its file, and read them back");
+	printf("adsp: step %u: put the image's segments into the audio DSP's memory (%#x, %u MB: memory of nobody's until "
+	    "TrustZone starts the DSP), with zeroes where a segment is longer than its file, and read them back\n", step,
+	    ADSP_MEMORY, ADSP_MEMORY_SIZE >> 20);
+	announce("(the image, as just said)");
 	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(ADSP_MEMORY, ADSP_MEMORY_SIZE, VM_WIMG_WCOMB);
 	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, ADSP_MEMORY);
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
 
-		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
-			printf("adsp: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
+		/*
+		 * A segment may end anywhere (munch's last one is 0x8c bytes): it is written to the next multiple
+		 * of eight, the rest of that word zeroes, as long as that stays in the DSP's memory.
+		 */
+		if ((image.segment[s].at & 7) || image.segment[s].at + ROUND8(image.segment[s].memory_size) > ADSP_MEMORY_SIZE) {
+			printf("adsp: %u: a segment that does not begin at a multiple of eight bytes, or ends past the memory: not written\n",
+			    step);
 			ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
 			return false;
 		}
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
+		for (uint32_t i = 0; i < ROUND8(image.segment[s].memory_size); i += 8) {
 			to[i / 8] = segment_word(s, i);
 		}
 		written += image.segment[s].file_size;
@@ -1501,7 +1545,7 @@ step_image(void)
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *from = dsp_memory + image.segment[s].at / 8;
 
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
+		for (uint32_t i = 0; i < ROUND8(image.segment[s].memory_size); i += 8) {
 			wrong += from[i / 8] != segment_word(s, i);
 		}
 	}
@@ -1522,18 +1566,18 @@ static struct block smem_lock = { "shared memory's lock", 0x01f43000, 0x1000 };
 
 /* Our item made in the partition, as Linux's qcom_smem_alloc_private() makes one (hakios.wifi.c: our_item_make()). */
 static bool
-our_item_make(uint32_t partition)
+item_make(uint32_t partition, uint32_t item, uint32_t item_size, uint32_t padding)
 {
 	struct smem_partition header;
 	struct smem_entry entry;
-	const uint32_t item_size = (sizeof(struct smp2p) + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
+	const uint32_t need_bytes = sizeof(entry) + item_size;
 	uint32_t owner = ~0u, at;
 	bool made = false;
 
 	lck_mtx_lock(&hakios_smem_alloc_lock);         /* (the Wi-Fi's start allocates under the same hardware lock) */
 	need(&smem_lock);
 	printf("adsp: %u: about to take the lock (%#x), write an entry for item %u with %u bytes behind it at the partition's mark, "
-	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, ITEM_SMP2P_OURS, item_size, need_bytes);
+	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, item, item_size, need_bytes);
 	snprintf(last_write, sizeof(last_write), "step %u took the shared memory's lock", step);
 	for (uint32_t ms = 0; ms <= 1000; ms++) {
 		wr(smem_lock.base + LOCK_OWNER, LOCK_US);
@@ -1554,7 +1598,7 @@ our_item_make(uint32_t partition)
 		goto out;
 	}
 	for (at = sizeof(header); at < header.free_uncached;) {
-		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == ITEM_SMP2P_OURS ||
+		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == item ||
 		    entry.size > header.size) {
 			break;
 		}
@@ -1569,9 +1613,9 @@ our_item_make(uint32_t partition)
 		printf("adsp: %u: no room: %u bytes wanted, %u free: nothing is written\n", step, need_bytes, header.free_cached - at);
 		goto out;
 	}
-	smem_poke(partition + at, SMEM_CANARY | ITEM_SMP2P_OURS << 16);
+	smem_poke(partition + at, SMEM_CANARY | item << 16);
 	smem_poke(partition + at + 4, item_size);
-	smem_poke(partition + at + 8, item_size - (uint32_t)sizeof(struct smp2p));
+	smem_poke(partition + at + 8, padding);
 	smem_poke(partition + at + 12, 0);
 	settle();
 	smem_poke(partition + __offsetof(struct smem_partition, free_uncached), at + need_bytes);
@@ -1582,6 +1626,15 @@ out:
 	printf("adsp: %u: the lock is released (it reads %u)\n", step, rd(smem_lock.base + LOCK_OWNER));
 	lck_mtx_unlock(&hakios_smem_alloc_lock);
 	return made;
+}
+
+/* Our SMP2P item (429). */
+static bool
+our_item_make(uint32_t partition)
+{
+	const uint32_t item_size = (sizeof(struct smp2p) + 7) & ~7u;
+
+	return item_make(partition, ITEM_SMP2P_OURS, item_size, item_size - (uint32_t)sizeof(struct smp2p));
 }
 
 static void glink_reset(void);
@@ -1794,6 +1847,7 @@ step_start(void)
 #define ITEM_GLINK_DESCRIPTOR   478
 #define ITEM_GLINK_OUR_QUEUE    479
 #define ITEM_GLINK_THEIR_QUEUE  480
+#define GLINK_OUR_QUEUE_SIZE    16384           /* Linux's SZ_16K */
 #define GLINK_OUR_TAIL          0
 #define GLINK_OUR_HEAD          4
 #define GLINK_THEIR_TAIL        8
@@ -2999,6 +3053,18 @@ step_queues(void)
 	uint32_t head, tail;
 
 	announce("find GLINK's descriptor and the two queues, and read what the audio DSP has put into its own");
+	if (!glink_find() && glink.descriptor != 0 && glink.ours == 0 && glink.theirs != 0) {
+		/*
+		 * The DSP has made the descriptor and its own queue, and ours is for us to make: Linux's
+		 * qcom_glink_smem_register() allocates it, 16 KB, once the DSP is up (munch's, from a cold start).
+		 */
+		uint32_t cacheline = 0, size = 0, partition = smem_partition(SMEM_US, SMEM_ADSP, &cacheline, &size);
+
+		printf("adsp: %u: our queue (item %u) is not there: it is ours to make, 16 KB\n", step, ITEM_GLINK_OUR_QUEUE);
+		if (partition == 0 || !item_make(partition, ITEM_GLINK_OUR_QUEUE, GLINK_OUR_QUEUE_SIZE, 0)) {
+			return false;
+		}
+	}
 	if (!glink_find()) {
 		printf("adsp: %u: GLINK's items are not all there, or not of a shape this knows (descriptor %#x, ours %#x of %u bytes, "
 		    "the DSP's %#x of %u)\n", step, glink.descriptor, glink.ours, glink.ours_size, glink.theirs, glink.theirs_size);
@@ -3249,7 +3315,9 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
 		hakios_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, hakios.sound.c) */
 		hakios_mic_dsp_up();           /* (boot-arg mic=N: the microphones' path, hakios.mic.c) */
-		battmgr_start();                /* (how the battery is, from the DSP; battmgr=0: not asked) */
+		if (hakios_soc_is("sc7280")) {
+			battmgr_start();        /* (how the battery is, from the DSP; battmgr=0: not asked; munch's is not the DSP's) */
+		}
 	} else {
 		tell("adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
 		    last_write);
@@ -3266,6 +3334,27 @@ hakios_adsp_init(void)
 
 	PE_parse_boot_argn("adsp_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || on != 1)) {
+		return;
+	}
+	if (hakios_soc_is("sm8250")) {
+		/*
+		 * The steps written for munch so far (see ADSP_MEMORY): reading, then the always-on processor's
+		 * mailbox (dt qcom,qmp-aop@c300000, IPCC client 0 signal 0, as redwood), TrustZone's taking
+		 * of the header and the place (image 1), the image written, our SMP2P item, the start
+		 * (RPMh lcx.lvl/lmx.lvl, "adsp: on" to the always-on processor, authenticate and reset), and
+		 * the conversation: GLINK in the shared memory, QRTR on "IPCRTR", APR.
+		 */
+		if (MUNCH_ADSP_STEPS < STEPS && (last_step == 0 || last_step > MUNCH_ADSP_STEPS)) {
+			printf("adsp: on munch only steps 1 to %u are written: adsp_step=N up to that\n", MUNCH_ADSP_STEPS);
+			if (last_step == 0) {
+				return;
+			}
+			last_step = MUNCH_ADSP_STEPS;
+		}
+		adsp_memory = 0x8bb00000u;
+		adsp_memory_size = 0x02500000u;
+	} else if (!hakios_soc_is("sc7280")) {
+		printf("adsp: adsp=1 and adsp_step=N are for the phone's audio DSP, and this is not the phone\n");
 		return;
 	}
 	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {

@@ -1,6 +1,7 @@
 #include "hakios-metal/compiler.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,9 +31,19 @@ std::unique_ptr<CompiledKernel> compileAir(const void*, size_t, std::string* why
     return nullptr;
 }
 
+std::unique_ptr<CompiledKernel> compileAirForChip(const void* bitcode, size_t size, uint32_t, std::string* why,
+                                                  const FunctionConstants& constants) {
+    return compileAir(bitcode, size, why, constants);
+}
+
 std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* why, const FunctionConstants&, uint32_t, const KnownBuffer*) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
     return nullptr;
+}
+
+std::unique_ptr<CompiledStage> compileStageForChip(const void* bitcode, size_t size, uint32_t, std::string* why,
+                                                  const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known) {
+    return compileStage(bitcode, size, why, constants, iboBase, known);
 }
 
 std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage>, std::shared_ptr<CompiledStage>, PixelFormat, std::string* why) {
@@ -45,29 +56,37 @@ bool argumentBufferLayout(const void*, size_t, uint32_t, std::vector<std::pair<u
     return false;
 }
 
+const char* stageCacheBuild() { return ""; }
+
 #else
 
 namespace {
 
 std::mutex gCompilerLock;   // ir3 keeps state in the compiler object; one compilation at a time
 
-// one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06030500 to the Adreno 7c+ Gen 3 row
+ir3_compiler* makeCompiler(uint32_t chipId) {
+    fd_dev_id id{};
+    id.chip_id = chipId;
+    // Framebuffer fetch uses the slot after the fragment shader's last texture.
+    ir3_compiler_options options{};
+    options.bindless_fb_read_descriptor = -1;
+    // The compiler holds the GLSL type cache for the lifetime of the process.
+    glsl_type_singleton_init_or_ref();
+    return ir3_compiler_create(nullptr, &id, fd_dev_info_raw(&id), &options);
+}
+
 ir3_compiler* theCompiler() {
-    static ir3_compiler* compiler = [] {
-        fd_dev_id id{};
-        id.gpu_id = 0;
-        id.chip_id = a6xx::kChipId;
-        // A framebuffer fetch (nir_texop_txf_ms_fb) through the FS's own texture table, at the slot after its last
-        // texture, as turnip has it (tu_device.cc: -1): the zero default would make it a bindless read of descriptor
-        // set 0, which this driver never binds
-        ir3_compiler_options options{};
-        options.bindless_fb_read_descriptor = -1;
-        // the GLSL type cache, which ir3 uses for the driver UBOs' types (get_driver_ubo_type: a module's constant table
-        // is read through one); held for the life of the process, as the compiler is
-        glsl_type_singleton_init_or_ref();
-        return ir3_compiler_create(nullptr, &id, fd_dev_info_raw(&id), &options);
-    }();
+    static ir3_compiler* compiler = makeCompiler(a6xx::kChipId);
     return compiler;
+}
+
+ir3_compiler* compilerForChip(uint32_t chipId) {
+    if (chipId == a6xx::kChipId) return theCompiler();
+    if (chipId == a6xx::kA650ChipId) {
+        static ir3_compiler* a650 = makeCompiler(a6xx::kA650ChipId);
+        return a650;
+    }
+    return nullptr;
 }
 
 bool refuse(std::string* why, const std::string& text) {
@@ -264,7 +283,8 @@ bool foldKnownLoad(nir_builder* b, nir_intrinsic_instr* intr, void* data) {
     return true;
 }
 
-bool translate(const void* bitcode, size_t size, Translation& t, std::string* why, const FunctionConstants& supplied, const KnownBuffer* known = nullptr) {
+bool translate(const void* bitcode, size_t size, Translation& t, std::string* why, const FunctionConstants& supplied,
+               const KnownBuffer* known, ir3_compiler* compiler) {
     t.mem = ralloc_context(nullptr);
     air_constant_value* constants = nullptr;
     unsigned numConstants = air_module_function_constants(t.mem, bitcode, size, &constants);
@@ -280,7 +300,7 @@ bool translate(const void* bitcode, size_t size, Translation& t, std::string* wh
     options.constants = constants;
     options.num_constants = numConstants;
     const char* error = nullptr;
-    t.nir = air_to_nir(t.mem, bitcode, size, nullptr, &options, ir3_get_compiler_options(theCompiler()), &t.info, &error);
+    t.nir = air_to_nir(t.mem, bitcode, size, nullptr, &options, ir3_get_compiler_options(compiler), &t.info, &error);
     if (t.nir == nullptr) return refuse(why, std::string("the front end refused it: ") + (error ? error : "no reason given"));
     // the known buffer's reads folded, its offsets folded first (a field's offset is the front end's arithmetic on the
     // pointer), until nothing more folds: a value read may decide the offset of another read
@@ -671,8 +691,7 @@ bool usesSubgroup(nir_shader* nir) {
     return false;
 }
 
-bool compileVariant(Translation& t, PassOrder order, std::string* why) {
-    ir3_compiler* compiler = theCompiler();
+bool compileVariant(Translation& t, PassOrder order, std::string* why, ir3_compiler* compiler) {
     nir_shader* nir = t.nir;
     // what the consumer owes before ir3: the front end emits NIR's own system values, as the SPIR-V one does
     nir_lower_system_values(nir);
@@ -1068,13 +1087,19 @@ const char* className(uint8_t element) { return element == kElemFloat ? "floats"
 bool hasCompiler() { return theCompiler() != nullptr; }
 
 std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
+    return compileAirForChip(bitcode, size, a6xx::kChipId, why, constants);
+}
+
+std::unique_ptr<CompiledKernel> compileAirForChip(const void* bitcode, size_t size, uint32_t chipId, std::string* why,
+                                                  const FunctionConstants& constants) {
     std::lock_guard<std::mutex> g(gCompilerLock);
-    if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+    ir3_compiler* compiler = compilerForChip(chipId);
+    if (compiler == nullptr) {
+        refuse(why, "ir3 has no compiler for the requested chip");
         return nullptr;
     }
     Translation t;
-    if (!translate(bitcode, size, t, why, constants)) return nullptr;
+    if (!translate(bitcode, size, t, why, constants, nullptr, compiler)) return nullptr;
     if (t.nir->info.stage != MESA_SHADER_COMPUTE) {
         refuse(why, std::string(t.info.entry_point ? t.info.entry_point : "the function") +
                         " is not a compute kernel; a vertex or fragment function goes through compileStage");
@@ -1086,7 +1111,7 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
     if (!walkTextures(t.nir, out->kernel, &highestSampler, why)) return nullptr;
     if (!nullTextures(t, out->kernel, false, why)) return nullptr;
     if (!inlineSamplersOf(t, &out->inlineSamplers, why)) return nullptr;
-    if (!compileVariant(t, PassOrder::kCompute, why)) return nullptr;
+    if (!compileVariant(t, PassOrder::kCompute, why, compiler)) return nullptr;
     KernelHome home{out->kernel, out->words, out->immediates, out->resources, out->name, out->listing};
     if (!fillKernel(t, home, highestSampler, why)) return nullptr;
     out->threadgroupBytes = t.info.threadgroup_bytes;
@@ -1097,7 +1122,7 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
 
 namespace {
 std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                                const KnownBuffer* known);
+                                                const KnownBuffer* known, ir3_compiler* compiler, uint32_t chipId);
 }  // namespace
 
 // A stage compiled as turnip compiles it, unless that spills: ir3's preamble pass hoists what is uniform into a
@@ -1151,8 +1176,13 @@ const char* const kCacheBuild = __DATE__ " " __TIME__;
 
 // The file name of a stage in the cache (no directory), "" when no cache is configured: the writable directory
 // HAKIOS_METAL_CACHE, and the read-only ones HAKIOS_METAL_CACHE_SEED (':' between them) -- stages compiled on an
-// earlier boot and put into the system image, looked in after the writable one and never written.
-std::string stageCacheName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known) {
+// earlier boot and put into the system image, looked in after the writable one and never written. CHIP_ID the chip
+// the stage is compiled for: a6xx::kChipId (redwood) and a6xx::kA650ChipId have a cache, "" for every other chip.
+// For kChipId the bytes hashed are exactly those of the redwood-only cache before (its names and seeds unchanged);
+// for the A650 the chip ID is mixed in after the layout, so an A650 stage is never taken for a redwood one.
+std::string stageCacheName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known,
+                           uint32_t chipId) {
+    if (chipId != a6xx::kChipId && chipId != a6xx::kA650ChipId) return {};
     const char* dir = getenv("HAKIOS_METAL_CACHE");
     const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
     if ((dir == nullptr || dir[0] == 0) && (seed == nullptr || seed[0] == 0)) return {};
@@ -1167,6 +1197,7 @@ std::string stageCacheName(const void* bitcode, size_t size, const FunctionConst
     const uint32_t layout[3] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase};
     mix(kCacheBuild, strlen(kCacheBuild));
     mix(layout, sizeof(layout));
+    if (chipId != a6xx::kChipId) mix(&chipId, sizeof(chipId));
     mix(bitcode, size);
     for (const FunctionConstant& c : constants) {
         mix(&c.index, sizeof(c.index));
@@ -1277,15 +1308,35 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
 
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
                                            const KnownBuffer* known) {
+    return compileStageForChip(bitcode, size, a6xx::kChipId, why, constants, iboBase, known);
+}
+
+std::unique_ptr<CompiledStage> compileStageForChip(const void* bitcode, size_t size, uint32_t chipId, std::string* why,
+                                                  const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known) {
     std::lock_guard<std::mutex> g(gCompilerLock);
-    if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+    ir3_compiler* compiler = compilerForChip(chipId);
+    if (compiler == nullptr) {
+        refuse(why, "ir3 has no compiler for the requested chip");
         return nullptr;
     }
-    const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
+    const auto began = std::chrono::steady_clock::now();
+    const std::string name = stageCacheName(bitcode, size, constants, iboBase, known, chipId);
+    // (what the request came to, for the plug-in's record: where from, the file's name, the digest, the time)
+    auto told = [&](std::unique_ptr<CompiledStage> s, uint32_t source) {
+        if (s != nullptr) {
+            s->cacheSource = source;
+            s->cacheName = name;
+            s->digest = stageDigest(*s);
+            s->compileUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - began).count());
+        }
+        return s;
+    };
     const std::string cached = stageCacheWritable(name);
     if (!cached.empty()) {
-        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) return s;
+        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) {
+            s->chipId = chipId;   // the file has no chip field: the name (above) has it for every chip but kChipId
+            return told(std::move(s), 1);
+        }
     }
     if (!name.empty()) {
         const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
@@ -1294,31 +1345,39 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
             const std::string dir(p, colon != nullptr ? size_t(colon - p) : strlen(p));
             p = colon != nullptr ? colon + 1 : nullptr;
             if (dir.empty()) continue;
-            if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) return s;
+            if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) {
+                s->chipId = chipId;
+                return told(std::move(s), 2);
+            }
         }
     }
-    std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known);
+    std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known, compiler, chipId);
     std::unique_ptr<CompiledStage> chosen;
-    if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {
+    if (with == nullptr || with->stage.k.pvtmemSize == 0 || !compiler->has_preamble) {
         chosen = std::move(with);
     } else {
-        theCompiler()->has_preamble = false;
+        compiler->has_preamble = false;
         std::string whyNot;
-        std::unique_ptr<CompiledStage> without = compileStageOnce(bitcode, size, &whyNot, constants, iboBase, known);
-        theCompiler()->has_preamble = true;
+        std::unique_ptr<CompiledStage> without = compileStageOnce(bitcode, size, &whyNot, constants, iboBase, known, compiler, chipId);
+        compiler->has_preamble = true;
         chosen = without != nullptr && preferWithoutPreamble(with->stage.k, without->stage.k) ? std::move(without) : std::move(with);
     }
     if (chosen != nullptr && !cached.empty()) stageCacheSave(cached, *chosen);
-    return chosen;
+    return told(std::move(chosen), 0);
+}
+
+const char* stageCacheBuild() {
+    static const std::string build = std::string(kCacheBuild) + " " + std::to_string(sizeof(Stage)) + "/" + std::to_string(sizeof(Kernel));
+    return build.c_str();
 }
 
 
 
 namespace {
 std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                                const KnownBuffer* known) {
+                                                const KnownBuffer* known, ir3_compiler* compiler, uint32_t chipId) {
     Translation t;
-    if (!translate(bitcode, size, t, why, constants, known)) return nullptr;
+    if (!translate(bitcode, size, t, why, constants, known, compiler)) return nullptr;
     // the stage is the module's named metadata (air.vertex / air.fragment / air.kernel: air_to_nir.c module_stage)
     const std::string name = t.info.entry_point ? t.info.entry_point : "the function";
     switch (t.nir->info.stage) {
@@ -1337,6 +1396,7 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
         return nullptr;
     }
     auto out = std::make_unique<CompiledStage>();
+    out->chipId = chipId;
     // read off the NIR before any lowering touches it: the textures the instructions address and the outputs' classes
     uint32_t highestSampler = 0;
     if (!walkTextures(t.nir, out->stage.k, &highestSampler, why)) return nullptr;
@@ -1352,7 +1412,7 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
         t.nir->info.num_ssbos += iboBase;
         out->iboBase = iboBase;
     }
-    if (!compileVariant(t, PassOrder::kGraphics, why)) return nullptr;
+    if (!compileVariant(t, PassOrder::kGraphics, why, compiler)) return nullptr;
     KernelHome home{out->stage.k, out->words, out->immediates, out->resources, out->name, out->listing};
     if (!fillKernel(t, home, highestSampler, why)) return nullptr;
     if (!fillStage(t, classes, out->stage, why)) return nullptr;
@@ -1370,13 +1430,13 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
         out->stage.k.numTextureSlots = std::max(out->stage.k.numTextureSlots, i + 1);
         out->stage.fbRead = 1;
     }
-    // The varyings' names, VAR0 first. The front end records the VERTEX side as the mangled string after the
-    // air.vertex_output key ("generated(5colorDv4_f)", air_to_nir.c:2571-2573) and the FRAGMENT side as air.arg_name
-    // ("color", :2499-2511) -- two different strings for one varying, and air_shader_info has no field for the FS's
-    // mangled name (nir_air.h: air_varying holds one name). A by-name link needs the same string on both sides, so the
-    // FS's names are left EMPTY here rather than filled with a name that cannot match (the gap air-vs-fs.md names:
-    // the front end would have to record md_str(node, key + 1) for an air.fragment_input). With one varying both
-    // sides land on VAR0 by order and the link is by slot (render::link), which is what the milestone needs.
+    // The varyings' link names, VAR0 first: the string after the air.vertex_output / air.fragment_input key
+    // ("generated(5colorDv4_f)"), which is what Metal matches the two stages on. The front end numbers the slots per
+    // stage in declaration order, so a slot alone does not name a varying across stages.
+    // VERTEX side: air_varying::name, which is that string, on every chip (unchanged).
+    // FRAGMENT side: air_varying::link_name (name is air.arg_name, "color", which cannot match), recorded only for a
+    // stage compiled for the A650, whose linkProgram matches by name; on every other chip the FS's names stay EMPTY
+    // and the link is by slot (render::link), as before. An input with no air.fragment_input gets "".
     if (out->stage.kind == kStageVertex) {
         for (unsigned i = 0; i < t.info.num_varyings; i++) {
             const air_varying& var = t.info.varyings[i];
@@ -1384,6 +1444,14 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
             size_t n = var.slot - VARYING_SLOT_VAR0;
             if (out->varyingNames.size() <= n) out->varyingNames.resize(n + 1);
             out->varyingNames[n] = var.name ? var.name : "";
+        }
+    } else if (out->stage.kind == kStageFragment && chipId == a6xx::kA650ChipId) {
+        for (unsigned i = 0; i < t.info.num_varyings; i++) {
+            const air_varying& var = t.info.varyings[i];
+            if (var.slot < VARYING_SLOT_VAR0 || var.slot >= VARYING_SLOT_VAR0 + 32) continue;
+            size_t n = var.slot - VARYING_SLOT_VAR0;
+            if (out->varyingNames.size() <= n) out->varyingNames.resize(n + 1);
+            out->varyingNames[n] = var.link_name ? var.link_name : "";
         }
     }
     return out;
@@ -1478,7 +1546,30 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, 
     }
     // --- the link, ours, then held to Mesa's own ir3_link_shaders over the same two tables ---
     auto out = std::make_unique<CompiledProgram>();
-    if (!render::link(V, F, &out->program.link, why)) return nullptr;
+    // On the A650 the FS's varyings are first relinked by their Metal identity (render::matchVaryingsByName) on a copy:
+    // the CompiledStage is shared with the other pipelines it is linked into (c_api.cpp: the colour-format variants), so
+    // it is never changed. The copy is what is linked, cross-checked and stored in Program::fs, so that the draw's
+    // re-link (render.cpp) sees the same slots. Every other chip links fs->stage by slot, as before.
+    Stage F2;
+    const Stage* linked = &F;
+    if (vs->chipId == a6xx::kA650ChipId && fs->chipId == a6xx::kA650ChipId) {
+        F2 = F;
+        std::vector<std::string> unmatched, notes;
+        render::matchVaryingsByName(V, vs->varyingNames, &F2, fs->varyingNames, &unmatched, &notes);
+        linked = &F2;
+        if (!unmatched.empty() || !notes.empty()) {
+            std::string line = vs->name + "+" + fs->name + ":";
+            if (!unmatched.empty()) {
+                line += " fragment input(s) ";
+                for (size_t i = 0; i < unmatched.size(); i++) line += (i ? ", " : "") + unmatched[i];
+                line += " have no vertex output of that name: they read zeros (A650 leniency; Metal validation would refuse this pipeline)";
+            }
+            for (size_t i = 0; i < notes.size(); i++) line += (i == 0 && unmatched.empty() ? " " : "; ") + notes[i];
+            out->linkNote = line;
+        }
+    }
+    const Stage& FL = *linked;
+    if (!render::link(V, FL, &out->program.link, why)) return nullptr;
     {
         // ir3_link_shaders (ir3_shader.h:1311-1361) reads inputs[], inputs_count, outputs[], outputs_count and total_in,
         // which the Stage copied from the real variants verbatim (fillStage; compiler_test holds the copies to the
@@ -1510,7 +1601,7 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, 
         static_assert(sizeof(ir3_shader_variant) < 65536, "two variants fit on the stack");
         ir3_shader_variant mv{}, mf{};
         fill(V, mv);
-        fill(F, mf);
+        fill(FL, mf);
         ir3_shader_linkage ml{};
         ir3_link_shaders(&ml, &mv, &mf, true);
         // the varmask as fd6 takes it, before the position (fd6_program.cc:654-658; src/link.cpp says why)
@@ -1544,7 +1635,7 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, 
     out->fs = fs;
     out->name = vs->name + "+" + fs->name;
     out->program.vs = V;
-    out->program.fs = F;
+    out->program.fs = FL;
     out->program.fsIboBase = fs->iboBase;
     out->program.ssboWrites = uint8_t((vs->writesMemory ? 1 : 0) | (fs->writesMemory ? 2 : 0));
     out->program.name = out->name.c_str();
@@ -1584,6 +1675,17 @@ bool argumentBufferLayout(const void* bitcode, size_t size, uint32_t set, std::v
 }
 
 #endif
+
+uint64_t stageDigest(const CompiledStage& s) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    auto mix = [&](const std::vector<uint32_t>& v) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(v.data());
+        for (size_t i = 0; i < v.size() * 4; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+    };
+    mix(s.words);
+    mix(s.immediates);
+    return h;
+}
 
 bool bindArgumentBuffers(const std::vector<Resource>& resources, Bindings* b, std::vector<std::shared_ptr<const void>>* kept, std::string* why) {
     // the sets as the caller bound them: a member's allocated index may be a set's own Metal index (the front end

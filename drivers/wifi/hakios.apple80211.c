@@ -33,6 +33,7 @@
  */
 #include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <sys/errno.h>
 #include <sys/kern_event.h>
@@ -193,7 +194,33 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct 
 
 /* Apple80211's events (APPLE80211_M_...) */
 enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
-       EVENT_SCAN_DONE = 10 };
+       EVENT_SCAN_DONE = 10, EVENT_RSSI_CHANGED = 39 };
+
+/*
+ * How well the network joined is heard, as a driver tells it from time to time: event 39,
+ * APPLE80211_M_RSSI_CHANGED, the only way that number reaches the status bar. wifid (its event
+ * callback's case 39) takes it from a dictionary of keys RSSI, SNR and NOISE, adds SCALED_RSSI and
+ * hands it to its clients; IO80211.framework makes that dictionary out of what follows the
+ * interface's name (at 0x1d30e1120 of 16.5's cache), which it wants to be 180 bytes at least. Fields
+ * not marked known are left out of it, and what comes after the noise has marks of its own.
+ */
+struct apple80211_rssi_changed {
+	uint8_t rssi_known, pad0[3];
+	int32_t rssi;
+	uint8_t per_core_known;
+	int8_t per_core[2];
+	uint8_t snr_known;
+	int16_t snr;
+	uint8_t noise_known, pad1;
+	int16_t noise;
+	uint8_t rest[0xb4 - 0x12];
+} __attribute__((packed));
+_Static_assert(sizeof(struct apple80211_rssi_changed) == 0xb4 && offsetof(struct apple80211_rssi_changed, rssi) == 4 &&
+    offsetof(struct apple80211_rssi_changed, snr) == 0xc && offsetof(struct apple80211_rssi_changed, noise) == 0x10,
+    "what IO80211.framework of 16.5 reads");
+
+#define NOISE_FLOOR             (-95)           /* ath11k: ATH11K_DEFAULT_NOISE_FLOOR */
+#define RSSI_EVERY_SECONDS      5
 
 static const char interface_name[16] = "en0";   /* (drivers/net/hakios.net.c makes one interface, and that is its name) */
 
@@ -433,6 +460,16 @@ get(struct apple80211req *request)
 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
 		break;
 	}
+	case 17: {                              /* what it is heard over: laid out as the RSSI above */
+		struct {
+			uint32_t version, radios, unit;
+			int32_t each[4], all, each_ext[4], all_ext;
+		} answer = { .version = 1, .radios = 1, .each = { NOISE_FLOOR }, .all = NOISE_FLOOR, .each_ext = { NOISE_FLOOR },
+			     .all_ext = NOISE_FLOOR };
+
+		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
 	case 103:                               /* all of it, as a scan's result */
 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give_network(request, &state->bss);
 		break;
@@ -613,6 +650,41 @@ post(uint32_t code, const void *data, uint32_t length)
 	kev_post_msg(&message);
 }
 
+/* While a network is joined: how it is heard, every few seconds. */
+static thread_call_t rssi_call;
+static unsigned rssi_told;
+
+static void
+rssi_tick(__unused thread_call_param_t first, __unused thread_call_param_t second)
+{
+	struct hakios_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+	static struct apple80211_rssi_changed told;
+	uint64_t deadline;
+	bool joined;
+
+	if (state == NULL) {
+		return;
+	}
+	hakios_sta_state(state);
+	joined = state->phase == HAKIOS_STA_JOINED;
+	if (joined) {
+		bzero(&told, sizeof(told));
+		told.rssi_known = told.snr_known = told.noise_known = 1;
+		told.rssi = state->bss.rssi;
+		told.snr = (int16_t)(state->bss.rssi - NOISE_FLOOR);
+		told.noise = NOISE_FLOOR;
+		post(EVENT_RSSI_CHANGED, &told, sizeof(told));
+		if (rssi_told++ < 4) {
+			printf("apple80211: told iOS how the network is heard: %d dBm (event %d)\n", told.rssi, EVENT_RSSI_CHANGED);
+		}
+	}
+	kfree_data(state, sizeof(*state));
+	if (joined) {
+		clock_interval_to_deadline(RSSI_EVERY_SECONDS, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(rssi_call, deadline);
+	}
+}
+
 /* What the station side says has happened (drivers/wifi/hakios.sta.c calls this, on its thread or the station's). */
 void
 hakios_apple80211_event(enum hakios_sta_event event, int status)
@@ -653,6 +725,14 @@ hakios_apple80211_event(enum hakios_sta_event event, int status)
 		post(EVENT_SSID_CHANGED, NULL, 0);
 		post(EVENT_BSSID_CHANGED, NULL, 0);
 		post(EVENT_LINK_CHANGED, &link, sizeof(link));
+		if (status == 1) {
+			if (rssi_call == NULL) {
+				rssi_call = thread_call_allocate(rssi_tick, NULL);
+			}
+			if (rssi_call != NULL) {
+				thread_call_enter(rssi_call);
+			}
+		}
 		break;
 	}
 	}

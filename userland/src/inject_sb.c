@@ -261,6 +261,43 @@ replace_method(const char *class_name, const char *selector, uintptr_t expected,
 	return replace_method_of_kind('-', class_name, selector, expected, replacement);
 }
 
+static BOOL (*original_can_adjust_brightness)(id, SEL);
+
+static BOOL
+can_adjust_brightness(id self, SEL selector)
+{
+	io_service_t backlight = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("HakiosBacklight"));
+
+	if (backlight == IO_OBJECT_NULL) {
+		return original_can_adjust_brightness(self, selector);
+	}
+	IOObjectRelease(backlight);
+	return YES;
+}
+
+static void
+enable_control_center_brightness(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0 ||
+	    strstr(arguments, "hw=munch") == NULL || strstr(arguments, "fb_backlight=1") == NULL) {
+		return;
+	}
+	dispatch_async(dispatch_get_main_queue(), ^{
+		const char *controller = "CCUIDisplayModuleViewController";
+
+		if (objc_getClass(controller) == Nil &&
+		    dlopen("/System/Library/ControlCenter/Bundles/DisplayModule.bundle/DisplayModule", RTLD_LAZY | RTLD_LOCAL) == NULL) {
+			say("hakios: munch display: Control Center display module unavailable\n");
+			return;
+		}
+		original_can_adjust_brightness = (BOOL (*)(id, SEL))replace_method(controller, "_canAdjustBrightness",
+		    0x20915f548UL, (IMP)can_adjust_brightness);
+	});
+}
+
 /*
  * -[SBLockdownManager _setupActivationState] asks MobileActivation and keeps the answer in the
  * int at +8: 2 = activated, 1 = not, 3 = unknown; it stays 0 when there is no answer.
@@ -2115,6 +2152,164 @@ caenv(void)
 	}
 }
 
+/*
+ * Auto-Lock. On an iPhone X (what this system takes the phone for) SpringBoard's idle timer is the attention sensor's: Face
+ * ID tells it someone is looking, and the timer that dims and locks waits on that. There is no Face ID here and no
+ * attentionawarenessd to answer ("Error getting value for entitlement 'com.apple.private.attentionawareness': No such
+ * process"), and the screen was never dimmed or locked by itself (9 November: every blank of a 30-minute run was the
+ * power button's). SpringBoard has a default for a phone without the sensor -- "_shouldUseAttentionSensor: NO because
+ * SBDisableAttentionAwareness is set" -- and then counts touches only, as a phone with a Touch ID button does. Set before
+ * its main() reads its defaults.
+ */
+static void
+idle_timer_without_attention(void)
+{
+	CFPreferencesSetAppValue(CFSTR("SBDisableAttentionAwareness"), kCFBooleanTrue, CFSTR("com.apple.springboard"));
+	CFPreferencesAppSynchronize(CFSTR("com.apple.springboard"));
+}
+
+/*
+ * What decides Auto-Lock, for as long as it does nothing by itself (9 November: Auto-Lock set to 30 s in Settings, ten
+ * minutes untouched, no blank): the effective setting as ManagedConfiguration gives it to SpringBoard (maxInactivity, in
+ * seconds), the attention default above as SpringBoard reads it back, and the idle timer's coordinator with its instance
+ * variables (UIKit's -_ivarDescription). A minute after the start, then every two minutes, five times.
+ */
+static void
+say_long(const char *text)
+{
+	char piece[1000];
+
+	for (size_t at = 0, length = text != NULL ? strlen(text) : 0; at < length; at += sizeof(piece) - 1) {
+		strlcpy(piece, text + at, sizeof(piece));
+		say("%s", piece);
+	}
+	say("\n");
+}
+
+static void
+idle_timer_report(void)
+{
+	Class mc = objc_getClass("MCProfileConnection"), coordinator = objc_getClass("SBIdleTimerGlobalCoordinator");
+	id connection = mc != Nil ? ((id (*)(Class, SEL))objc_msgSend)(mc, sel_registerName("sharedConnection")) : nil;
+	id inactivity = connection != nil ? ((id (*)(id, SEL, id))objc_msgSend)(connection,
+	    sel_registerName("effectiveValueForSetting:"), (id)CFSTR("maxInactivity")) : nil;
+	CFPropertyListRef attention = CFPreferencesCopyAppValue(CFSTR("SBDisableAttentionAwareness"), CFSTR("com.apple.springboard"));
+	id shared = coordinator != Nil && class_getClassMethod(coordinator, sel_registerName("sharedInstance")) != NULL ?
+	    ((id (*)(Class, SEL))objc_msgSend)(coordinator, sel_registerName("sharedInstance")) : nil;
+
+	say("hakios: idle: Auto-Lock (ManagedConfiguration maxInactivity): %s s; SBDisableAttentionAwareness %s\n", text_of(inactivity),
+	    attention == kCFBooleanTrue ? "YES" : attention == NULL ? "(not set)" : "NO");
+	if (attention != NULL) {
+		CFRelease(attention);
+	}
+	say("hakios: idle: coordinator: ");
+	say_long(text_of(shared));
+	if (shared != nil && class_getInstanceMethod(object_getClass(shared), sel_registerName("_ivarDescription")) != NULL) {
+		say_long(text_of(((id (*)(id, SEL))objc_msgSend)(shared, sel_registerName("_ivarDescription"))));
+	}
+	/* what holds it off, how long it waits, and what it believes of the phone's state: each one's description and its ivars */
+	static const char *const inner[] = { "_idleTimerDisableAssertions", "_enabledIdleTimerDescriptor", "_globalStateMonitor",
+		"_enabledIdleTimerProxy", "_idleTimerCoordinatorHelper", "_delegate" };
+	for (unsigned i = 0; shared != nil && i < sizeof(inner) / sizeof(inner[0]); i++) {
+		Ivar ivar = class_getInstanceVariable(object_getClass(shared), inner[i]);
+		id value = ivar != NULL ? object_getIvar(shared, ivar) : nil;
+
+		say("hakios: idle: %s = ", inner[i]);
+		say_long(text_of(value));
+		if (value != nil && class_getInstanceMethod(object_getClass(value), sel_registerName("_ivarDescription")) != NULL) {
+			say_long(text_of(((id (*)(id, SEL))objc_msgSend)(value, sel_registerName("_ivarDescription"))));
+		}
+		/* the policy aggregator's own timer: SBBacklightIdleTimer, and the IdleTimerServices objects it waits on */
+		if (value != nil && strcmp(inner[i], "_delegate") == 0) {
+			Ivar timer_ivar = class_getInstanceVariable(object_getClass(value), "_idleTimer");
+			id timer = timer_ivar != NULL ? object_getIvar(value, timer_ivar) : nil;
+
+			for (int depth = 0; timer != nil && depth < 4; depth++) {
+				unsigned count = 0;
+				Ivar *ivars;
+				id next = nil;
+
+				say("hakios: idle: timer %d: ", depth);
+				say_long(text_of(timer));
+				if (class_getInstanceMethod(object_getClass(timer), sel_registerName("_ivarDescription")) != NULL) {
+					say_long(text_of(((id (*)(id, SEL))objc_msgSend)(timer, sel_registerName("_ivarDescription"))));
+				}
+				ivars = class_copyIvarList(object_getClass(timer), &count);
+				for (unsigned k = 0; k < count; k++) {
+					const char *type = ivar_getTypeEncoding(ivars[k]);
+					id v = type != NULL && type[0] == '@' && strcmp(type, "@?") != 0 ? object_getIvar(timer, ivars[k]) : nil;
+
+					if (v != nil && (strncmp(object_getClassName(v), "IT", 2) == 0 || strncmp(object_getClassName(v), "AW", 2) == 0 ||
+					    strstr(object_getClassName(v), "IdleTim") != NULL) && v != timer) {
+						say("hakios: idle: timer %d %s: ", depth, ivar_getName(ivars[k]));
+						say_long(text_of(v));
+						if (class_getInstanceMethod(object_getClass(v), sel_registerName("_ivarDescription")) != NULL) {
+							say_long(text_of(((id (*)(id, SEL))objc_msgSend)(v, sel_registerName("_ivarDescription"))));
+						}
+						next = next != nil ? next : v;
+					}
+				}
+				free(ivars);
+				timer = next;
+			}
+		}
+	}
+}
+
+static void
+idle_timer_watch(void)
+{
+	for (int i = 0; i < 5; i++) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 + 120 * i) * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			idle_timer_report();
+		});
+	}
+}
+
+/*
+ * Auto-Lock through the kernel (drivers/input/hakios.input.c, kern.hakios.autolock): every five seconds, the timeout
+ * SpringBoard's idle timer has now -- its enabled descriptor's total (60 s by the setting, shorter on the lock screen), 0
+ * when the descriptor is not "Auto" (Never, or disabled) or something holds a disable assertion (a video, a call) -- told
+ * to the kernel, which presses the power key once nobody has touched the phone for that long. SpringBoard's own timeouts
+ * never come here (the AttentionAwareness service does not send them).
+ */
+static void
+autolock_feed(void)
+{
+	static int told = -1;
+	Class coordinator = objc_getClass("SBIdleTimerGlobalCoordinator");
+	id shared = coordinator != Nil && class_getClassMethod(coordinator, sel_registerName("sharedInstance")) != NULL ?
+	    ((id (*)(Class, SEL))objc_msgSend)(coordinator, sel_registerName("sharedInstance")) : nil;
+	Ivar descriptor_ivar = shared != nil ? class_getInstanceVariable(object_getClass(shared), "_enabledIdleTimerDescriptor") : NULL;
+	Ivar assertions_ivar = shared != nil ? class_getInstanceVariable(object_getClass(shared), "_idleTimerDisableAssertions") : NULL;
+	id descriptor = descriptor_ivar != NULL ? object_getIvar(shared, descriptor_ivar) : nil;
+	id assertions = assertions_ivar != NULL ? object_getIvar(shared, assertions_ivar) : nil;
+	Ivar mode_ivar = descriptor != nil ? class_getInstanceVariable(object_getClass(descriptor), "_timerMode") : NULL;
+	Ivar total_ivar = descriptor != nil ? class_getInstanceVariable(object_getClass(descriptor), "_totalInterval") : NULL;
+	long mode = mode_ivar != NULL ? *(long *)((uint8_t *)(void *)descriptor + ivar_getOffset(mode_ivar)) : 0;
+	double total = total_ivar != NULL ? *(double *)((uint8_t *)(void *)descriptor + ivar_getOffset(total_ivar)) : 0;
+	unsigned long held = assertions != nil ? ((unsigned long (*)(id, SEL))objc_msgSend)(assertions, sel_registerName("count")) : 0;
+	int seconds = mode == 1 && held == 0 && total >= 1 && total < 86400 ? (int)(total + 0.5) : 0;
+
+	if (seconds != told && sysctlbyname("kern.hakios.autolock", NULL, NULL, &seconds, sizeof(seconds)) == 0) {
+		say("hakios: autolock: %d s (descriptor mode %ld, total %.0f s, %lu disable assertions)\n", seconds, mode, total, held);
+		told = seconds;
+	}
+}
+
+static void
+autolock_start(void)
+{
+	static dispatch_source_t timer;
+
+	timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+	dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), 5 * NSEC_PER_SEC, NSEC_PER_SEC);
+	dispatch_source_set_event_handler(timer, ^{
+		autolock_feed();
+	});
+	dispatch_resume(timer);
+}
+
 __attribute__((constructor))
 static void
 hakios_springboard_init(void)
@@ -2144,6 +2339,8 @@ hakios_springboard_init(void)
 	caenv();
 	display_link_rates();
 	accessibility_settings();
+	idle_timer_without_attention();
+	autolock_start();
 	/*
 	 * The tweaks of the package manager's prefix, if one is installed: ElleKit's loader
 	 * (/var/jb/usr/lib/TweakLoader.dylib) reads /var/jb/usr/lib/TweakInject and opens the tweaks
@@ -2153,6 +2350,7 @@ hakios_springboard_init(void)
 	 */
 	load_tweaks();
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+	enable_control_center_brightness();
 	activation = replace_method("SBLockdownManager", "_setupActivationState", 0x1c4bc8dfcUL, (IMP)setup_activation_state);
 	original_set_setup_required_reason = (void (*)(id, SEL, long))replace_method("SBSetupManager",
 	    "_setSetupRequiredReason:", 0x1c4cdd3a4UL, (IMP)set_setup_required_reason);

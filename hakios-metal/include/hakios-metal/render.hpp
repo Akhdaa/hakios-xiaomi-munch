@@ -252,11 +252,26 @@ struct Program {
 
 namespace render {
 
+// A reserved StageInput::slot (gl_varying_slot values in a Stage are all below 64): a fragment input that no vertex
+// output serves. Only matchVaryingsByName (the A650 path) writes it; render::link links it with no vertex register, so
+// the input reads zeros, as ir3_link_shaders does with regid(63, 0).
+constexpr uint8_t kVaryingSlotUnserved = 0xff;
+
 // VS to FS as ir3_link_shaders does it: every FS input with compmask && bary and inloc < totalIn takes the VS output of
-// the same slot at loc = inloc (ir3_link_add), then the position is appended at maxLoc with compmask 0xf. False with
-// *why: an FS varying no VS output serves (ir3 would read zeros through regid 63.0; refused here by slot), a VS without
-// a position, more than kMaxStageOutputs entries. Implemented in src/link.cpp.
+// the same slot at loc = inloc (ir3_link_add), then the position is appended at maxLoc with compmask 0xf. An input at
+// kVaryingSlotUnserved gets no VS register (it reads zeros, as Mesa's regid(63, 0)); only the A650 name match makes
+// one. False with *why: any other FS varying no VS output serves (refused by slot), a VS without a position, more than
+// kMaxStageOutputs entries. Implemented in src/link.cpp.
 bool link(const Stage& vs, const Stage& fs, Linkage* out, std::string* why);
+
+// The A650's link by varying identity (Metal's rule): VSNAMES / FSNAMES are the stages' CompiledStage::varyingNames
+// (indexed by slot - VAR0). Each FS user varying (bary, compmask, inloc < totalIn, slot VAR0..VAR31) whose identity
+// a VS output carries gets that output's slot; one whose identity no VS output carries gets kVaryingSlotUnserved, and
+// "VARn 'identity'" (its old slot) is appended to UNMATCHED. An input with no identity, or a pair where some VS name is
+// empty, keeps its slot (the slot link), and NOTES, when given, says so; a VS identity declared twice takes the first
+// and is noted. Sysvals, [[point_coord]] and every other field of FS are untouched. True when FS was changed.
+bool matchVaryingsByName(const Stage& vs, const std::vector<std::string>& vsNames, Stage* fs, const std::vector<std::string>& fsNames,
+                         std::vector<std::string>* unmatched, std::vector<std::string>* notes = nullptr);
 
 }  // namespace render
 
@@ -421,6 +436,7 @@ static_assert(kTableBorderColorAt % 128 == 0 && kTableBorderColorAt + 3 * 128 <=
 // whole stream as turnip's sysmem pass and r3d path have it; the *Alt fields pick the other witness's value where the
 // two disagree, so one boot of --bisect can tell which the hardware wants.
 struct Options {
+    bool a650Sysmem = false;    // Adreno 650 sysmem render state for the offscreen probe.
     bool batchStart = true;      // CP_SET_MODE 0, PC_CCU_INVALIDATE_COLOR/DEPTH + CACHE_INVALIDATE (fd6's three), HLSQ_INVALIDATE_CMD all,
                                  // WFI, kStaticState, CP_SET_DRAW_STATE disable-all, kStaticStateAfterDrawState, the 32 VFD_FETCH sizes,
                                  // the border colour bases, kStaticStateTail, WFI (fd6_emit_restore / tu6_init_hw)

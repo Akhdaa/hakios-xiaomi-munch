@@ -38,8 +38,11 @@ struct hakios_touch {
 #ifdef KERNEL
 /* For drivers; not from interrupt context. */
 void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
+/* an SM8250 phone's charger, read from its PMIC (drivers/input/hakios.buttons.c): USB input status, port kind, charger state */
+bool hakios_munch_charger(uint8_t *input_status, uint8_t *port_kind, uint8_t *charger_state);
 void hakios_input_init(void);
 void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
+bool hakios_hw_is(const char *name);   /* hw= from xnuloader names this device; none: redwood (an older loader) */
 void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
 void hakios_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
 void hakios_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
@@ -53,6 +56,8 @@ int hakios_battery_temperature(void);  /* the battery's temperature in C, -273 w
 /* one transfer at a time through the PMIC arbiter for this system (drivers/input/hakios.buttons.c) */
 void hakios_spmi_lock(void);
 void hakios_spmi_unlock(void);
+/* munch's charger, read from its PMIC (bsd/dev/hakios_buttons.c): USB input status, port kind, charger state */
+bool hakios_munch_charger(uint8_t *input_status, uint8_t *port_kind, uint8_t *charger_state);
 /*
  * How the battery is, as the audio DSP's battery manager says (drivers/audio/hakios.adsp.c, with adsp=1):
  * handed to drivers/power/hakios.battery.c, which keeps it for the sysctls kern.hakios.battery_* and
@@ -100,6 +105,15 @@ bool hakios_wifi_dsp_is_up(void);      /* the DSP that runs the radio's firmware
 const uint8_t *hakios_wifi_driver_file(const char *name, uint64_t *size);     /* a file by the name Linux has for it */
 bool hakios_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address); /* memory shown to the radio */
 bool hakios_wifi_radio_msi(unsigned long long *address, uint32_t *data, uint32_t *first_spi); /* where the radio raises its interrupts */
+void hakios_wifi_radio_space_want(uint32_t stream, uint32_t mask);   /* ... for the POCO F4's QCA6390 as well (hakios_munch_mhi.c) */
+void hakios_wifi_radio_space_off(void);
+void hakios_wifi_qrtr_over(int (*send)(const void *data, uint32_t length));  /* QRTR over the QCA6390's MHI */
+int hakios_munch_wifi_up(void);               /* the QCA6390 powered, its firmware in mission mode, QRTR running: 0 or an errno */
+void hakios_munch_wifi_down(void);            /* ... and all of it taken back */
+void hakios_munch_wifi_quiesce(void);         /* on the way back to the loader: no locks, no sleeping */
+void *hakios_munch_wifi_registers(unsigned long *size);        /* its BAR0 */
+int hakios_munch_qrtr_send(const void *data, uint32_t length);
+void hakios_wifi_qrtr_input(const uint8_t *data, uint32_t length);     /* a datagram from it; NULL: only the lookups' news */
 bool hakios_wifi_radio_address(uint8_t *address);      /* the radio's own address (boot-arg wifi_mac), if one was given */
 /* the network to join (fw/network of the small image): name and passphrase, buffer sizes in and lengths out */
 bool hakios_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length);

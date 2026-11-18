@@ -374,13 +374,17 @@ static const char* dimName(uint8_t dim) {
 }
 
 int main(int argc, char** argv) {
-    bool recover = false, bisect = false, binTrace = false;
+    bool recover = false, bisect = false, binTrace = false, query = false, blitOnly = false, computeOnly = false, renderOnly = false;
     compute::Options chosen;   // what the dispatches of stage 5 are encoded with
     std::vector<std::pair<std::string, std::string>> metallibs;   // --metallib FILE FUNCTION: a kernel of the phone's own image
     for (int i = 1; i < argc; i++) {
         recover = recover || strcmp(argv[i], "--recover") == 0;
         bisect = bisect || strcmp(argv[i], "--bisect") == 0;
         binTrace = binTrace || strcmp(argv[i], "--bin-trace") == 0;
+        query = query || strcmp(argv[i], "--query") == 0;
+        blitOnly = blitOnly || strcmp(argv[i], "--blit-only") == 0;
+        computeOnly = computeOnly || strcmp(argv[i], "--compute-only") == 0;
+        renderOnly = renderOnly || strcmp(argv[i], "--render-only") == 0;
         // --notail: no end-of-dispatch events and waits of our own; the kernel's own CACHE_FLUSH_TS fence closes the
         // submission (28 October: with them every dispatch hung, without them end_only completed in 48 us)
         if (strcmp(argv[i], "--notail") == 0) chosen.tail = false;
@@ -397,13 +401,131 @@ int main(int argc, char** argv) {
     }
     Gpu gpu(std::move(transport));
     uint64_t id = 0, chip = 0, freq = 0;
-    gpu.param(kParamGpuId, &id);
-    gpu.param(kParamChipId, &chip);
-    gpu.param(kParamMaxFreq, &freq);
+    if (gpu.param(kParamGpuId, &id) != 0 || gpu.param(kParamChipId, &chip) != 0 || gpu.param(kParamMaxFreq, &freq) != 0) {
+        std::puts("probe: could not read the GPU identity");
+        return 1;
+    }
     // (the chip id with the speed bin above it; FAULTS is how many times the kernel has reset a hung GPU in this run)
+    const uint64_t startingFaults = gpu.faults();
     std::printf("probe: GPU %llu, chip id 0x%llx, %llu MHz, FAULTS %llu%s\n", (unsigned long long)id, (unsigned long long)chip,
-                (unsigned long long)(freq / 1000000), (unsigned long long)gpu.faults(),
-                recover ? "; the GPU will be hung on purpose at the end (--recover)" : "");
+                (unsigned long long)(freq / 1000000), (unsigned long long)startingFaults,
+                recover && !query && !blitOnly && !computeOnly && !renderOnly ? "; the GPU will be hung on purpose at the end (--recover)" : "");
+    if (query) {
+        uint64_t gmem, bankBit, swizzle, macroTile;
+        if (gpu.param(kParamGmemSize, &gmem) != 0 || gpu.param(kParamHighestBankBit, &bankBit) != 0 ||
+            gpu.param(kParamUbwcSwizzle, &swizzle) != 0 || gpu.param(kParamMacrotileMode, &macroTile) != 0) {
+            std::puts("probe: could not read the GPU layout");
+            return 1;
+        }
+        std::printf("probe: GMEM %llu bytes, highest bank bit %llu, UBWC swizzle %#llx, macro tile mode %llu\n",
+                    (unsigned long long)gmem, (unsigned long long)bankBit, (unsigned long long)swizzle,
+                    (unsigned long long)macroTile);
+        return 0;
+    }
+    const bool a650 = uint32_t(chip) == a6xx::kA650ChipId;
+    if (uint32_t(chip) != a6xx::kChipId && !((blitOnly || computeOnly || renderOnly) && a650)) {
+        std::printf("probe: command tests require chip %#x; use --query to read this GPU's layout\n", a6xx::kChipId);
+        return 1;
+    }
+    if (renderOnly) {
+        auto vs = compileStageForChip(kernels::tri_flat_vs_bc, kernels::tri_flat_vs_bc_size, uint32_t(chip), &why);
+        if (!vs) {
+            report(false, "offscreen vertex compilation: " + why);
+            return failures;
+        }
+        auto fs = compileStageForChip(kernels::tri_flat_fs_bc, kernels::tri_flat_fs_bc_size, uint32_t(chip), &why, {}, vs->stage.k.numSsbos);
+        if (!fs) {
+            report(false, "offscreen fragment compilation: " + why);
+            return failures;
+        }
+        auto program = linkProgram(std::move(vs), std::move(fs), PixelFormat::kRGBA8Unorm, &why);
+        if (!program) {
+            report(false, "offscreen shader link: " + why);
+            return failures;
+        }
+        report(true, "offscreen shaders compiled and linked for the GPU");
+        constexpr uint32_t size = 64, colour = 0xff804020u, canary = 0xa5a5a5a5u;
+        TextureDesc desc;
+        desc.format = PixelFormat::kRGBA8Unorm;
+        desc.width = desc.height = size;
+        desc.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+        auto queue = CommandQueue::make(gpu, &why);
+        auto target = Texture::make(gpu, desc, &why);
+        if (!queue || !target) {
+            report(false, "offscreen setup: " + why);
+            return failures;
+        }
+        fillBo(*target, canary);
+        RenderPass pass;
+        pass.color0 = target.get();
+        Draw draw;
+        draw.vertexCount = 3;
+        draw.viewport = Viewport{0, 0, size, size, 0, 1};
+        render::Options options;
+        options.a650Sysmem = a650;
+        options.gmem = false;
+        auto cb = queue->commandBuffer();
+        cb->setGmem(false);
+        if (!cb->draw(program->program, pass, draw, Bindings{}, Bindings{}, options)) {
+            report(false, "offscreen draw recording: " + cb->error());
+            return failures;
+        }
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto pixels = textureBo(*target);
+        unsigned interior = 0, exterior = 0, edge = 0, edgeCanary = 0, padding = 0;
+        for (uint32_t y = 0; y < size; y++) {
+            for (uint32_t x = 0; x < size; x++) {
+                uint32_t pixel;
+                memcpy(&pixel, pixels.data() + y * target->bytesPerRow() + x * 4, sizeof(pixel));
+                if (x < y) interior += pixel == colour;
+                else if (x > y) exterior += pixel == canary;
+                else {
+                    edge += pixel == colour;
+                    edgeCanary += pixel == canary;
+                }
+            }
+            for (size_t i = size * 4; i < target->bytesPerRow(); i++) {
+                padding += pixels[y * target->bytesPerRow() + i] != 0xa5;
+            }
+        }
+        for (size_t i = size * target->bytesPerRow(); i < pixels.size(); i++) padding += pixels[i] != 0xa5;
+        const bool valid = cb->status() == CommandBuffer::kCompleted && interior == 2016 && exterior == 2016 &&
+                           (edgeCanary == size || edge == size) && padding == 0 && gpu.faults() == startingFaults;
+        report(valid, "offscreen triangle: " + std::to_string(interior) + "/2016 interior, " +
+                          std::to_string(exterior) + "/2016 exterior, " + std::to_string(edge) + " edge pixels drawn" + status(*cb, gpu));
+        return failures;
+    }
+    if (computeOnly) {
+        auto compiled = compileAirForChip(kernels::fill_id_bc, kernels::fill_id_bc_size, uint32_t(chip), &why);
+        if (!compiled) {
+            report(false, "compute shader compilation: " + why);
+            return failures;
+        }
+        report(true, "compute shader compiled for the GPU");
+        constexpr uint32_t words = 64, constant = 0x4321;
+        const uint32_t canary = canaryFor(words, constant);
+        auto queue = CommandQueue::make(gpu, &why);
+        auto out = newBuffer(gpu, 4096, &why);
+        auto input = newBuffer(gpu, 64, &why);
+        if (!queue || !out || !input) {
+            report(false, "compute setup: " + why);
+            return failures;
+        }
+        std::fill_n(static_cast<uint32_t*>(out->contents()), out->length() / 4, canary);
+        static_cast<uint32_t*>(input->contents())[0] = constant;
+        const uint32_t groups[] = {1, 1, 1}, local[] = {words, 1, 1};
+        auto cb = queue->commandBuffer();
+        chosen.tail = false; // The kernel appends the submission fence.
+        const bool recorded = cb->dispatch(compiled->kernel, groups, local, {Binding{out.get(), 0}, Binding{input.get(), 0}}, nullptr, chosen);
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto result = readBack(*out, words, constant, canary);
+        report(recorded && cb->status() == CommandBuffer::kCompleted && result.right == words &&
+                   result.beyondOther == 0 && gpu.faults() == startingFaults,
+               "compute fill_id: " + describe(result, words, out->length() / 4 - words) + status(*cb, gpu));
+        return failures;
+    }
     {
         // what this processor's writes and reads of a GPU buffer cost against its own memory: a draw writes some 3 KB
         // of descriptors into one, and an uncached mapping makes each store a bus transaction
@@ -456,6 +578,9 @@ int main(int argc, char** argv) {
                    (cb->error().empty() ? "" : " (" + cb->error() + ")") + ", " +
                    std::to_string(cb->gpuNanoseconds() / 1000) + " us");
     }
+    if (blitOnly && failures != 0) {
+        return failures;
+    }
 
     // 2. fills of lengths that end inside the doubling, at an offset
     for (uint64_t len : {4ull, 256ull, 260ull, 65540ull, 999996ull}) {
@@ -469,6 +594,13 @@ int main(int argc, char** argv) {
         bool ok = back[15] == 0x11 && (16 + len >= mb || back[16 + len] == 0x11);
         for (uint64_t i = 16; i < 16 + len; i++) ok = ok && back[i] == 0xa5;
         report(ok && cb->status() == CommandBuffer::kCompleted, "fill of " + std::to_string(len) + " bytes at 16");
+        if (blitOnly && failures != 0) {
+            return failures;
+        }
+    }
+    if (blitOnly) {
+        report(gpu.faults() == startingFaults, "aligned blits completed without a GPU reset");
+        return failures;
     }
 
     // 3. forty command buffers in flight at once: their handlers in commit order, and the memory as the last left it

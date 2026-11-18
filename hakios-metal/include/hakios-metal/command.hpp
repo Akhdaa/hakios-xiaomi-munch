@@ -215,6 +215,18 @@ private:
     void finish(Status s);
     void use(const Buffer& b, bool write) { uses_.push_back(BoUse{&b.bo(), write}); }
 public:
+    // the buffers named so far, in the order they were named, each with its write flag (append-only until submission):
+    // what the C API's surface targets read to find the targets a command buffer wrote
+    const std::vector<BoUse>& uses() const { return uses_; }
+    // What this command buffer wrote into BO since it was made (or since resetDamage), as one rectangle in pixels of
+    // level 0 of the texture over it (*RECT, not aligned or clamped): the union of each draw's render::drawArea into it
+    // as a colour attachment of a pass that loads it, and of each 2D copy's destination rectangle into its level 0.
+    // False when that is the whole texture or not known -- a Clear or DontCare load, a mip level or slice past 0, a draw
+    // whose area is not known, a dispatch, a buffer copy, or any other write that names BO -- and when nothing was
+    // written; the commit copy is whole then. metal-ca-perf's damage-region commit copy reads it.
+    bool damageOf(const Bo* bo, render::BlitRect* rect) const;
+    // what is written from here on is the damage damageOf reports (the commit copy's: since the last resolve)
+    void resetDamage();
     // What each register written in a pass holds, for appendDeduped: a draw writes some 500 of them and almost all
     // hold their value already, so each is looked up once, in an open-addressed table of its own (std::unordered_map's
     // find and insert, two lookups and a node a register, were most of a draw's 20 us of deduplication on the phone)
@@ -321,6 +333,15 @@ private:
     std::string error_;
     pm4::Stream stream_;
     std::vector<BoUse> uses_;
+    // damageOf's: per buffer object written since resetDamage, the rectangle union (X0 Y0 X1 Y1 inclusive) or whole;
+    // the writes among uses_ from DAMAGE_SEEN_ on are not accounted yet (each is the whole of its object)
+    struct Damage { uint32_t x0 = ~0u, y0 = ~0u, x1 = 0, y1 = 0; bool whole = false; };
+    std::unordered_map<const Bo*, Damage> damage_;
+    size_t damageSeen_ = 0;
+    // every write among uses_ from damageSeen_ on the whole of its object, but those to the objects of KNOWN (N of them),
+    // whose rectangles the caller adds; then all of them seen
+    void settleDamage(const Bo* const* known = nullptr, size_t n = 0);
+    void addDamage(const Bo* bo, const uint32_t area[4]);
     std::vector<std::shared_ptr<const Buffer>> kept_;   // the buffers it uses stay alive until it completes
     std::vector<std::shared_ptr<const void>> keptAny_;
     std::vector<std::function<void(CommandBuffer&)>> handlers_;

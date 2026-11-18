@@ -1,0 +1,5 @@
+# devices/munch/drivers/display/conf: the POCO F4's own display hardware (docs/porting/drivers.md, docs/drivers-config.md).
+
+driver MUNCH_PANEL
+	file    bsd/dev/hakios.munch_panel.c
+	help    the POCO F4 panel's brightness: DCS 0x51 through DSI0's command FIFO, between two frames (panel=1 a look, panel=2 kern.hakios.panel_brightness)

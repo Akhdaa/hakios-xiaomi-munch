@@ -241,6 +241,39 @@ bool CommandBuffer::fail(const std::string& why) {
     return false;
 }
 
+// --- the damage (damageOf) ---
+void CommandBuffer::settleDamage(const Bo* const* known, size_t n) {
+    for (size_t i = damageSeen_; i < uses_.size(); i++) {
+        if (!uses_[i].write || std::find(known, known + n, uses_[i].bo) != known + n) continue;
+        damage_[uses_[i].bo].whole = true;
+    }
+    damageSeen_ = uses_.size();
+}
+
+void CommandBuffer::addDamage(const Bo* bo, const uint32_t area[4]) {
+    Damage& r = damage_[bo];
+    if (r.whole) return;
+    r.x0 = std::min(r.x0, area[0]);
+    r.y0 = std::min(r.y0, area[1]);
+    r.x1 = std::max(r.x1, area[2]);
+    r.y1 = std::max(r.y1, area[3]);
+}
+
+bool CommandBuffer::damageOf(const Bo* bo, render::BlitRect* rect) const {
+    for (size_t i = damageSeen_; i < uses_.size(); i++) {
+        if (uses_[i].write && uses_[i].bo == bo) return false;   // (a write not accounted: the whole object)
+    }
+    auto it = damage_.find(bo);
+    if (it == damage_.end() || it->second.whole || it->second.x0 > it->second.x1 || it->second.y0 > it->second.y1) return false;
+    *rect = render::BlitRect{it->second.x0, it->second.y0, it->second.x1 - it->second.x0 + 1, it->second.y1 - it->second.y0 + 1};
+    return true;
+}
+
+void CommandBuffer::resetDamage() {
+    damage_.clear();
+    damageSeen_ = uses_.size();
+}
+
 void CommandBuffer::stamp(uint32_t slot) {
     if (profileStamps_ == nullptr) {
         std::string why;

@@ -249,8 +249,8 @@ struct eagl {
 	id object;                      /* the EAGLContext */
 	struct hakios_gl *gl;
 	unsigned long api;
-	struct image images[256];
-	unsigned image_count;
+	struct image *images;           /* the textures whose memory is an IOSurface (image_new() makes room) */
+	unsigned image_count, image_room;
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
@@ -492,6 +492,52 @@ note_format(const char *how, GLenum internal, GLenum format, GLenum type, GLsize
 	}
 }
 
+/*
+ * The IOSurfaces CoreAnimation hands over, by pixel format, planes and what became of them -- kept for the summary, since the
+ * first lines that tell of them are gone from the log by the time a picture comes out wrong (the POCO F4, 9 November: app
+ * snapshots green with their detail showing -- a 4:2:0 surface whose chroma is zero -- and some labels black).
+ */
+struct surface_use {
+	uint32_t pixels;
+	unsigned planes, plane, count, widest, tallest;
+	const char *how;
+};
+static struct surface_use surface_uses[40];
+
+static void
+note_surface(const char *how, IOSurfaceRef surface, unsigned plane)
+{
+	uint32_t pixels = IOSurfaceGetPixelFormat(surface);
+	unsigned planes = (unsigned)IOSurfaceGetPlaneCount(surface);
+	struct surface_use *use = NULL;
+
+	for (unsigned i = 0; i < sizeof(surface_uses) / sizeof(surface_uses[0]); i++) {
+		if (surface_uses[i].count == 0 || (surface_uses[i].how == how && surface_uses[i].pixels == pixels &&
+		    surface_uses[i].planes == planes && surface_uses[i].plane == plane)) {
+			use = &surface_uses[i];
+			break;
+		}
+	}
+	if (use == NULL) {
+		return;
+	}
+	if (use->count++ == 0) {
+		use->how = how;
+		use->pixels = pixels;
+		use->planes = planes;
+		use->plane = plane;
+		say("hakios-gl: a new kind of IOSurface: %s, '%.4s', %u planes, plane %u, %zu x %zu, %zu bytes an element\n", how,
+		    (const char *)&(uint32_t){ OSSwapInt32(pixels) }, planes, plane, IOSurfaceGetWidth(surface),
+		    IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerElement(surface));
+	}
+	if ((unsigned)IOSurfaceGetWidth(surface) > use->widest) {
+		use->widest = (unsigned)IOSurfaceGetWidth(surface);
+	}
+	if ((unsigned)IOSurfaceGetHeight(surface) > use->tallest) {
+		use->tallest = (unsigned)IOSurfaceGetHeight(surface);
+	}
+}
+
 static void
 summary(struct eagl *e)
 {
@@ -507,6 +553,11 @@ summary(struct eagl *e)
 	for (unsigned i = 0; i < sizeof(formats) / sizeof(formats[0]) && formats[i].count; i++) {
 		say("hakios-gl:   textures: %s %#x/%#x/%#x: %u times, up to %u x %u\n", formats[i].how, formats[i].internal,
 		    formats[i].format, formats[i].type, formats[i].count, formats[i].widest, formats[i].tallest);
+	}
+	for (unsigned i = 0; i < sizeof(surface_uses) / sizeof(surface_uses[0]) && surface_uses[i].count; i++) {
+		say("hakios-gl:   IOSurfaces: %s '%.4s' %u planes, plane %u: %u times, up to %u x %u\n", surface_uses[i].how,
+		    (const char *)&(uint32_t){ OSSwapInt32(surface_uses[i].pixels) }, surface_uses[i].planes, surface_uses[i].plane,
+		    surface_uses[i].count, surface_uses[i].widest, surface_uses[i].tallest);
 	}
 	for (unsigned offset = 8; offset < SLOTS * 8; offset += 8) {
 		if (slot_calls[offset / 8]) {
@@ -528,15 +579,47 @@ image_of(struct eagl *e, GLuint texture)
 	return NULL;
 }
 
+static void image_forget(struct eagl *e, GLuint texture);
+
 static struct image *
 image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 {
 	struct image *image = image_of(e, texture);
 
 	if (image == NULL) {
-		if (e->image_count == sizeof(e->images) / sizeof(e->images[0])) {
-			say("hakios-gl: more textures with IOSurfaces than there is room for\n");
-			return NULL;
+		if (e->image_count == e->image_room) {
+			/*
+			 * Full. A texture deleted by another context of its share group, or one that went with its
+			 * context, is never seen by my_glDeleteTextures here: its entry stays, with its IOSurface.
+			 * With room for 256 the table filled after a minute of SpringBoard, and every texture
+			 * after that was drawn empty (black labels). First the entries whose texture is gone ...
+			 */
+			unsigned gone = 0;
+
+			for (unsigned i = 0; i < e->image_count;) {
+				if (!glIsTexture(e->images[i].texture)) {
+					image_forget(e, e->images[i].texture);
+					gone++;
+				} else {
+					i++;
+				}
+			}
+			/* ... then more room, if that was not enough */
+			if (e->image_count == e->image_room) {
+				unsigned room = e->image_room ? e->image_room * 2 : 64;
+				struct image *more = realloc(e->images, room * sizeof(*more));
+
+				if (more == NULL) {
+					say("hakios-gl: more textures with IOSurfaces than there is room for (%u)\n", e->image_count);
+					return NULL;
+				}
+				e->images = more;
+				e->image_room = room;
+				if (room > 256) {
+					say("hakios-gl: room for %u textures with IOSurfaces (%u entries were of textures since deleted)\n",
+					    room, gone);
+				}
+			}
 		}
 		image = &e->images[e->image_count++];
 	} else {
@@ -647,10 +730,12 @@ surface_shared(struct eagl *e, struct image *image)
 			    "a part of it; " : "(the library refused)");
 		}
 		e->refused++;
+		note_surface(image->target ? "drawn into, copied" : "shown, copied", surface, image->plane);
 		return false;
 	}
 	image->shared = true;
 	e->shared++;
+	note_surface(image->target ? "drawn into, shared" : "shown, shared", surface, image->plane);
 	return true;
 }
 
@@ -3346,17 +3431,29 @@ static void
 my_glFlush(void *context)
 {
 	struct eagl *e = context;
-	uint64_t began;
+	uint64_t began, entered = 0, cleared = 0, submitted = 0;
 
 	EAGL_ENTER(e, 0x2d8);
 	if (eagl_tracing) {
 		eagl_trace("glFlush()\n");
 	}
+	if (slow_calls_us != 0) {
+		entered = now_us();
+	}
 	clear_now(e);
 	began = now_us();
+	cleared = began;
 	glFlush();
-	e->flushing += now_us() - began;
+	submitted = now_us();
+	e->flushing += submitted - began;
 	frame_end(e, false);
+	if (slow_calls_us != 0) {
+		uint64_t ended = now_us();
+		if (ended - entered >= slow_calls_us) {
+			say("tl: flush phases clear %llu submit %llu present %llu at %llu frame %u\n",
+			    cleared - entered, submitted - cleared, ended - submitted, ended, e->frames);
+		}
+	}
 	EAGL_LEAVE(e, 0x2d8);
 }
 
@@ -4077,6 +4174,7 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	image->height = height;
 	note_format(invert ? "IOSurface shown, inverted" : "IOSurface shown", image->internal, image->format, image->type, width,
 	    height);
+	note_surface("shown", surface, plane);
 	if (shown++ < 24) {
 		say("hakios-gl: -texImageIOSurface: surface %u ('%.4s' %zu x %zu, %zu planes) as texture %d: %d x %d, plane %u%s\n",
 		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) },
@@ -4118,6 +4216,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	    (image = image_new(e, (GLuint)texture, surface)) == NULL) {
 		say("hakios-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s': not done\n", target, texture,
 		    (const char *)&(uint32_t){ __builtin_bswap32(pixels) });
+		note_surface("drawn into: REFUSED", surface, 0);
 		return NO;
 	}
 	image->target = true;
@@ -4178,6 +4277,11 @@ my_dealloc(id self, SEL selector)
 			hakios_gl_make_current(NULL);
 			current = NULL;
 		}
+		/* (the GL objects go with e->gl; the IOSurfaces they were made of are ours to let go of) */
+		for (unsigned i = 0; i < e->image_count; i++) {
+			CFRelease(e->images[i].surface);
+		}
+		free(e->images);
 		hakios_gl_destroy(e->gl);
 		free(e);
 	}

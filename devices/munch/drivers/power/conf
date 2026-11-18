@@ -1,0 +1,7 @@
+# devices/munch/drivers/power/conf: the POCO F4's own power hardware (docs/porting/drivers.md, docs/drivers-config.md).
+
+driver MUNCH_BATTERY
+	file    bsd/dev/hakios.munch_battery.c
+	help    the POCO F4's TI bq27z561 fuel gauge on QUP 2's serial engine 16, read every 10 s, read only, to the battery driver
+	help    (battery=1; battery_stop=<percent> ends the run before the battery is flat, whatever is plugged in)
+	requires BATTERY

@@ -54,6 +54,11 @@
  *            mic_tap=1 with haptic=5 (the vibration motor from 2 s to 3 s of listening: the motor's
  *            175.5 Hz in the samples)
  *
+ * The POCO F4 (munch) has the same WCD938x with the same SoundWire ID, the TX and VA macros, the TX master and the LPASS
+ * pins at the same addresses and the same two clocks (its kona-audio-overlay.dtsi), and for now only mic=1 there, reading:
+ * its master is version 1.5 (0x01050001), its data lines are LPASS GPIOs 1 and 2 without a third, its codec's reset is GPIO
+ * 32 (south tile, function 2) and its microphone routes are not yet read from its own mixer paths.
+ *
  * What is asked for is given back at the end, and before the DSP is shut down (hakios_mic_dsp_down()).
  */
 #include <kern/clock.h>
@@ -68,6 +73,7 @@
 #include <sys/conf.h>
 #include <sys/hakios.audio.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.version.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 
@@ -398,6 +404,7 @@ static struct block tx_hctl = { "the TX SoundWire master's HCTL", 0x032a9000, 0x
 static struct block lpi = { "the LPASS pins", 0x033c0000, 0x10000 };
 static struct block lpi_high = { "the LPASS pins", 0x033ce000, 0x1000 };
 static struct block tlmm = { "the pin controller", 0x0f100000, 0x100000 };
+static unsigned reset_gpio = 83;                /* the codec's */
 
 static void
 look(void)
@@ -431,8 +438,8 @@ look(void)
 	}
 	(void)get(&lpi_high, "gpio14 config (SoundWire TX data 2)", 0);
 	(void)get(&lpi_high, "gpio14 in/out", 4);
-	(void)get(&tlmm, "gpio83 config (the codec's reset)", 0x1000 * 83);
-	(void)get(&tlmm, "gpio83 in/out", 0x1000 * 83 + 4);
+	(void)get(&tlmm, "the codec's reset pin, config", 0x1000 * reset_gpio);
+	(void)get(&tlmm, "the codec's reset pin, in/out", 0x1000 * reset_gpio + 4);
 	/* (last: the master is a block of its own, and not yet known; with its version above 1.5.1 the votes are all it needs) */
 	for (size_t i = 0; i < sizeof(swr) / sizeof(swr[0]); i++) {
 		(void)get(&tx_swr, swr[i].name, swr[i].offset);
@@ -442,8 +449,8 @@ look(void)
 
 /* ---- the codec's reset, the master's pins ------------------------------------------------------------ */
 
-#define TLMM_CFG_83             (0x1000 * 83)
-#define TLMM_IO_83              (0x1000 * 83 + 4)
+#define TLMM_CFG_83             (0x1000 * reset_gpio)
+#define TLMM_IO_83              (0x1000 * reset_gpio + 4)
 static uint32_t found_reset_cfg, found_reset_io;
 static bool reset_taken;
 
@@ -1821,10 +1828,18 @@ hakios_mic_dsp_up(void)
 {
 	thread_t thread;
 
+	if (hakios_soc_is("sm8250")) {
+		tlmm.phys = 0x0f500000;
+		tlmm.size = 0x83000;
+		reset_gpio = 32;
+	}
 	if (!PE_parse_boot_argn("mic", &level, sizeof(level)) || level == 0) {
 		return;
 	}
 	level = level > 4 ? 4 : level;
+	if (hakios_soc_is("sm8250")) {
+		level = 1;              /* (the POCO F4: a look; see the top) */
+	}
 	PE_parse_boot_argn("mic_secs", &mic_secs, sizeof(mic_secs));
 	PE_parse_boot_argn("mic_input", &smic_input, sizeof(smic_input));
 	PE_parse_boot_argn("mic_adc", &adc_on, sizeof(adc_on));

@@ -36,6 +36,7 @@
 #include <notify.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <mach-o/dyld.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -56,6 +57,19 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 #define HAKIOS_GL "/redwood/lib/libhakios.gl.dylib"
 
 static uintptr_t slide;
+
+static int
+has_boot_arg(const char *arguments, const char *arg)
+{
+	size_t length = strlen(arg);
+
+	for (const char *p = arguments; (p = strstr(p, arg)) != NULL; p += length) {
+		if ((p == arguments || p[-1] == ' ') && (p[length] == '\0' || p[length] == ' ')) {
+			return 1;
+		}
+	}
+	return 0;
+}
 
 static void
 say(const char *format, ...)
@@ -578,6 +592,114 @@ brightness_fixes(void)
 		return;
 	}
 	method_setImplementation(method, (IMP)wait_for_als_arrival);
+}
+
+/*
+ * With a brightness service on munch, QuartzCore connects to the EDR port
+ * declared by backboardd. On this display nobody checks it in.
+ */
+static void
+start_edr_server(void)
+{
+	kern_return_t (*lookup)(mach_port_t, const char *, mach_port_t *) = dlsym(RTLD_DEFAULT, "bootstrap_look_up");
+	mach_port_t bootstrap = MACH_PORT_NULL, port = MACH_PORT_NULL;
+	mach_port_type_t rights = 0;
+	void *lib;
+	void (*start)(void);
+
+	if (lookup != NULL && task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bootstrap) == KERN_SUCCESS) {
+		if (lookup(bootstrap, "com.apple.libEDR.Notification", &port) == KERN_SUCCESS) {
+			mach_port_type(mach_task_self(), port, &rights);
+			mach_port_deallocate(mach_task_self(), port);
+		}
+		mach_port_deallocate(mach_task_self(), bootstrap);
+	}
+	if (rights & MACH_PORT_TYPE_RECEIVE) {
+		return;
+	}
+	lib = dlopen("/System/Library/PrivateFrameworks/libEDR.framework/libEDR", RTLD_LAZY | RTLD_LOCAL);
+	start = lib != NULL ? dlsym(lib, "EDRServerStartService") : NULL;
+	if (start != NULL) {
+		start();
+		say("hakios: munch display: EDR server start returned\n");
+	} else {
+		say("hakios: munch display: EDRServerStartService unavailable\n");
+	}
+}
+
+static _Bool (*original_brightness_property)(id, SEL, id, id);
+static kern_return_t (*write_brightness_properties)(io_registry_entry_t, CFTypeRef);
+
+static _Bool
+set_brightness_property(id self, SEL selector, id property, id key)
+{
+	static unsigned reports;
+	_Bool handled = original_brightness_property(self, selector, property, key);
+	CFTypeRef value;
+	double level;
+	int32_t nits;
+	CFNumberRef number;
+	CFDictionaryRef request;
+	io_service_t service;
+	kern_return_t result = kIOReturnNoMemory;
+
+	if (key == NULL || !CFEqual((CFTypeRef)key, CFSTR("DisplayBrightness")) ||
+	    property == NULL || CFGetTypeID((CFTypeRef)property) != CFDictionaryGetTypeID()) {
+		return handled;
+	}
+	value = CFDictionaryGetValue((CFDictionaryRef)property, CFSTR("Brightness"));
+	if (value == NULL || CFGetTypeID(value) != CFNumberGetTypeID() ||
+	    !CFNumberGetValue((CFNumberRef)value, kCFNumberDoubleType, &level) || !(level >= 0 && level <= 1)) {
+		return handled;
+	}
+	service = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("HakiosBacklight"));
+	if (service == IO_OBJECT_NULL) {
+		if (__atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) < 6) {
+			say("hakios: munch display: brightness service missing\n");
+		}
+		return handled;
+	}
+	nits = (int32_t)((2.0 + level * 498.0) * 65536.0 + 0.5);
+	number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &nits);
+	if (number != NULL) {
+		const void *keys[] = { CFSTR("brightness-nits") };
+		const void *values[] = { number };
+		request = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1,
+		    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		if (request != NULL) {
+			result = write_brightness_properties(service, request);
+			CFRelease(request);
+		}
+		CFRelease(number);
+	}
+	IOObjectRelease(service);
+	if (__atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) < 6) {
+		say("hakios: munch display: brightness %.3f forwarded (status %#x)\n", level, result);
+	}
+	return handled;
+}
+
+static void
+install_brightness_bridge(void)
+{
+	Class cls = objc_getClass("BrightnessSystem");
+	Method method = cls != Nil ? class_getInstanceMethod(cls, sel_registerName("setProperty:forKey:")) : NULL;
+	IMP original = method != NULL ? method_getImplementation(method) : NULL;
+
+	/* BrightnessSystem receives the same display property from Settings and Control Center on 20F66. */
+	if ((uintptr_t)original != 0x1aef900c4UL + slide ||
+	    strcmp(method_getTypeEncoding(method), "B32@0:8@16@24") != 0) {
+		say("hakios: munch display: BrightnessSystem setter not recognized\n");
+		return;
+	}
+	write_brightness_properties = dlsym(RTLD_DEFAULT, "IORegistryEntrySetCFProperties");
+	if (write_brightness_properties == NULL) {
+		say("hakios: munch display: IORegistryEntrySetCFProperties unavailable\n");
+		return;
+	}
+	original_brightness_property = (void *)original;
+	method_setImplementation(method, (IMP)set_brightness_property);
+	say("hakios: munch display: BrightnessSystem bridge installed\n");
 }
 
 /* ---- backboardd: the touch screen and the buttons ---------------------------------------------- */
@@ -1161,6 +1283,39 @@ watch_metallib_lookups(const char *arguments)
 	    ca_metallib ? ca_metallib : "");
 }
 
+/*
+ * Auto-Lock's timeouts come to SpringBoard from the AttentionAwareness service (SBBacklightIdleTimer ->
+ * ITAttentionAwareIdleTimer -> AWAttentionAwarenessClient), which this program serves through the HID filter plugin
+ * AttentionAwarenessFilter.plugin (com.apple.AttentionAwareness in its launchd plist). A minute after the start: whether
+ * that plugin and its framework are loaded here, and how many AW classes they brought.
+ */
+static void
+attention_report(void)
+{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		unsigned found = 0;
+
+		for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+			const char *image = _dyld_get_image_name(i);
+			unsigned count = 0;
+			const char **classes;
+
+			if (image == NULL || strstr(image, "AttentionAwareness") == NULL) {
+				continue;
+			}
+			found++;
+			classes = objc_copyClassNamesForImage(image, &count);
+			say("hakios: attention: %s is loaded in backboardd, %u classes%s%s%s\n", image, count, count > 0 ? " (first: " : "",
+			    count > 0 ? classes[0] : "", count > 0 ? ")" : "");
+			free(classes);
+		}
+		if (found == 0) {
+			say("hakios: attention: nothing of AttentionAwareness is loaded in backboardd: its HID filter plugin was not "
+			    "taken, and nobody serves com.apple.AttentionAwareness\n");
+		}
+	});
+}
+
 __attribute__((constructor))
 static void
 hakios_init(void)
@@ -1175,6 +1330,8 @@ hakios_init(void)
 	slide = (uintptr_t)cache - CACHE_BASE;
 	if (strcmp(name, "backboardd") == 0) {
 		char arguments[1024] = "";
+
+		attention_report();
 		size_t size = sizeof(arguments) - 1;
 
 		/*
@@ -1228,6 +1385,12 @@ hakios_init(void)
 		 * survive; not tried again since, and until it is, the five seconds stay.)
 		 */
 		input_start();
+		if (has_boot_arg(arguments, "hw=munch") && has_boot_arg(arguments, "fb_backlight=1")) {
+			dispatch_async(dispatch_get_main_queue(), ^{
+				install_brightness_bridge();
+				start_edr_server();
+			});
+		}
 	} else if (strncmp(name, "containermanagerd", 17) == 0) {
 		container_manager_fixes();
 	}

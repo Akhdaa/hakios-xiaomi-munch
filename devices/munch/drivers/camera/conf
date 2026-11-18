@@ -1,0 +1,9 @@
+# devices/munch/drivers/camera/conf: the POCO F4's cameras (docs/porting/drivers.md).
+
+driver MUNCH_CAMERA
+	file    bsd/dev/hakios.munch_camera.c
+	help    the POCO F4's cameras: the PM8008 and the sensors by hand, as drivers/camera/hakios.camera.c (munch_cam=1: a look)
+
+driver MUNCH_TORCH
+	file    bsd/dev/hakios.munch_torch.c
+	help    the POCO F4's flashlight: the PM8150L's flash LED module, torch channel 0 (munch_torch=1 a look, 2 on for 3 s, then kern.hakios.torch)

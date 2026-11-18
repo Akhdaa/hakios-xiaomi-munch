@@ -62,9 +62,11 @@ uint32_t hakios_gpu_last(void);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
 void hakios_gpu_stop(void);
+void hakios_gpu_dcvs(uint32_t submissions);
 
 void HakiosGPUStart(void);
 void HakiosGPUStop(void);
+void HakiosGPUTick(void);
 void MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t height, uint32_t rowBytes);
 }
 
@@ -180,17 +182,102 @@ struct hakios_show {
 #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
+static uint32_t gSubmissionsSinceTick;          /* the user clients' submissions since HakiosGPUTick(), under gGPULock */
 static bool gGPUReported;
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
+/*
+ * Boot-arg gpu_push_ms=N: how long after a surface was last pushed out of the cache a submission that names it,
+ * its seed unchanged, does without pushing it again (4). What writes a surface without saying so (its seed) and
+ * has the GPU read it within that time has the GPU read memory without what is still in this processor's cache:
+ * on the POCO F4, icons black while a list was scrolled fast. 0: every time.
+ */
+static uint32_t gGPUPushMs = GPU_PUSH_AGAIN_MS;
 
 /* What the last seconds' submissions were and cost here, for the log. */
 static struct {
 	uint64_t since, flushing, waiting, taking;      /* times of the processor's clock */
 	uint64_t flushed;                       /* bytes sent out of the cache */
+	uint64_t forgot;                        /* bytes forgotten by the cache after the GPU was done (gpuRetire()) */
 	uint32_t submissions, commands, buffers, surfaces, waits, over;
 	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
 	uint64_t making;                        /* ... and the time it took to make the others */
 } gGPUStat;
+
+/*
+ * Ordinary memory the GPU may have written (an IOSurface, a client's own pages): what this processor's cache
+ * holds of it is forgotten once the submission is done, before anybody here reads it. Pushing it out of the
+ * cache before the submission (submit()) is not enough: whatever is read of it meanwhile -- the display's
+ * driver reads the surfaces it shows, a program the picture it has drawn, the processor reads ahead of
+ * itself -- comes back into the cache as it was before the GPU wrote it, and is read from there afterwards.
+ * On the POCO F4 that was icons black (read when the surface was still zero) and rows of the last frame
+ * among the new one's (6 November). Each entry holds a reference to the memory, so that its pages stay
+ * wired and its own until then. With the lock held.
+ */
+struct gpu_dirty {
+	IOMemoryDescriptor *            memory;
+	uint64_t                        size;
+	uint32_t                        fence;
+};
+#define GPU_DIRTY               256
+static struct gpu_dirty gGPUDirty[GPU_DIRTY];
+static uint32_t gGPUDirtyCount, gGPUDirtyFull;
+
+static void
+gpuForget(struct gpu_dirty * d)
+{
+	for (uint64_t offset = 0; offset < d->size;) {
+		IOByteCount length = 0;
+		addr64_t phys = d->memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
+
+		if (phys == 0 || length == 0) {
+			break;
+		}
+		length = MIN(length, d->size - offset);
+		flush_dcache64(phys, (unsigned) length, TRUE);
+		offset += length;
+	}
+	gGPUStat.forgot += d->size;
+	d->memory->release();
+}
+
+/* Forget what the cache holds of the memory of every submission that is done. */
+static void
+gpuRetire(void)
+{
+	for (uint32_t i = 0; i < gGPUDirtyCount;) {
+		if (hakios_gpu_ready() && !hakios_gpu_done(gGPUDirty[i].fence)) {
+			i++;
+			continue;
+		}
+		gpuForget(&gGPUDirty[i]);
+		gGPUDirty[i] = gGPUDirty[--gGPUDirtyCount];
+	}
+}
+
+static void
+gpuDirty(IOMemoryDescriptor * memory, uint64_t size, uint32_t fence)
+{
+	for (uint32_t i = 0; i < gGPUDirtyCount; i++) {
+		if (gGPUDirty[i].memory == memory) {
+			gGPUDirty[i].fence = fence;
+			gGPUDirty[i].size = MAX(gGPUDirty[i].size, size);
+			return;
+		}
+	}
+	if (gGPUDirtyCount == GPU_DIRTY) {
+		gpuRetire();
+	}
+	if (gGPUDirtyCount == GPU_DIRTY) {
+		/* (nowhere to keep it: the oldest is forgotten now, as it was before there was this) */
+		if (gGPUDirtyFull++ < 4) {
+			IOLog("HakiosGPU: more than %u buffers drawn into at once: the cache is forgotten early for one\n", GPU_DIRTY);
+		}
+		gpuForget(&gGPUDirty[0]);
+		gGPUDirty[0] = gGPUDirty[--gGPUDirtyCount];
+	}
+	memory->retain();
+	gGPUDirty[gGPUDirtyCount++] = (struct gpu_dirty){ memory, size, fence };
+}
 
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
 static bool
@@ -201,6 +288,7 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
 	for (bool waited = false;; waited = true) {
 		if (hakios_gpu_done(fence)) {
+			gpuRetire();
 			if (waited) {
 				gGPUStat.waits++;
 				gGPUStat.waiting += mach_absolute_time() - began;
@@ -330,6 +418,13 @@ HakiosGPUStart(void)
 	uint32_t cached = 0;
 
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
+	{
+		uint32_t push;
+
+		if (PE_parse_boot_argn("gpu_push_ms", &push, sizeof(push)) && push <= 1000) {
+			gGPUPushMs = push;
+		}
+	}
 	gGPULock = IOLockAlloc();
 	gpu = OSTypeAlloc(HakiosGPU);
 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
@@ -342,6 +437,19 @@ HakiosGPUStart(void)
 		IOLog("HakiosGPU: the service did not start\n");
 	}
 	gpu->release();
+}
+
+/* The GPU's speed, looked at again (hakios.adreno.c, gpu_dcvs): between two submissions, never in one. */
+void
+HakiosGPUTick(void)
+{
+	if (gGPULock == NULL) {
+		return;
+	}
+	IOLockLock(gGPULock);
+	hakios_gpu_dcvs(gSubmissionsSinceTick);         /* (gpu_anim_floor: animating is 2+ in a window) */
+	gSubmissionsSinceTick = 0;
+	IOLockUnlock(gGPULock);
 }
 
 /* The run is ending (hakios.adreno.c): nobody is in the middle of anything when the GPU goes. */
@@ -1005,7 +1113,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 	 * ordinary memory (gpu_cached=1).
 	 */
 	began = mach_absolute_time();
-	nanoseconds_to_absolutetime(GPU_PUSH_AGAIN_MS * NSEC_PER_MSEC, &again);
+	nanoseconds_to_absolutetime((uint64_t) gGPUPushMs * NSEC_PER_MSEC, &again);
 	for (uint32_t i = 0; i < request->nr_bos; i++) {
 		struct gpu_buffer * b = buffer(bos[i].handle);
 
@@ -1061,6 +1169,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		words[count++] = cmds[i].size / 4;
 	}
 	request->fence = hakios_gpu_submit(addresses, words, count);
+	gSubmissionsSinceTick += request->fence != 0;  /* (still under gGPULock: HakiosGPUTick() takes the count) */
 	if (gpu_log && request->fence != 0) {
 		/* "tl: Q FENCE at US: N buffers, B of 4 MB or more, W words of commands": what was given (tl: q: what it took) */
 		uint32_t big = 0, all_words = 0;
@@ -1094,8 +1203,12 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 			if (b->surface != NULL) {
 				b->surface->drawn = request->fence;
 			}
+			if ((b->surface != NULL || b->client) && !(b->flags & MSM_BO_GPU_READONLY)) {
+				gpuDirty(b->memory, b->size, request->fence);
+			}
 		}
 	}
+	gpuRetire();
 	reap();
 	if (request->fence == 0 && !gGPUReported) {
 		gGPUReported = true;
@@ -1129,13 +1242,13 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		IOLog("HakiosGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "
-		    "began; %u IOSurfaces taken as buffers in %llu us each; %u buffers, %llu MB\n",
+		    "began; %u IOSurfaces taken as buffers in %llu us each; %u buffers, %llu MB; %llu KB forgotten by the cache after the GPU\n",
 		    gGPUStat.submissions, nanos / NSEC_PER_MSEC, gGPUStat.commands, gGPUStat.buffers,
 		    (gGPUStat.flushed >> 10) / gGPUStat.submissions, flushing / NSEC_PER_USEC / gGPUStat.submissions,
 		    timed ? worked / timed : 0, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked / 1000,
 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
-		    fBufferBytes >> 20);
+		    fBufferBytes >> 20, gGPUStat.forgot >> 10);
 		bzero(&gGPUStat, sizeof(gGPUStat));
 	}
 	IOLockUnlock(gGPULock);

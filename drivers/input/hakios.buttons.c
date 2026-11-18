@@ -7,6 +7,9 @@
  *   power        KPDPWR_N of the power-on block ("PON") of the PMK8350
  *   volume down  RESIN_N of the same block
  *   volume up    GPIO6 of the PM7325, pulled up; the key pulls it low
+ * On the POCO F4 (munch, hw=munch) all three are of one chip, the PM8150 (slave 0): power and volume
+ * down are KPDPWR_N and RESIN_N of its power-on block (an older kind, "generation 2", with the two
+ * bits low in its status), volume up is its GPIO6. Its arbiter is where redwood's is.
  * Both chips sit on the SPMI bus (slaves 0 and 1), and the way to that bus is the SoC's "PMIC
  * arbiter": it owns the bus and gives each of the systems on the chip (this one, the modem, the
  * always-on processor, TrustZone...) a set of registers per PMIC peripheral -- a "channel" -- to
@@ -50,6 +53,7 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.version.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -233,6 +237,12 @@ find_channel(struct peripheral *p, uint32_t channels)
 #define PON_SUBTYPE_HLOS        0x09
 #define PON_KPDPWR              0x80            /* in the status and in the interrupt registers */
 #define PON_RESIN               0x40
+/* munch's PM8150: a power-on block in one piece ("generation 2", qpnp-power-on.c), its keys in bits 0 and 1 */
+#define PON_SUBTYPE_GEN2_PRIMARY 0x04
+#define PON_GEN2_KPDPWR         0x01
+#define PON_GEN2_RESIN          0x02
+
+static uint8_t pon_subtype = PON_SUBTYPE_HLOS, pon_kpdpwr = PON_KPDPWR, pon_resin = PON_RESIN;
 
 /* a GPIO of the low or medium voltage kind */
 #define GPIO_TYPE               0x10
@@ -319,8 +329,8 @@ buttons_poll(void)
 	if (power.usable || volume_down.usable) {
 		problem = spmi_read(&pon, REG_RT_STATUS, &status, 1);
 		if (problem == NULL) {
-			button_look(&power, status & PON_KPDPWR);
-			button_look(&volume_down, status & PON_RESIN);
+			button_look(&power, status & pon_kpdpwr);
+			button_look(&volume_down, status & pon_resin);
 		} else if (said < 8) {
 			said++;
 			printf("buttons: reading %s: %s\n", pon.name, problem);
@@ -369,7 +379,8 @@ pon_inputs(void)
 	const char *problem;
 	uint8_t r[8], more[2];
 
-	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x1310 to 0x1319)\n", pon.name);
+	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x%02x10 to 0x%02x19)\n", pon.name,
+	    pon.id & 0xff, pon.id & 0xff);
 	problem = spmi_read(&pon, REG_RT_STATUS, r, 8);
 	if (problem == NULL) {
 		problem = spmi_read(&pon, REG_INT_LATCHED, more, 2);
@@ -379,12 +390,12 @@ pon_inputs(void)
 		return;
 	}
 	printf("buttons: power-on block: status %#x (power %s, volume down %s); interrupts: edge %#x, high %#x, low %#x, "
-	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & PON_KPDPWR) ? "HELD" : "released",
-	    (r[0] & PON_RESIN) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
+	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & pon_kpdpwr) ? "HELD" : "released",
+	    (r[0] & pon_resin) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
 	    r[REG_INT_POLARITY_LOW - REG_RT_STATUS], r[REG_INT_ENABLED - REG_RT_STATUS], more[0], more[1]);
 	power.usable = volume_down.usable = true;
-	power.last = r[0] & PON_KPDPWR;
-	volume_down.last = r[0] & PON_RESIN;
+	power.last = r[0] & pon_kpdpwr;
+	volume_down.last = r[0] & pon_resin;
 }
 
 /* Step 4 for the pin: it is volume up only if it is an input with a pull-up, and switched on. */
@@ -395,7 +406,8 @@ pin_input(void)
 	uint8_t c[8], status = 0;
 	unsigned mode, pull;
 
-	printf("buttons: next: read the setup and the level of %s (registers 0x8d40 to 0x8d47, 0x8d10)\n", pin.name);
+	printf("buttons: next: read the setup and the level of %s (registers 0x%02x40 to 0x%02x47, 0x%02x10)\n", pin.name,
+	    pin.id & 0xff, pin.id & 0xff, pin.id & 0xff);
 	problem = spmi_read(&pin, GPIO_REG_MODE, c, 8);
 	if (problem == NULL) {
 		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
@@ -463,7 +475,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	}
 
 	printf("buttons: step 3: the first transfers on the SPMI bus\n");
-	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
+	pon_known = identify(&pon, PON_TYPE, pon_subtype, pon_subtype);
 	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
 	if (steps < 4) {
 		goto out;
@@ -515,11 +527,56 @@ out:
 }
 
 /*
- * boot-arg press_power=<seconds>: a short press of the power key that many seconds after boot, and another ten
- * seconds later, given to Darwin as the key's own are (hakios_touch_post): the lock, and the wake, tried with nobody
- * at the phone. press_power_ms=<ms> is how long each is held (default 150: a tap; 3000 and up is a long press).
+ * munch's charger as its PMIC has it, for the fuel gauge's driver (devices/munch: hakios.munch_battery.c): the PM8150B
+ * (slave 2; Android's drivers/power/supply/qcom/smb5-reg.h), three registers READ, never written -- the USB input's
+ * status (0x1310, bit 4: something is plugged in), what its detection found the port to be (0x1308: bit 0 a
+ * computer's, 1 OCP, 2 a computer's charging port, 3 a charger, 4 a floating one, 5 and 6 Quick Charge) and the
+ * charger's state (0x1006, [2:0]: 0 inhibited, 1 trickle, 2 pre-charge, 3 full current, 4 taper, 5 terminated,
+ * 6 paused, 7 disabled). The arbiter is mapped and the two channels found on the first call. One caller at a time.
  */
-static uint32_t press_ms = 150, press_left;
+static struct peripheral usbin = { .name = "the PM8150B's USB input", .id = 0x213 };     /* registers 0x1300 of slave 2 */
+static struct peripheral chgr = { .name = "the PM8150B's charger", .id = 0x210 };        /* registers 0x1000 of slave 2 */
+
+bool
+hakios_munch_charger(uint8_t *input_status, uint8_t *port_kind, uint8_t *charger_state)
+{
+	static bool tried, usable;
+
+	if (!hakios_soc_is("sm8250")) {
+		return false;
+	}
+	if (!tried) {
+		uint32_t version, channels;
+
+		tried = true;
+		if (arb_core == 0 || arb_cnfg == 0 || arb_observer == 0) {
+			arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+			arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
+			arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+		}
+		version = rd(arb_core + ARB_VERSION);
+		channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
+		if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) {
+			printf("battery: munch: PMIC arbiter version %#x, not 5: the charger is not read\n", version);
+			return false;
+		}
+		if (channels == 0 || channels > ARB_MAX_CHANNELS) {
+			channels = ARB_MAX_CHANNELS;
+		}
+		find_channel(&usbin, channels);
+		find_channel(&chgr, channels);
+		usable = usbin.found && chgr.found;
+	}
+	return usable && spmi_read(&usbin, REG_RT_STATUS, input_status, 1) == NULL &&
+	       spmi_read(&usbin, 0x08, port_kind, 1) == NULL && spmi_read(&chgr, 0x06, charger_state, 1) == NULL;
+}
+
+/*
+ * boot-arg press_power=<seconds>: a short press of the power key that many seconds after boot, and another ten
+ * seconds later, given to Darwin as the key's own are (hakios_touch_post): the lock and the wake, tried with nobody at the phone.
+ * press_power_ms=<ms> is how long each is held (default 150: a tap). press_power_n=<n>: so many presses (default 2).
+ */
+static uint32_t press_ms = 150, press_left = 2;
 static thread_call_t press_call;
 
 static void
@@ -553,12 +610,12 @@ press_power_init(void)
 		return;
 	}
 	PE_parse_boot_argn("press_power_ms", &press_ms, sizeof(press_ms));
-	press_left = 2;
+	PE_parse_boot_argn("press_power_n", &press_left, sizeof(press_left));
 	press_call = thread_call_allocate(press_step, NULL);
 	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(press_call, deadline);
-	printf("buttons: press_power: the power key will be pressed for %u ms at %u s and at %u s\n", press_ms, seconds,
-	    seconds + 10);
+	printf("buttons: press_power: the power key will be pressed for %u ms, %u times, from %u s on, ten seconds apart\n", press_ms,
+	    press_left, seconds);
 }
 
 void
@@ -573,6 +630,15 @@ hakios_buttons_init(void)
 	 * On with the touch screen (the phone, somebody at it) unless buttons=0 says otherwise: a hand
 	 * has pressed all three keys and each press and release was read as it was made.
 	 */
+	if (hakios_soc_is("sm8250")) {
+		pon = (struct peripheral){ .name = "the PM8150's power-on block", .id = 0x008 };     /* registers 0x0800 of slave 0 */
+		pin = (struct peripheral){ .name = "GPIO6 of the PM8150", .id = 0x0c5 };             /* registers 0xc500 of slave 0 */
+		pon_subtype = PON_SUBTYPE_GEN2_PRIMARY;
+		pon_kpdpwr = PON_GEN2_KPDPWR;
+		pon_resin = PON_GEN2_RESIN;
+	} else if (!hakios_soc_is("sc7280")) {
+		return;         /* the keys of another phone's PMICs */
+	}
 	if (!PE_parse_boot_argn("buttons", &enabled, sizeof(enabled))) {
 		uint32_t touch_screen = 0;
 

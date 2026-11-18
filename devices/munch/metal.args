@@ -1,0 +1,7 @@
+# what tools/metal-run.sh gives this phone (docs/porting/index.md): its big core and cores, its panel's rate,
+# how many threads copy frames, how often the touch screen is read. A line of boot-arguments; # is a comment.
+# fb_intf=<physical> as well, if its SoC's display interface is known: frames are then written behind the scan.
+# The panel runs at 60 Hz under UEFI (fb_scan=1 counted 61 frames a second on INTF_1, 6 November). Its INTF_1 counts
+# lines only while a frame is sent (a panel in command mode, its timing engine reads 0): fb_beam measures that sending
+# and needs no fb_intf= (the kernel knows SM8250's INTF_1).
+fb_hz=60 fb_threads=3

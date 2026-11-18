@@ -1,0 +1,5 @@
+# devices/munch/drivers/input/conf: the POCO F4's own input hardware (docs/porting/drivers.md, docs/drivers-config.md).
+
+driver MUNCH_TOUCH
+	file    bsd/dev/hakios.munch_touch.c
+	help    the POCO F4's FocalTech FT3658U on QUP 0's serial engine 4, polled (touchscreen=1, touch_poll_us=, spi_hz=, touch_flip=)

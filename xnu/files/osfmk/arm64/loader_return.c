@@ -17,6 +17,8 @@
 #include <kern/debug.h>
 #include <kern/startup.h>
 #include <kern/thread_call.h>
+#include <kern/processor.h>
+#include <kern/sched_prim.h>
 #include <kern/clock.h>
 #include <arm/cpu_internal.h>
 #include <arm/machine_routines.h>
@@ -49,6 +51,8 @@ extern void hakios_adreno_stop(void);
 extern void hakios_adreno_minute(void);
 extern void hakios_wifi_stop(void);
 extern void hakios_wifi_quiesce(void);
+extern void hakios_munch_bt_quiesce(void) __attribute__((weak));
+extern void hakios_munch_bt_stop(void) __attribute__((weak));
 extern void hakios_adsp_stop(void);
 extern void hakios_adsp_quiesce(void);
 extern void hakios_mpss_stop(void);
@@ -57,6 +61,7 @@ extern void hakios_ddr_quiesce(void);
 extern void hakios_haptic_quiesce(void);
 extern void hakios_torch_quiesce(void);
 extern void hakios_camera_quiesce(void);
+extern void hakios_munch_modem_quiesce(void) __attribute__((weak));    /* devices/munch/drivers/modem */
 extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
 extern void hakios_var_save_on_return(void);   /* drivers/storage/hakios.ufs.c: the data volume into the flash */
@@ -373,9 +378,15 @@ loader_return(void)
 #endif
 	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
+	if (hakios_munch_bt_quiesce != NULL) {
+		hakios_munch_bt_quiesce();
+	}
 	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	hakios_adsp_quiesce();         /* nor the audio DSP */
 	hakios_mpss_quiesce();         /* nor the modem */
+	if (hakios_munch_modem_quiesce != NULL) {
+		hakios_munch_modem_quiesce();  /* (the POCO F4's X55, on its PCIe 2) */
+	}
 	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
 	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
 	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
@@ -428,6 +439,54 @@ loader_return_test(void *as_panic)
 	loader_return();
 }
 
+/*
+ * The timed return and "xl stop" are thread calls, and a thread call runs on whichever processor
+ * has a worker free. On any but the boot processor the return is handed over by an interrupt
+ * (psci_smp_stop_others()), and the boot processor then does all of it -- the storage, the GPU,
+ * the DSPs -- from inside that interrupt's handler. Run 173038 (9 November, the second kernel of
+ * a loader session) went that way and hung there, after "cpu 1 ends the system"; every return
+ * made on the boot processor itself came back. So this thread goes to the boot processor first,
+ * as thread_vm_bind_group_add() does, and the return is made there, in a thread.
+ */
+/*
+ * A panel put to sleep while the screen was blanked (fb_sleep) is woken before the return: the loader shows its log on it,
+ * and the next kernel's system draws on it. From a thread (it waits); a panic's way back cannot.
+ */
+extern int hakios_munch_panel_power(bool on) __attribute__((weak));
+
+extern void hakios_munch_torch_stop(void) __attribute__((weak));       /* the POCO F4's flashlight, if Darwin left it lit */
+
+static void
+loader_return_wake_panel(void)
+{
+	if (hakios_munch_panel_power != NULL) {
+		(void)hakios_munch_panel_power(true);
+	}
+	if (hakios_munch_torch_stop != NULL) {
+		hakios_munch_torch_stop();
+	}
+}
+
+static void
+loader_return_move_to_boot_cpu(void)
+{
+	/*
+	 * Bound in every case, not only when it is elsewhere: the GPU's and the DSPs' teardown that follows waits, and an
+	 * unbound thread that happened to start on the boot processor went on from cpu 1 after one of those waits (run
+	 * 185425: "cpu 1 ends the system", and the return hung as before).
+	 */
+	thread_bind(master_processor);
+	if (cpu_number() != master_cpu) {
+		thread_block(THREAD_CONTINUE_NULL);
+	}
+	if (cpu_number() != master_cpu) {
+		static const char note[] = "loader_return: this thread did not get to the boot processor: the return is handed over\n";
+		for (const char *c = note; *c; c++) {
+			loader_log_putc(*c);
+		}
+	}
+}
+
 static void
 loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
@@ -438,9 +497,16 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 		loader_log_putc(*c);
 	}
 	PE_parse_boot_argn("return_panic", &as_panic, sizeof(as_panic));
+	if (!PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu))) {
+		loader_return_move_to_boot_cpu();       /* (return_cpu=N asks for the other way on purpose) */
+	}
 	if (!as_panic) {
+		loader_return_wake_panel();
 		hakios_var_save_on_return();   /* the data volume kept, while the system is still whole */
 		hakios_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
+		if (hakios_munch_bt_stop != NULL) {
+			hakios_munch_bt_stop();
+		}
 		hakios_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
 		hakios_adsp_stop();            /* and the audio DSP */
 		hakios_mpss_stop();            /* and the modem */
@@ -486,8 +552,13 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		for (const char *c = banner; *c; c++) {
 			loader_log_putc(*c);
 		}
+		loader_return_move_to_boot_cpu();
+		loader_return_wake_panel();
 		hakios_var_save_on_return();
 		hakios_adreno_stop();
+		if (hakios_munch_bt_stop != NULL) {
+			hakios_munch_bt_stop();
+		}
 		hakios_wifi_stop();
 		hakios_adsp_stop();
 		loader_return();

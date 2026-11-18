@@ -185,6 +185,35 @@ public:
     // stop running submissions until resume(): to see what a program does while the GPU is behind
     void pause();
     void resume();
+    // the chip id kParamChipId answers below the speed bin: kChipId unless a test makes the fake another GPU (the A650's
+    // 0x06050002, or 0 for a kernel that does not say)
+    void setChipId(uint64_t chip);
+    // the last submission as the kernel took it: its fence and every buffer it named, with the read / write flags
+    // (kSubmitBoRead, kSubmitBoWrite), the buffer's GPU address and size, and the IOSurface it is the memory of (0: none)
+    struct SubmittedBo {
+        uint32_t handle = 0, flags = 0;
+        uint64_t iova = 0, size = 0;
+        uint32_t surface = 0;
+    };
+    struct Submission {
+        uint32_t fence = 0;
+        std::vector<SubmittedBo> bos;
+    };
+    Submission lastSubmission();
+    // the 2D engine's writes carried out (CP_BLIT solid fills and copies into linear images), in the order they ran:
+    // the submission's fence, fill or copy, the destination's base and pitch, its bytes a pixel and the rectangle
+    // (X1, Y1 inclusive). The last 4096 are kept; CLEAR empties the record after it is read.
+    struct Write {
+        uint32_t fence = 0;
+        bool fill = false;
+        uint64_t base = 0, pitch = 0;
+        uint32_t bpp = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    };
+    std::vector<Write> writes(bool clear);
+    // every command-stream word the CP read since the record was last cleared, in the order it read them: each stream
+    // (a submission's, then an indirect buffer's when it is called) whole as it is entered. The first 4 Mi are kept;
+    // CLEAR empties the record after it is read. For a test to hold two runs' streams word for word.
+    std::vector<uint32_t> executedWords(bool clear);
 
     // what the kernel says about this GPU, for the fake to say the same and for a test to check it does
     static constexpr uint64_t kChipId = 0x06030500;      // dt qcom,chipid: an A635-family part, "Adreno 7c+ Gen 3" to Mesa
@@ -304,6 +333,12 @@ private:
     // a draw counts one sample per index it submits, times its instances: enough to tell begin from end and the
     // query's arithmetic from a wrong one; how many samples a real draw passes is the phone's (probe 9q)
     uint64_t samples_ = 0;
+    uint64_t chip_ = kChipId;                   // setChipId's
+    Submission last_;                           // lastSubmission's
+    std::deque<Write> writes_;                  // writes()'s
+    std::vector<uint32_t> executed_;            // executedWords()'s
+    uint32_t running_ = 0;                      // the fence of the submission running now
+    void wrote(bool fill, uint64_t base, uint64_t pitch, uint32_t bpp, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1);
     uint32_t nextHandle_ = 1, nextQueue_ = 1;
     uint64_t nextIova_ = 0x100000000ull;
     Stats stats_;

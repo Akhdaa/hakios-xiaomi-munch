@@ -15,6 +15,7 @@
 #include <sys/hakios.input.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
+#include <sys/hakios.version.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
@@ -183,6 +184,7 @@ hakios_battery_init(void)
 	thread_t thread;
 
 	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) return;
+	if (hakios_soc_is("sm8250")) return;     /* (munch's fuel gauge: hakios_munch_battery.c) */
 	if (!PE_parse_boot_argn("battery_shared_pa", &shared_pa, sizeof(shared_pa)) || shared_pa == 0) {
 		printf("battery: xnuloader did not provide battery_shared_pa\n");
 		return;

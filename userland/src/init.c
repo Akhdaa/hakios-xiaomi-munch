@@ -1539,9 +1539,13 @@ main(int argc, char **argv, char **envp)
 	printf("\n=== init: process %d, started as %s ===\n", getpid(), argc > 0 ? argv[0] : "?");
 	{
 		const char *dev = boot_arg("root_apfs");
+		struct stat bt_audio;
 
 		if (dev != NULL) {
 			flash_root(dev);
+		} else if (stat(in_image("/hal/BTAudioHALPlugin.driver/Info.plist"), &bt_audio) == 0) {
+			check(bind_dir(in_image("/hal"), "/System/Library/Audio/Plug-Ins/HAL"),
+			    "the speaker and Bluetooth audio plug-ins");
 		}
 	}
 

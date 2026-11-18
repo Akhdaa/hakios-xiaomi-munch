@@ -28,6 +28,7 @@
 #include <sys/hakios.lx.h>
 #include <sys/hakios.net.h>
 #include <sys/systm.h>
+#include <sys/hakios.version.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
 
@@ -228,7 +229,22 @@ lx_os_firmware(const char *name, const void **data, unsigned long *size)
 int
 lx_os_rproc_boot(void)
 {
+	if (hakios_soc_is("sm8250")) {
+		return hakios_munch_wifi_up();
+	}
 	return hakios_wifi_dsp_is_up() ? 0 : ENXIO;
+}
+
+int
+lx_os_radio_is_pcie(void)
+{
+	return hakios_soc_is("sm8250");
+}
+
+void *
+lx_os_radio_bar(unsigned long *size)
+{
+	return hakios_munch_wifi_registers(size);
 }
 
 int

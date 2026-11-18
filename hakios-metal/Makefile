@@ -58,8 +58,8 @@ TESTS     = $(wildcard tests/*_test.cpp) tests/main.cpp
 .PHONY: test tsan asan check ios darwin clean sweep
 
 # (and the front end's archive: a test binary linked before the front end changed passed or failed for the old one)
-$(HOSTOUT)/tests: $(HOST) $(TESTS) $(wildcard include/hakios-metal/*.hpp) $(wildcard tests/fixtures/*.hpp) tests/test.hpp \
-		$(if $(strip $(MESA)),$(MESA_BUILD)/src/compiler/air/libair.a)
+$(HOSTOUT)/tests: $(HOST) $(TESTS) $(wildcard include/hakios-metal/*.hpp) $(wildcard tests/fixtures/*.hpp) tests/test.hpp tools/hm_seed.hpp \
+		$(wildcard ../userland/src/hm_ca_cover.h ../userland/src/hm_ca_label.h ../userland/src/hm_ca_diag.h ../userland/src/hm_ca_tint_bc.h) $(if $(strip $(MESA)),$(MESA_BUILD)/src/compiler/air/libair.a)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -pthread -o $@ $(HOST) $(TESTS) $(HOSTLIBS)
 
@@ -70,6 +70,21 @@ $(HOSTOUT)/sweep: tools/sweep.cpp $(HOST) $(wildcard include/hakios-metal/*.hpp)
 	$(CXX) $(CXXFLAGS) -pthread -o $@ tools/sweep.cpp $(HOST) $(HOSTLIBS)
 
 sweep: $(HOSTOUT)/sweep
+
+# hm-seed (tools/hm-seed.cpp, metal-ca-perf): the A650's compiled-stage seed built from a phone run's "stage miss:" lines.
+# Its cache names are the phone's only when its compiler build is the phone's: CACHE_BUILD= the build of the run's
+# "stage cache:" line, compiled in as HAKIOS_METAL_CACHE_BUILD (a stamp file rebuilds the tool when it changes), and
+# the compiler in (MESA=1, the host Mesa build-native). `make print-cache-build MESA=1`: this tree's iOS value.
+.PHONY: print-cache-build FORCE
+out/host/hm-seed.build: FORCE
+	@mkdir -p $(dir $@)
+	@printf '%s\n' '$(CACHE_BUILD)' | cmp -s - $@ || printf '%s\n' '$(CACHE_BUILD)' > $@
+out/host/hm-seed: tools/hm-seed.cpp tools/hm_seed.hpp out/host/hm-seed.build $(HOST) $(wildcard include/hakios-metal/*.hpp)
+	@test -n "$(strip $(MESA))" || { echo "hm-seed: MESA=1 (and MESA_BUILD=) needed: without the compiler there is nothing to seed" >&2; exit 1; }
+	@printf '%s' '$(CACHE_BUILD)' | grep -Eqx '[0-9A-Za-z._:-]+' || { echo "hm-seed: CACHE_BUILD= the phone's \"stage cache:\" build (letters, digits, ._:-)" >&2; exit 1; }
+	$(CXX) $(CXXFLAGS) -DHAKIOS_METAL_CACHE_BUILD='"$(CACHE_BUILD)"' -pthread -o $@ tools/hm-seed.cpp $(HOST) $(HOSTLIBS)
+print-cache-build:
+	@echo '$(IOS_CACHE_BUILD)'
 
 # (with the compiler in, compiler_test compiles every tools/kernels/*.ll against its fixture: their bitcode must be there)
 test: $(HOSTOUT)/tests $(if $(strip $(MESA)),$(KERNEL_BC))

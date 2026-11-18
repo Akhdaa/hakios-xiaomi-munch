@@ -101,7 +101,15 @@ SET_BY = {
 
 def tracked(root):
     out = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True).stdout
-    return [p.decode() for p in out.split(b"\0") if p]
+    files = [p.decode() for p in out.split(b"\0") if p]
+    # ... and the drivers of the SoC and device repositories checked out here (socs/*/drivers/, devices/*/drivers/, their
+    # SoC layers): repositories of their own, which this one ignores, whose drivers read arguments all the same
+    for top in ("socs", "devices"):
+        for dirpath, _, names in os.walk(os.path.join(root, top)):
+            rel = os.path.relpath(dirpath, root)
+            if "/drivers" in "/" + rel.replace(os.sep, "/"):
+                files += [os.path.join(rel, n).replace(os.sep, "/") for n in sorted(names)]
+    return files
 
 
 def scan(root, keep=None):
@@ -122,7 +130,7 @@ def scan(root, keep=None):
             text = "\n".join(l[1:] for l in text.splitlines() if l.startswith("+") and not l.startswith("+++"))
             base = "(patch)"
         # the kernel's side: where the drivers are kept (xnu/files/ until they moved to drivers/<subsystem>/) and the Linux layer
-        if f.startswith(("xnu/", "drivers/", "wifi/lx/src/")):
+        if f.startswith(("xnu/", "drivers/", "wifi/lx/src/")) or ("/drivers/" in f and f.startswith(("socs/", "devices/"))):
             for m in KERNEL.finditer(text):
                 found[m.group(1)]["kernel"].add(base)
             for m in STRING.finditer(text):

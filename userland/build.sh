@@ -488,6 +488,23 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
 	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
+# ... or a QCA6390's on PCIe (the POCO F4's, devices/munch/drivers/wifi): /vendor/firmware_mnt/image/qca6390 and
+# /vendor/firmware/wlan of its Android in ../fw-wifi -- the firmware MHI starts (4.3 MB), then what ath11k sends it: M3's,
+# the regulatory database, the board data (bd_l11rgl.elf: a GLOBAL phone's, ro.boot.hwc)
+if [ -f ../fw-wifi/amss20.bin ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-wifi/amss20.bin root/fw/
+	for f in m3.bin regdb.bin bdwlan.elf bd_l11rgl.elf; do
+		[ -f ../fw-wifi/$f ] && install -m 0644 ../fw-wifi/$f root/fw/
+	done
+	rm -f root/fw/network
+	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
+fi
+# The POCO F4's QCA6390 Bluetooth firmware and generic board configuration.
+if [ -f ../fw-bluetooth/htbtfw20.tlv ] && [ -f ../fw-bluetooth/htnv20.bin ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-bluetooth/htbtfw20.tlv ../fw-bluetooth/htnv20.bin root/fw/
+fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (drivers/haptic/hakios.haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
 if [ -f ../fw-haptic/aw8697_haptic.bin ]; then
@@ -498,10 +515,16 @@ fi
 # the sensors' module files of Android's camera stack, the phone's /vendor/lib64/camera/com.qti.sensormodule.
 # hakios_<maker>_<sensor>_<camera>.bin, in ../fw-camera (the vendor's: neither they nor the tables are in the
 # repository): camera-<sensor>.tab
-for module in ../fw-camera/com.qti.sensormodule.hakios_*.bin; do
+# Munch wide and front use their own table names. The other sensors keep their existing names.
+# The current Munch stream code uses the Sunny wide and front modules when both makers are present.
+for module in ../fw-camera/com.qti.sensormodule.hakios_*.bin ../fw-camera/com.qti.sensormodule.munch_*.bin; do
 	[ -f "$module" ] || continue
-	sensor=$(basename "$module" .bin | sed 's/^com\.qti\.sensormodule\.hakios_[a-z]*_\([a-z0-9]*\)_.*/\1/')
+	sensor=$(basename "$module" .bin | sed 's/^com\.qti\.sensormodule\.[a-z]*_[a-z]*_\([a-z0-9]*\)_.*/\1/')
 	mkdir -p root/fw
+	case "${module##*/}" in
+		com.qti.sensormodule.munch_sunny_ov64b40_wide.bin|com.qti.sensormodule.munch_sunny_imx596_front.bin)
+			../tools/camsensor.py "$module" "root/fw/camera-munch-$sensor.tab" >/dev/null ;;
+	esac
 	../tools/camsensor.py "$module" "root/fw/camera-$sensor.tab" >/dev/null
 done
 # ... and their colour tuning (libhakios.media's processor, src/camera_isp.c), made by tools/camtuning.py out of the
@@ -518,6 +541,8 @@ done
 if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
+	# (the POCO F4's amplifiers' configuration, /vendor/firmware/tfa98xx.cnt: devices/munch/drivers/audio/hakios.munch_amp.c)
+	[ -f ../fw-audio/tfa98xx.cnt ] && install -m 0644 ../fw-audio/tfa98xx.cnt root/fw/
 fi
 # Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
 # device log -- "adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin" cost a phone
@@ -696,11 +721,22 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 			rm -rf sysroot/fw/image && cp -R ../fw-modem/image sysroot/fw/image
 		fi
 	fi
+	# the POCO F4's external modem, a Snapdragon X55 (devices/munch/drivers/modem/hakios.munch_modem.c): the images its boot
+	# loader asks for over MHI, the ROM's own from ../fw-modem/sdx55m (devices/munch/pull-firmware.sh; never in the repository)
+	if [ -d ../fw-modem/sdx55m ]; then
+		mkdir -p sysroot/fw/sdx55m
+		cp ../fw-modem/sdx55m/* sysroot/fw/sdx55m/
+	fi
 	# ... and the speaker amplifiers' configuration, the phone's /vendor/etc/aw882xx_acf.bin (drivers/audio/hakios.speaker.c,
 	# for sound=3): Android's own register values, which are not in the repository either
 	if [ -f ../fw-audio/aw882xx_acf.bin ]; then
 		mkdir -p sysroot/fw
 		cp ../fw-audio/aw882xx_acf.bin sysroot/fw/
+	fi
+	# ... or the POCO F4's TFA9874s' (devices/munch/drivers/audio/hakios.munch_amp.c): its /vendor/firmware/tfa98xx.cnt
+	if [ -f ../fw-audio/tfa98xx.cnt ]; then
+		mkdir -p sysroot/fw
+		cp ../fw-audio/tfa98xx.cnt sysroot/fw/
 	fi
 	# the package manager's prefix, when tools/mk-jb.sh has fetched one: the Procursus bootstrap with
 	# Sileo in it, as /jb. It cannot live at /var/jb in the image -- /private/var is a memory

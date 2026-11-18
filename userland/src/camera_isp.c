@@ -218,9 +218,11 @@ bool
 isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *s, struct hakios_camera_command *c)
 {
 	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
-	double target = 0.15 * WHITE, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
+	double target = 0.15 * WHITE * exp2(isp->exposure_bias), mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
 	double bright = s->bright * isp->digital;
 	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
+	double gain_limit = (double)f->gain_max / f->gain_unity;
+	double short_gain = fmin(16, gain_limit);
 	uint32_t lines, gain, frame_lines = 0;
 	double digital = 1;
 
@@ -240,19 +242,19 @@ isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_st
 	if (want <= fast) {
 		lines = want < 4 ? 4 : (uint32_t)want;
 		gain = f->gain_unity;
-	} else if (want <= (double)fast * 16) {
+	} else if (want <= fast * short_gain) {
 		lines = fast;
 		gain = (uint32_t)(want / fast * f->gain_unity);
 	} else {
-		lines = (uint32_t)(want / 16);
+		lines = (uint32_t)(want / short_gain);
 		lines = lines > longest - f->margin ? longest - f->margin : lines < fast ? fast : lines;
 		frame_lines = lines + f->margin;
 		double g = want / lines;
 
-		if (g > (double)f->gain_max / f->gain_unity) {
-			digital = g / ((double)f->gain_max / f->gain_unity);
+		if (g > gain_limit) {
+			digital = g / gain_limit;
 			digital = digital > 4 ? 4 : digital;
-			g = (double)f->gain_max / f->gain_unity;
+			g = gain_limit;
 		}
 		gain = (uint32_t)(g * f->gain_unity);
 	}

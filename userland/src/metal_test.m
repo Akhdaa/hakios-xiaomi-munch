@@ -561,7 +561,7 @@ coreimage(void)
  * fill, commit, and the bytes checked when it is done. With hakios-metal and gpu=1 the GPU's command processor does the
  * work (HakiosMetal.m, hakios-metal's CP_MEMCPY and CP_MEM_WRITE); without, the queue makes no command buffers and this says so.
  */
-static void
+static int
 blits(void)
 {
 	id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -569,8 +569,9 @@ blits(void)
 
 	if (device == nil) {
 		printf("metal_test:   no device\n");
-		return;
+		return 1;
 	}
+	printf("metal_test:   MTLCreateSystemDefaultDevice() = \"%s\", class %s\n", device.name.UTF8String, object_getClassName(device));
 	id<MTLCommandQueue> queue = [device newCommandQueue];
 	id<MTLBuffer> a = [device newBufferWithLength:n options:MTLResourceStorageModeShared];
 	id<MTLBuffer> b = [device newBufferWithLength:n options:MTLResourceStorageModeShared];
@@ -580,7 +581,7 @@ blits(void)
 	    (unsigned long long)a.gpuAddress, (unsigned long long)b.gpuAddress, cb ? object_getClassName(cb) : "nil");
 	if (queue == nil || a == nil || b == nil || cb == nil) {
 		printf("metal_test:   no blits: the device has no GPU queue (gpu=1, and the plug-in built with hakios-metal)\n");
-		return;
+		return 1;
 	}
 	uint32_t *pa = a.contents;
 	for (NSUInteger i = 0; i < n / 4; i++) {
@@ -606,7 +607,9 @@ blits(void)
 	    cb.error ? [[NSString stringWithFormat:@" (%@)", cb.error.localizedDescription] UTF8String] : "",
 	    handled == 1 ? "ran" : handled ? "saw an error" : "DID NOT RUN", same ? "ok" : "WRONG", filled ? "ok" : "WRONG",
 	    edges ? "untouched" : "CHANGED", (unsigned long long)((t1 - t0) / 1000));
-	printf("metal_test:   blits %s\n", cb.status == MTLCommandBufferStatusCompleted && handled == 1 && same && filled && edges ? "WORK" : "FAILED");
+	int passed = cb.status == MTLCommandBufferStatusCompleted && handled == 1 && same && filled && edges;
+	printf("metal_test:   blits %s\n", passed ? "WORK" : "FAILED");
+	return passed ? 0 : 1;
 }
 
 int
@@ -643,7 +646,7 @@ main(int argc, char **argv)
 		} else if (strcmp(argv[1], "objects") == 0) {
 			device_objects();
 		} else if (strcmp(argv[1], "blits") == 0) {
-			blits();
+			return blits();
 		} else {
 			printf("metal_test: no such question: %s\n", argv[1]);
 			return 2;

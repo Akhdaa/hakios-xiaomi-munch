@@ -51,7 +51,7 @@ APFS_WRITE_PATH	arg	apfs_write_path	Storage and APFS	k	hakios.apfs_check.c	the f
 APPLOG	arg	applog	CPU, memory and boot	k	(patch)	
 APPLOG_NAME	arg	applog_name	CPU, memory and boot	k	(patch)	
 AUTOUNLOCK	arg	autounlock	User space	u	inject_sb.c	
-BATTERY	arg	battery	Audio and battery	kl	hakios.adsp.c,hakios.battery.c,loader.c	
+BATTERY	arg	battery	Audio and battery	kl	hakios.adsp.c,hakios.battery.c,hakios.munch_battery.c,loader.c	
 BATTMGR	arg	battmgr	Audio and battery	k	hakios.adsp.c	every property once, for the log (which number is which on this phone's firmware)
 BT	arg	bt	User space	k	hakios.bt.c	
 BT_AGAIN	arg	bt_again	User space	k	hakios.bt.c	the second look this many seconds later (0: no second look; 30)
@@ -74,22 +74,32 @@ CAM_SETTLE	arg	cam_settle	Cameras	k	hakios.camera.c
 CAM_SHUTTER	arg	cam_shutter	Cameras	k	hakios.camera.c	
 CAM_VBLANK	arg	cam_vblank	Cameras	k	hakios.camera.c	
 CC_FADE	arg	cc_fade	User space	u	inject_sb.c	
+CPUFREQ_PRIME_MHZ	arg	cpufreq_prime_mhz	CPU, memory and boot	k	hakios.cpufreq.c	
+CPUGOV	arg	cpugov	CPU, memory and boot	k	hakios.cpufreq.c	
 CPULOAD	arg	cpuload	CPU, memory and boot	k	hakios.cpufreq.c	every MS milliseconds, how busy each of our cores was meanwhile, in percent, to the loader's log (tools/frames.py shows it per gesture)
 CPUMASK	arg	cpumask	Loader	l	loader.c	
 DDR	arg	ddr	CPU, memory and boot	k	hakios.cpufreq.c	the memory's bus clock managers ("BCM") in the command database the boot loader left, with what is needed to vote for bandwidth on them -- only read
 DDR_REST	arg	ddr_rest	CPU, memory and boot	k	hakios.cpufreq.c	
 DDR_VOTE	arg	ddr_vote	CPU, memory and boot	k	hakios.cpufreq.c	
 DISPLAY_PROBE	arg	display_probe	GPU and display	k	hakios.adreno.c	before any step: read what the firmware left the display controller doing (display_probe() below; two clocks are turned on, nothing else written)
+FB_BACKLIGHT	arg	fb_backlight	GPU and display	ku	MiniIOMobileFramebuffer.cpp,inject_sb.c	publish the brightness service. On munch, the backboardd injection must check in the EDR server for this configuration.
 FB_BEAM	arg	fb_beam	GPU and display	k	MiniIOMobileFramebuffer.cpp	frames written to the panel's memory whenever their beat comes, as before
 FB_BEAT	arg	fb_beat	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_CA_HZ	arg	fb_ca_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp	the refresh rate told to CoreAnimation (IOMFBDisplayRefresh) when it is not to be fb_hz's
+FB_CORNER	arg	fb_corner	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_DIFF	arg	fb_diff	GPU and display	k	MiniIOMobileFramebuffer.cpp	which pixels of the panel each frame changed (it costs: the panel's memory is slow to read)
 FB_FILTER	arg	fb_filter	GPU and display	k	MiniIOMobileFramebuffer.cpp	the picture is scaled to the panel nearest neighbour, as it once was
+FB_HOLE	arg	fb_hole	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+FB_HOLE_X	arg	fb_hole_x	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+FB_HOLE_Y	arg	fb_hole_y	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_HZ	arg	fb_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_INTF	arg	fb_intf	GPU and display	k	MiniIOMobileFramebuffer.cpp	the registers of the display interface the panel is on, for a port
 FB_MEASURE	arg	fb_measure	GPU and display	k	MiniIOMobileFramebuffer.cpp	how often the panel is really refreshed
 FB_PRI	arg	fb_pri	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_QUEUE	arg	fb_queue	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+FB_SCAN	arg	fb_scan	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+FB_SLEEP	arg	fb_sleep	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+FB_STATS	arg	fb_stats	GPU and display	k	MiniIOMobileFramebuffer.cpp,hakios.adreno.c	the pacing of the panel, every five seconds in which frames came, as a scanSay line ("fb: ...")
 FB_THREADS	arg	fb_threads	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FBHEIGHT	arg	fbheight	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FBSCALE	arg	fbscale	GPU and display	k	MiniIOMobileFramebuffer.cpp	the same 375 x 812 points drawn at two pixels a point instead of three
@@ -133,16 +143,23 @@ GLTRACE_SHADERS	arg	gltrace_shaders	GPU and display	u	eagl.c	the text of the sha
 GLTRACE_UNIFORMS	arg	gltrace_uniforms	GPU and display	u	eagl.c	what the program of a traced draw was given, by the names its shaders use (coord_arg, texmat0, ...)
 GLWAIT	arg	glwait	GPU and display	u	eagl.c	
 GLYES	arg	glyes	User space	u	inject.c	the renderer is made to answer that it has those functions after all
+GPU_ANIM_FLOOR	arg	gpu_anim_floor	GPU and display	k	hakios.adreno.c	the lowest speed of the 3D core while the UI animates, munch only (0, the default: none)
 GPU_CACHED	arg	gpu_cached	GPU and display	k	hakios.gpu.cpp	
+GPU_DCVS	arg	gpu_dcvs	GPU and display	k	hakios.adreno.c	
 GPU_EXACT	arg	gpu_exact	GPU and display	k	hakios.adreno.c	
 GPU_KEEP	arg	gpu_keep	GPU and display	k	hakios.gpu.cpp	
 GPU_LOG	arg	gpu_log	GPU and display	k	hakios.adreno.c	
+GPU_PUSH_MS	arg	gpu_push_ms	GPU and display	k	hakios.gpu.cpp	how long after a surface was last pushed out of the cache a submission that names it, its seed unchanged, does without pushing it again (4)
 HAPTIC_EFFECT	arg	haptic_effect	Haptics and torch	k	hakios.haptic.c	
+HW	arg	hw	User space	u	inject_sb.c	
 M2V_UTRACE	arg	m2v_utrace	User space	u	HakiosMetalCA.m	Turnip's GPU trace of every render pass (u_trace) into a file, printed during the run
 MACHINE_NAME	arg	machine_name	CPU, memory and boot	k	GenericARMPE.cpp	
 MEMBENCH	arg	membench	CPU, memory and boot	k	hakios.cpufreq.c	
 METAL	arg	metal	GPU and display	ku	HakiosMetal.m,MiniIOMobileFramebuffer.cpp,inject_sb.c	only the program metal_test (userland/src/metal_test.m): the safe level, for seeing what Metal does with the device
 METAL_ALL	arg	metal_all	User space	u	HakiosMetalCA.m	
+METAL_BLIT	arg	metal_blit	User space	u	HakiosMetalCA.m	
+METAL_CACHE	arg	metal_cache	User space	u	HakiosMetalCA.m	
+METAL_DAMAGE	arg	metal_damage	User space	u	HakiosMetalCA.m	every commit copy of a surface target whole (the stalefix run's), not only its damage
 METAL_DEFER	arg	metal_defer	User space	u	HakiosMetalCA.m	this queue's command buffers recorded by a thread of hakios-metal's own (deferred recording), so that the window server's render thread does not wait
 METAL_DUMP	arg	metal_dump	User space	u	HakiosMetalCA.m	
 METAL_FPS	arg	metal_fps	User space	u	HakiosMetalCA.m	each draw of a sysmem pass timed alone, by program (only sysmem passes are: without metal_gmem=1)
@@ -199,9 +216,34 @@ MODEM_SIM_SWITCH_OFF	arg	modem_sim_switch_off	Cellular	k	hakios.mpss.c
 MODEM_STEP	arg	modem_step	Cellular	k	hakios.mpss.c	the steps once the root is there, then back to the loader if modem_return=1 says so
 MODEM_WAIT	arg	modem_wait	Cellular	k	hakios.mpss.c	
 MODEM_WDA_OFF	arg	modem_wda_off	Cellular	k	hakios.mpss.c	
+MUNCH_BT	arg	munch_bt	User space	k	hakios.munch_bt.c	
+MUNCH_CAM	arg	munch_cam	User space	k	hakios.munch_camera.c	read IDs from the three Camera.app sensors
+MUNCH_MODEM	arg	munch_modem	User space	k	hakios.munch_modem.c	
+MUNCH_MODEM_AP2MDM	arg	munch_modem_ap2mdm	User space	k	hakios.munch_modem.c	left as they are.
+MUNCH_MODEM_IOVA	arg	munch_modem_iova	User space	k	hakios.munch_modem.c	
+MUNCH_MODEM_KEEP	arg	munch_modem_keep	User space	k	hakios.munch_modem.c	
+MUNCH_MODEM_PHYS	arg	munch_modem_phys	User space	k	hakios.munch_modem.c	the boot ROM is given the copy's physical address instead of the one our SMMU context shows it at
+MUNCH_MODEM_SOCRESET	arg	munch_modem_socreset	User space	k	hakios.munch_modem.c	a fresh boot ROM first. Android warm-resets the X55 through its PMIC's power-on block before the boot loader goes over BHI; that block's channel at
+MUNCH_MODEM_TBU	arg	munch_modem_tbu	User space	k	hakios.munch_modem.c	
+MUNCH_TORCH	arg	munch_torch	Loader	kl	hakios.munch_torch.c,loader.c	a look: the module's type, subtype and status, its channel at the arbiter and whether it is ours
+MUNCH_TORCH_MA	arg	munch_torch_ma	User space	k	hakios.munch_torch.c	
+MUNCH_TORCH_SECS	arg	munch_torch_secs	User space	k	hakios.munch_torch.c	
+PANEL	arg	panel	User space	k	hakios.munch_panel.c	a look: the bus clocks and the DSI host's registers, nothing written
+PANEL_HS	arg	panel_hs	User space	k	hakios.munch_panel.c	
+PANEL_LEVEL	arg	panel_level	User space	k	hakios.munch_panel.c	
+PCIE_HOLD	arg	pcie_hold	User space	k	hakios.munch_pcie.c	
+PCIE_MHI_WAIT	arg	pcie_mhi_wait	User space	k	hakios.munch_mhi.c	
+PCIE_PROBE	arg	pcie_probe	User space	k	hakios.munch_pcie.c	
+PCIE_QRTR_WAIT	arg	pcie_qrtr_wait	User space	k	hakios.munch_mhi.c	
+PCIE_RDDM	arg	pcie_rddm	User space	k	hakios.munch_mhi.c	
+PCIE_SID	arg	pcie_sid	Wi-Fi	k	hakios.munch_mhi.c,hakios.wifi.c	
+PCIE_SID_MASK	arg	pcie_sid_mask	Wi-Fi	k	hakios.munch_mhi.c,hakios.wifi.c	
+PCIE_SLOW	arg	pcie_slow	User space	k	hakios.munch_pcie.c	
+PCIE_WAIT	arg	pcie_wait	User space	k	hakios.munch_pcie.c	
 PMIC_LIST	arg	pmic_list	Chip, thermal and PMIC	k	hakios.pmic.c	only the clock, not the inventory of every block
 PRESS_POWER	arg	press_power	Touch and buttons	k	hakios.buttons.c	a short press of the power key that many seconds after boot, and another ten seconds later, given to Darwin as the key's own are (hakios_touch_post):
 PRESS_POWER_MS	arg	press_power_ms	Touch and buttons	k	hakios.buttons.c	
+PRESS_POWER_N	arg	press_power_n	Touch and buttons	k	hakios.buttons.c	
 PRIVS	arg	privs	Security stand-ins	k	kern_minimac.c	
 RD	arg	rd	CPU, memory and boot	kl	(patch),loader.c	
 REC_MB	arg	rec_mb	GPU and display	k	MiniIOMobileFramebuffer.cpp	
@@ -232,11 +274,14 @@ SOC_PAS_MPSS	arg	soc_pas_mpss	Cellular	k	hakios.mpss.c
 SOC_SMEM	hex	soc_smem	Cellular	k	hakios.mpss.c,hakios.socinfo.c	where SMEM is (also the modem driver's argument; 0x80900000 on the reference phone)
 SOC_SMEM_SIZE	hex	soc_smem_size	Chip, thermal and PMIC	k	hakios.socinfo.c	
 SOUND_BELOW	arg	sound_below	Audio and battery	k	hakios.sound.c	
+SOUND_BITS	arg	sound_bits	Audio and battery	k	hakios.sound.c	
+SOUND_DUMP	arg	sound_dump	User space	k	hakios.munch_amp.c	
 SOUND_GAIN	arg	sound_gain	Audio and battery	k	hakios.sound.c	
 SOUND_GUARD_AS	arg	sound_guard_as	Audio and battery	k	hakios.sound.c	
 SOUND_PAUSE	arg	sound_pause	Audio and battery	k	hakios.sound.c	
+SOUND_RATE	arg	sound_rate	Audio and battery	k	hakios.sound.c	
 SOUND_SECS	arg	sound_secs	Audio and battery	k	hakios.sound.c	
-SPEAKER_PROBE	arg	speaker_probe	Audio and battery	k	hakios.speaker.c	reads registers and nothing else: the pins, the power names (below)
+SPEAKER_PROBE	arg	speaker_probe	Audio and battery	k	hakios.munch_speaker.c,hakios.speaker.c	reads the pins and nothing else
 SURF_CLEAR	arg	surf_clear	GPU and display	k	MiniIOSurface.cpp	kept memory is given out as it is (to see what the clearing costs; a surface is then not all zeroes)
 SURF_WRAP	arg	surf_wrap	GPU and display	k	MiniIOSurface.cpp	surfaces around the client's pictures refused, as before methodWrapClientImage (for comparing)
 SURFTRACE	arg	surftrace	GPU and display	k	MiniIOSurface.cpp	log the first N surfaces created (default 24)
@@ -246,16 +291,15 @@ SYSSLEEP	arg	syssleep	CPU, memory and boot	k	(patch)
 SYSTRACE	arg	systrace	CPU, memory and boot	k	(patch),user_exception_trace.c	
 SYSTRACE_NAME	arg	systrace_name	CPU, memory and boot	k	(patch)	
 THERMAL_LOG	arg	thermal_log	Chip, thermal and PMIC	k	hakios.thermal.c	a summary line this often (0: only on a rise; 60)
-THERMAL_TM0	arg	thermal_tm0	Chip, thermal and PMIC	k	hakios.thermal.c	
-THERMAL_TM1	arg	thermal_tm1	Chip, thermal and PMIC	k	hakios.thermal.c	
+THERMAL_SLOW	arg	thermal_slow	Chip, thermal and PMIC	k	hakios.thermal.c	slow the prime core from this temperature (0: never; 90)
 TORCH	arg	torch	Haptics and torch	kl	hakios.torch.c,loader.c	a look, reading only: the arbiter's channel for the module and who may write through it, the module's type, its registers, the PMIC's temperature
 TORCH_MAX_S	arg	torch_max_s	Haptics and torch	k	hakios.torch.c	
 TORCH_SECS	arg	torch_secs	Haptics and torch	k	hakios.torch.c	
-TOUCH_FLIP	arg	touch_flip	Touch and buttons	k	hakios.goodix.c	
+TOUCH_FLIP	arg	touch_flip	Touch and buttons	k	hakios.goodix.c,hakios.munch_touch.c	
 TOUCH_LAT	arg	touch_lat	GPU and display	ku	HakiosMetalCA.m,MiniIOMobileFramebuffer.cpp,eagl.c,hakios.goodix.c,hakios.gpu.cpp,hakios.input.c,inject.c,inject_sb.c	a line for every wait of a program's for the GPU that took a millisecond or more ("tl: f KIND US at US"), for telling apart what holds a frame up
-TOUCH_POLL_US	arg	touch_poll_us	Touch and buttons	k	hakios.goodix.c	
+TOUCH_POLL_US	arg	touch_poll_us	Touch and buttons	k	hakios.goodix.c,hakios.munch_touch.c	
 TOUCH_RATE	arg	touch_rate	Touch and buttons	k	hakios.goodix.c	the chip reports twice as often (Xiaomi's game mode; 240 otherwise)
-TOUCH_SPI_HZ	arg	touch_spi_hz	Touch and buttons	k	hakios.goodix.c	the bus at N Hz (Android's device tree gives the chip 5 MHz)
+TOUCH_SPI_HZ	arg	touch_spi_hz	Touch and buttons	k	hakios.goodix.c,hakios.munch_touch.c	the bus at N Hz (Android's device tree gives the chip 5 MHz)
 TU_DEBUG	arg	tu_debug	User space	u	HakiosMetalCA.m	Turnip's TU_DEBUG in the window server (sysmem, gmem, forcebin, ...)
 UFS_BENCH	arg	ufs_bench	Storage and APFS	k	hakios.ufs.c	what one request through the loader costs, by size
 UFS_CHECK	arg	ufs_check	Storage and APFS	k	hakios.ufs.c	

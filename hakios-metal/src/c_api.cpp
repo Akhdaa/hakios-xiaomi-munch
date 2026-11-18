@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -13,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -33,6 +36,38 @@ thread_local std::string lastError;
 const char* failed(const std::string& why) {
     lastError = why;
     return nullptr;
+}
+
+// hakios_metal_set_stage_observer's (metal-ca-perf's record of every stage request)
+std::atomic<void (*)(const hakios_metal_stage_event*, void*)> gStageObserver{nullptr};
+std::atomic<void*> gStageContext{nullptr};
+
+void noteStage(unsigned stage, const CompiledStage* s, const void* bitcode, size_t size, const hakios_metal_constant* constants, unsigned count,
+               uint32_t iboBase, const KnownBuffer* known) {
+    void (*observer)(const hakios_metal_stage_event*, void*) = gStageObserver.load();
+    if (observer == nullptr) return;
+    hakios_metal_stage_event e{};
+    e.stage = stage;
+    e.bitcode = bitcode;
+    e.size = size;
+    e.constants = constants;
+    e.constant_count = constants != nullptr ? count : 0;
+    e.ibo_base = iboBase;
+    if (known != nullptr) {
+        e.known_binding = known->binding;
+        e.known = known->bytes.data();
+        e.known_length = known->bytes.size();
+    }
+    e.cache_name = "";
+    if (s != nullptr) {
+        e.compiled = 1;
+        e.source = s->cacheSource;
+        e.digest = s->digest;
+        e.microseconds = s->compileUs;
+        e.words = uint32_t(s->words.size());
+        e.cache_name = s->cacheName.c_str();
+    }
+    observer(&e, gStageContext.load());
 }
 }  // namespace
 
@@ -103,8 +138,27 @@ private:
 thread_local bool Deferrer::worker_ = false;
 }  // namespace
 
+// The surface targets of a device (metal-ca-stale-frame): one driver-owned texture per IOSurface ID that CoreAnimation
+// draws into in place of the surface's pages, shared by every texture object over that surface and freed with the
+// last of them (HmSurfaceTarget's destructor), copied whole into the surface at each commit that wrote it
+// (hakios_metal_cb_resolve_surface_targets). The lock is recursive: the last reference to a target may be let go of
+// by a call that holds it.
+struct HmSurfaceTarget;
+struct HmSurfaceTargets {
+    std::recursive_mutex lock;
+    std::map<unsigned, std::weak_ptr<HmSurfaceTarget>> bySurface;
+    std::map<const Bo*, std::weak_ptr<HmSurfaceTarget>> byBo;   // the target's memory, as a command buffer names it
+    uint64_t bytes = 0;                                         // the live targets' memory, against the budget
+    unsigned live = 0;
+    unsigned made = 0, filled = 0, copies = 0, overBudget = 0;  // since the last hakios_metal_surface_target_stats
+    bool saidOverBudget = false;
+    bool damage = true;   // hakios_metal_surface_target_set_damage's: copy only the damage (false: whole, metal_damage=0)
+};
+
 struct hakios_metal_device {
     std::unique_ptr<Gpu> gpu;
+    std::shared_ptr<HmSurfaceTargets> targets = std::make_shared<HmSurfaceTargets>();
+    std::unique_ptr<CommandQueue> fillQueue;   // the device's own queue for the targets' first fill (destroyed before gpu)
 };
 struct hakios_metal_buffer {
     std::shared_ptr<Buffer> buffer;
@@ -119,6 +173,7 @@ struct hakios_metal_kernel {
 struct hakios_metal_queue {
     std::unique_ptr<CommandQueue> queue;
     std::shared_ptr<Deferrer> deferrer;   // hakios_metal_queue_set_deferred's; destroyed first (its thread drains)
+    std::shared_ptr<HmSurfaceTargets> targets;   // its device's
     ~hakios_metal_queue() { deferrer.reset(); }
 };
 struct hakios_metal_cb {
@@ -133,9 +188,39 @@ struct hakios_metal_cb {
     uint64_t indirectOffset = 0;
     std::shared_ptr<Deferrer> deferrer;   // the queue's, when it records deferred
     std::atomic<int> pending{0};          // jobs posted for this buffer and not yet done
+    std::shared_ptr<HmSurfaceTargets> targets;   // its queue's device's surface targets
+    size_t resolvedUses = 0;              // CommandBuffer::uses() already looked at by hakios_metal_cb_resolve_surface_targets
+    // metal-ca-perf's measurement (hakios_metal_cb_damage_stats): what the last resolve found written into the targets
+    // it copied (CommandBuffer::damageOf, aligned), whether the copies were the damage or whole
+    unsigned damageCopies = 0, damageSmallest = 0, damageLargest = 0;
+    uint64_t damageTargetPixels = 0, damagePixels = 0;
 };
 struct hakios_metal_texture {
     std::shared_ptr<Texture> texture;   // its Buffer is kept by every command buffer that dispatched over it
+    std::shared_ptr<HmSurfaceTarget> target;   // a texture over a surface target: the target it holds (nullptr for any other)
+};
+// One surface target: TARGET drawn in place of SURFACE (the texture over the surface's own pages), FILL the copy
+// surface -> target made when it was, SURFACE_HANDLE what hakios_metal_texture_surface_of answers.
+struct HmSurfaceTarget {
+    std::weak_ptr<HmSurfaceTargets> owner;
+    unsigned surfaceId = 0;
+    std::shared_ptr<Texture> target, surface;
+    const Bo* bo = nullptr;
+    uint64_t bytes = 0;
+    std::shared_ptr<CommandBuffer> fill;
+    hakios_metal_texture surfaceHandle;
+    bool wholeNext = false;   // (under the owner's lock) hakios_metal_surface_target_mark_whole's: the next copy whole
+    ~HmSurfaceTarget() {
+        std::shared_ptr<HmSurfaceTargets> o = owner.lock();
+        if (o == nullptr) return;
+        std::lock_guard<std::recursive_mutex> g(o->lock);
+        auto a = o->bySurface.find(surfaceId);
+        if (a != o->bySurface.end() && a->second.expired()) o->bySurface.erase(a);
+        auto b = o->byBo.find(bo);
+        if (b != o->byBo.end() && b->second.expired()) o->byBo.erase(b);
+        o->bytes -= std::min(o->bytes, bytes);
+        if (o->live > 0) o->live--;
+    }
 };
 struct hakios_metal_sampler {
     Sampler sampler;                    // four words, copied into each dispatch's table: nothing of it stays on the GPU
@@ -215,7 +300,6 @@ const char* hakios_metal_error(void) { return lastError.c_str(); }
 // Tiles, GMEM offsets and the shader compiler are built for one chip (a6xx.hpp). A kernel that does not say (0) is taken at its
 // word that it is that one: only a chip it names as another is refused, so that the window server stays on OpenGL ES there.
 bool hakios_metal_chip_known(uint32_t chip) { return chip == 0 || chip == a6xx::kChipId; }
-static bool chipKnown(uint32_t chip) { return hakios_metal_chip_known(chip); }
 
 static hakios_metal_device* deviceOn(std::unique_ptr<Transport> t) {
     auto* d = new hakios_metal_device;
@@ -223,7 +307,7 @@ static hakios_metal_device* deviceOn(std::unique_ptr<Transport> t) {
     return d;
 }
 
-hakios_metal_device* hakios_metal_open(void) {
+static hakios_metal_device* openDevice(bool a650BlitProbe) {
 #ifdef __APPLE__
 #if TARGET_OS_IPHONE || defined(HAKIOS_METAL_IOKIT)
     std::string why;
@@ -233,10 +317,11 @@ hakios_metal_device* hakios_metal_open(void) {
         return nullptr;
     }
     hakios_metal_device* d = deviceOn(std::move(t));
-    if (!chipKnown(d->gpu->chipId())) {
+    const uint32_t chipId = d->gpu->chipId();
+    if (a650BlitProbe ? chipId != a6xx::kA650ChipId : !hakios_metal_chip_known(chipId)) {
         char text[160];
-        snprintf(text, sizeof(text), "the GPU's chip ID is %#x: the tables of this driver are the Adreno's of chip ID %#x (a6xx.hpp), another's would hang it",
-                 d->gpu->chipId(), a6xx::kChipId);
+        snprintf(text, sizeof(text), "the GPU's chip ID is %#x, expected %#x",
+                 chipId, a650BlitProbe ? a6xx::kA650ChipId : a6xx::kChipId);
         failed(text);
         delete d;
         return nullptr;
@@ -244,11 +329,113 @@ hakios_metal_device* hakios_metal_open(void) {
     return d;
 #endif
 #endif
+    (void)a650BlitProbe;
     failed("no kernel GPU on this system (the driver talks to hakios's HakiosGPU, on the phone)");
     return nullptr;
 }
 
+hakios_metal_device* hakios_metal_open(void) { return openDevice(false); }
+
+hakios_metal_device* hakios_metal_open_a650_blit_probe(void) { return openDevice(true); }
+
 hakios_metal_device* hakios_metal_open_fake(void) { return deviceOn(std::make_unique<FakeGpu>(true)); }
+
+hakios_metal_device* hakios_metal_open_fake_chip(uint64_t chip) {
+    auto f = std::make_unique<FakeGpu>(true);
+    f->setChipId(chip);
+    return deviceOn(std::move(f));
+}
+
+// the fake under a device, nullptr with the reason for any other
+static FakeGpu* fakeOf(hakios_metal_device* d) {
+    FakeGpu* f = d != nullptr && d->gpu ? dynamic_cast<FakeGpu*>(&d->gpu->transport()) : nullptr;
+    if (f == nullptr) failed("not a device on the fake GPU (hakios_metal_open_fake)");
+    return f;
+}
+
+int hakios_metal_fake_add_surface(hakios_metal_device* d, unsigned id, unsigned width, unsigned height, unsigned rowBytes, uint32_t fourcc) {
+    FakeGpu* f = fakeOf(d);
+    if (f == nullptr) return -1;
+    f->addSurface(id, width, height, rowBytes, fourcc);
+    return 0;
+}
+
+int64_t hakios_metal_fake_surface_bytes(hakios_metal_device* d, unsigned id, void* out, size_t size) {
+    FakeGpu* f = fakeOf(d);
+    if (f == nullptr) return -1;
+    std::vector<uint8_t> b = f->surfaceBytes(id);
+    if (out != nullptr) memcpy(out, b.data(), std::min<size_t>(size, b.size()));
+    return int64_t(b.size());
+}
+
+int hakios_metal_fake_write_surface(hakios_metal_device* d, unsigned id, uint64_t offset, const void* bytes, size_t size) {
+    FakeGpu* f = fakeOf(d);
+    if (f == nullptr) return -1;
+    f->writeSurface(id, offset, bytes, size);
+    return 0;
+}
+
+int hakios_metal_fake_pause(hakios_metal_device* d) {
+    FakeGpu* f = fakeOf(d);
+    if (f == nullptr) return -1;
+    f->pause();
+    return 0;
+}
+
+int hakios_metal_fake_resume(hakios_metal_device* d) {
+    FakeGpu* f = fakeOf(d);
+    if (f == nullptr) return -1;
+    f->resume();
+    return 0;
+}
+
+int hakios_metal_fake_last_submission(hakios_metal_device* d, unsigned* fence, struct hakios_metal_fake_bo* bos, unsigned max) {
+    FakeGpu* f = fakeOf(d);
+    if (f == nullptr) return -1;
+    const FakeGpu::Submission s = f->lastSubmission();
+    if (fence != nullptr) *fence = s.fence;
+    for (unsigned i = 0; bos != nullptr && i < max && i < s.bos.size(); i++) {
+        bos[i].gpu_address = s.bos[i].iova;
+        bos[i].size = s.bos[i].size;
+        bos[i].flags = s.bos[i].flags;
+        bos[i].surface = s.bos[i].surface;
+    }
+    return int(s.bos.size());
+}
+
+int hakios_metal_fake_writes(hakios_metal_device* d, struct hakios_metal_fake_write* out, unsigned max, int clear) {
+    FakeGpu* f = fakeOf(d);
+    if (f == nullptr) return -1;
+    const std::vector<FakeGpu::Write> w = f->writes(clear != 0);
+    for (unsigned i = 0; out != nullptr && i < max && i < w.size(); i++) {
+        out[i].submission = w[i].fence;
+        out[i].fill = w[i].fill ? 1 : 0;
+        out[i].base = w[i].base;
+        out[i].pitch = w[i].pitch;
+        out[i].bytes_per_pixel = w[i].bpp;
+        out[i].x0 = w[i].x0;
+        out[i].y0 = w[i].y0;
+        out[i].x1 = w[i].x1;
+        out[i].y1 = w[i].y1;
+    }
+    return int(w.size());
+}
+
+int64_t hakios_metal_fake_words(hakios_metal_device* d, uint32_t* out, size_t max, int clear) {
+    FakeGpu* f = fakeOf(d);
+    if (f == nullptr) return -1;
+    const std::vector<uint32_t> w = f->executedWords(clear != 0);
+    if (out != nullptr) memcpy(out, w.data(), sizeof(uint32_t) * std::min(max, w.size()));
+    return int64_t(w.size());
+}
+
+int hakios_metal_fake_add_surface_planes(hakios_metal_device* d, unsigned id, unsigned width, unsigned height, unsigned rowBytes, uint32_t fourcc,
+                                         unsigned planes) {
+    FakeGpu* f = fakeOf(d);
+    if (f == nullptr) return -1;
+    f->addSurface(id, width, height, rowBytes, fourcc, 0, planes);
+    return 0;
+}
 
 void hakios_metal_close(hakios_metal_device* d) { delete d; }
 
@@ -592,6 +779,147 @@ hakios_metal_texture* hakios_metal_texture_new_iosurface(hakios_metal_device* d,
     return textureOverSurface(d, surfaceId, plane, pixelFormat, width, height, usage, nullptr);
 }
 
+// The qualifying surface of the design's glossary (metal-ca-stale-frame): the A650, metal_blit on, plane 0 of a surface
+// of one plane, a 4-byte colour format the 2D engine copies texel for texel (BGRA8Unorm 80 and its sRGB 81, RGBA8Unorm 70
+// and its sRGB 71, and BGRA10_XR 552 / BGR10_XR 554 when served at 4 bytes), no rotation, rows the GPU takes as they lie
+// (a multiple of 64 bytes, so not the plug-in's shadow), the descriptor's size the surface's.
+bool hakios_metal_surface_target_wanted(uint64_t chip, int blitOn, unsigned pixelFormat, unsigned width, unsigned height, unsigned surfaceWidth,
+                                        unsigned surfaceHeight, unsigned planes, unsigned plane, unsigned rotation, uint64_t bytesPerRow) {
+    if (chip != a6xx::kA650ChipId || blitOn == 0) return false;
+    bool format = pixelFormat == 80 || pixelFormat == 81 || pixelFormat == 70 || pixelFormat == 71;
+    if (pixelFormat == 552 || pixelFormat == 554) {
+        const FormatInfo* f = formatInfo(PixelFormat(pixelFormat));
+        format = f != nullptr && f->bytesPerPixel == 4 && f->blockW == 1 && !f->depth && !f->twoPlane;
+    }
+    return format && planes == 1 && plane == 0 && rotation == 0 && width != 0 && height != 0 && width == surfaceWidth && height == surfaceHeight &&
+           bytesPerRow != 0 && bytesPerRow % 64 == 0;
+}
+
+namespace {
+constexpr uint64_t kSurfaceTargetBudget = 128ull << 20;   // the memory of all of a device's surface targets
+
+// the fill of a target made but not yet run: waited for before the processor reads or writes the target
+void settleFill(hakios_metal_texture* t) {
+    if (t == nullptr || t->target == nullptr || t->target->fill == nullptr) return;
+    const CommandBuffer::Status s = t->target->fill->status();
+    if (s == CommandBuffer::kCommitted || s == CommandBuffer::kScheduled) t->target->fill->waitUntilCompleted();
+}
+}  // namespace
+
+// The texture CoreAnimation draws a surface through (design: Changes Required, C API 2): the texture over the surface's
+// pages as hakios_metal_texture_new_iosurface makes it; when the surface qualifies and the budget allows, a texture
+// over the surface's target instead -- the one the registry holds for that surface ID, or a new one of the same format
+// and size filled from the surface by a 2D copy on the device's own queue, committed at once (the kernel runs every
+// queue's submissions on one ring, in order, so the fill comes before any later command buffer's use of it).
+hakios_metal_texture* hakios_metal_texture_new_iosurface_target(hakios_metal_device* d, unsigned surfaceId, unsigned pixelFormat, unsigned width,
+                                                                unsigned height, unsigned usage, int blitOn, int* targeted) {
+    if (targeted != nullptr) *targeted = 0;
+    hakios_metal_texture* s = textureOverSurface(d, surfaceId, 0, pixelFormat, width, height, usage, nullptr);
+    if (s == nullptr) return nullptr;
+    const uint64_t chip = d->gpu->chipId();
+    if (chip != a6xx::kA650ChipId || blitOn == 0) return s;   // (nothing more is asked of the kernel off the A650 or with metal_blit=0)
+    SurfaceInfo info;
+    std::string why;
+    if (surfaceBuffer(*d->gpu, surfaceId, &info, &why) == nullptr) return s;
+    if (!hakios_metal_surface_target_wanted(chip, blitOn, pixelFormat, width, height, info.width, info.height, std::max(1u, info.planes), 0, 0,
+                                            s->texture->bytesPerRow()))
+        return s;
+    HmSurfaceTargets& reg = *d->targets;
+    std::lock_guard<std::recursive_mutex> g(reg.lock);
+    std::shared_ptr<HmSurfaceTarget> e;
+    auto live = reg.bySurface.find(surfaceId);
+    if (live != reg.bySurface.end()) e = live->second.lock();
+    if (e != nullptr && (e->target->width() != width || e->target->height() != height)) return s;   // (a surface of another size under the same ID)
+    if (e == nullptr) {
+        TextureDesc desc;
+        desc.type = TextureType::k2D;
+        desc.format = PixelFormat(pixelFormat);
+        desc.width = width;
+        desc.height = height;
+        desc.mipLevels = 1;
+        desc.usage = usage | kTextureUsageRenderTarget | kTextureUsageRead;
+        const FormatInfo* fi = nullptr;
+        uint64_t pitch = 0, planned = 0;
+        if (!Texture::plan(desc, &fi, &pitch, &planned, &why)) return s;
+        if (reg.bytes + planned > kSurfaceTargetBudget) {
+            reg.overBudget++;
+            if (!reg.saidOverBudget) {
+                reg.saidOverBudget = true;
+                std::fprintf(stderr, "HakiosMetal: IOSurface %u (%ux%u) is drawn straight into the surface: the surface targets' %llu MB are in use\n",
+                             surfaceId, width, height, (unsigned long long)(kSurfaceTargetBudget >> 20));
+            }
+            return s;
+        }
+        std::shared_ptr<Texture> t = Texture::make(*d->gpu, desc, &why);
+        if (t == nullptr) return s;
+        if (d->fillQueue == nullptr) d->fillQueue = CommandQueue::make(*d->gpu, &why);
+        if (d->fillQueue == nullptr) return s;
+        std::shared_ptr<CommandBuffer> fill = d->fillQueue->commandBuffer();
+        if (!fill->blit(*s->texture, 0, render::BlitRect{0, 0, width, height}, *t, 0, render::BlitRect{0, 0, width, height}, false)) return s;
+        fill->keepAlive(s->texture);
+        fill->keepAlive(t);
+        fill->commit();
+        e = std::make_shared<HmSurfaceTarget>();
+        e->owner = d->targets;
+        e->surfaceId = surfaceId;
+        e->target = std::move(t);
+        e->surface = s->texture;
+        e->bo = &e->target->buffer()->bo();
+        e->bytes = e->target->buffer()->length();
+        e->fill = std::move(fill);
+        e->surfaceHandle.texture = s->texture;
+        reg.bySurface[surfaceId] = e;
+        reg.byBo[e->bo] = e;
+        reg.bytes += e->bytes;
+        reg.live++;
+        reg.made++;
+        reg.filled++;
+    }
+    std::shared_ptr<Texture> over = e->target;
+    if (e->target->format() != PixelFormat(pixelFormat)) {
+        // another format of the same bytes over the same surface (BGRA8Unorm and its sRGB): a view of the one target
+        over = Texture::view(e->target, PixelFormat(pixelFormat), TextureType::k2D, 0, 1, 0, 1, &why);
+        if (over == nullptr) return s;
+    }
+    auto* r = new hakios_metal_texture;
+    r->texture = std::move(over);
+    r->target = std::move(e);
+    delete s;
+    if (targeted != nullptr) *targeted = 1;
+    return r;
+}
+
+hakios_metal_texture* hakios_metal_texture_surface_of(hakios_metal_texture* t) {
+    return t != nullptr && t->target != nullptr ? &t->target->surfaceHandle : nullptr;
+}
+
+void hakios_metal_surface_target_stats(hakios_metal_device* d, unsigned* live, uint64_t* bytes, unsigned* made, unsigned* filled, unsigned* copies,
+                                       unsigned* overBudget) {
+    HmSurfaceTargets& reg = *d->targets;
+    std::lock_guard<std::recursive_mutex> g(reg.lock);
+    if (live != nullptr) *live = reg.live;
+    if (bytes != nullptr) *bytes = reg.bytes;
+    if (made != nullptr) *made = reg.made;
+    if (filled != nullptr) *filled = reg.filled;
+    if (copies != nullptr) *copies = reg.copies;
+    if (overBudget != nullptr) *overBudget = reg.overBudget;
+    reg.made = reg.filled = reg.copies = reg.overBudget = 0;
+}
+
+void hakios_metal_surface_target_set_damage(hakios_metal_device* d, int on) {
+    HmSurfaceTargets& reg = *d->targets;
+    std::lock_guard<std::recursive_mutex> g(reg.lock);
+    reg.damage = on != 0;
+}
+
+void hakios_metal_surface_target_mark_whole(hakios_metal_texture* t) {
+    if (t == nullptr || t->target == nullptr) return;
+    std::shared_ptr<HmSurfaceTargets> o = t->target->owner.lock();
+    if (o == nullptr) return;
+    std::lock_guard<std::recursive_mutex> g(o->lock);
+    t->target->wholeNext = true;
+}
+
 hakios_metal_texture* hakios_metal_texture_new_iosurface2(hakios_metal_device* d, unsigned surfaceId, unsigned plane, unsigned pixelFormat, unsigned width,
                                                           unsigned height, unsigned usage, uint64_t chromaOffset, unsigned chromaRowBytes) {
     const Texture::SurfacePlane chroma{chromaOffset, chromaRowBytes};
@@ -700,6 +1028,7 @@ int hakios_metal_texture_replace(hakios_metal_texture* t, unsigned x, unsigned y
 int hakios_metal_texture_replace_level(hakios_metal_texture* t, unsigned level, unsigned x, unsigned y, unsigned w, unsigned h, const void* bytes,
                                        uint64_t bytesPerRow) {
     std::string why;
+    settleFill(t);
     if (!t->texture->replace(level, x, y, w, h, bytes, bytesPerRow, &why)) {
         failed(why);
         return -1;
@@ -714,6 +1043,7 @@ int hakios_metal_texture_read(hakios_metal_texture* t, unsigned x, unsigned y, u
 int hakios_metal_texture_read_level(hakios_metal_texture* t, unsigned level, unsigned x, unsigned y, unsigned w, unsigned h, void* bytes,
                                     uint64_t bytesPerRow) {
     std::string why;
+    settleFill(t);
     if (!t->texture->read(level, x, y, w, h, bytes, bytesPerRow, &why)) {
         failed(why);
         return -1;
@@ -783,6 +1113,7 @@ hakios_metal_queue* hakios_metal_queue_new(hakios_metal_device* d) {
     }
     auto* r = new hakios_metal_queue;
     r->queue = std::move(q);
+    r->targets = d->targets;
     return r;
 }
 
@@ -797,6 +1128,7 @@ hakios_metal_cb* hakios_metal_cb_new(hakios_metal_queue* q) {
     auto* r = new hakios_metal_cb;
     r->cb = q->queue->commandBuffer();
     r->deferrer = q->deferrer;
+    r->targets = q->targets;
     return r;
 }
 
@@ -859,6 +1191,99 @@ int hakios_metal_cb_blit_rotated(hakios_metal_cb* cb, hakios_metal_texture* from
     cb->cb->keepAlive(from->texture);
     cb->cb->keepAlive(to->texture);
     return 0;
+}
+
+// The commit copy (design: Changes Required, C API 3; metal-ca-perf, damage-region copy): each surface target among the
+// buffers CB named for writing since the last call, once, copied into its surface by the 2D engine after everything
+// recorded so far (the copy closes the open pass first), both kept alive -- in CB's own submission, so the surface's
+// fence is that copy's. What is copied is the target's damage since the last call (CommandBuffer::damageOf) aligned
+// outward to 16 pixels by 4 rows and clamped to the target: the surface equals the target after every resolve, so the
+// rest of it is the target's already. The whole target when the damage is the whole or not known, when the device's
+// damage copy is off (metal_damage=0) and when the target was marked (hakios_metal_surface_target_mark_whole).
+namespace {
+// the damage R of a WIDTH x HEIGHT target aligned outward to 16 pixels by 4 rows and clamped; false: the whole target
+bool alignedDamage(const render::BlitRect& r, uint32_t width, uint32_t height, render::BlitRect* out) {
+    if (width == 0 || height == 0 || r.w == 0 || r.h == 0 || r.x >= width || r.y >= height) return false;
+    const uint32_t x0 = r.x & ~15u, y0 = r.y & ~3u;
+    const uint32_t x1 = std::min(uint32_t(std::min<uint64_t>(uint64_t(r.x) + r.w - 1, width - 1)) | 15u, width - 1);
+    const uint32_t y1 = std::min(uint32_t(std::min<uint64_t>(uint64_t(r.y) + r.h - 1, height - 1)) | 3u, height - 1);
+    if (x0 == 0 && y0 == 0 && x1 == width - 1 && y1 == height - 1) return false;
+    *out = render::BlitRect{x0, y0, x1 - x0 + 1, y1 - y0 + 1};
+    return true;
+}
+}  // namespace
+
+int hakios_metal_cb_resolve_surface_targets(hakios_metal_cb* cb) {
+    syncAll(cb);   // deferred recording: what was posted is in the buffer before its uses are read
+    if (cb->targets == nullptr) return 0;
+    std::vector<std::shared_ptr<HmSurfaceTarget>> written;
+    std::vector<render::BlitRect> rects;   // per target written: the rectangle copied
+    {
+        std::lock_guard<std::recursive_mutex> g(cb->targets->lock);
+        const std::vector<BoUse>& uses = cb->cb->uses();
+        if (!cb->targets->byBo.empty()) {
+            for (size_t i = std::min(cb->resolvedUses, uses.size()); i < uses.size(); i++) {
+                if (!uses[i].write) continue;
+                auto it = cb->targets->byBo.find(uses[i].bo);
+                if (it == cb->targets->byBo.end()) continue;
+                std::shared_ptr<HmSurfaceTarget> e = it->second.lock();
+                if (e == nullptr) continue;
+                if (std::find(written.begin(), written.end(), e) == written.end()) written.push_back(std::move(e));
+            }
+        }
+        cb->resolvedUses = uses.size();
+        cb->damageCopies = cb->damageSmallest = cb->damageLargest = 0;
+        cb->damageTargetPixels = cb->damagePixels = 0;
+        for (const std::shared_ptr<HmSurfaceTarget>& e : written) {
+            const Texture& t = *e->target;
+            const render::BlitRect all{0, 0, t.width(), t.height()};
+            render::BlitRect r, a = all;
+            const bool part = cb->cb->damageOf(e->bo, &r) && alignedDamage(r, t.width(), t.height(), &a);
+            // (the measurement counts the damage whether or not it is what is copied: metal_damage=0 shows what it would save)
+            const uint64_t whole = uint64_t(t.width()) * t.height(), damage = uint64_t(a.w) * a.h;
+            const unsigned share = whole != 0 ? unsigned(damage * 1000 / whole) : 1000;
+            cb->damageSmallest = cb->damageCopies == 0 ? share : std::min(cb->damageSmallest, share);
+            cb->damageLargest = std::max(cb->damageLargest, share);
+            cb->damageCopies++;
+            cb->damageTargetPixels += whole;
+            cb->damagePixels += damage;
+            rects.push_back(part && cb->targets->damage && !e->wholeNext ? a : all);
+            e->wholeNext = false;
+        }
+    }
+    int copies = 0;
+    for (size_t k = 0; k < written.size(); k++) {
+        const std::shared_ptr<HmSurfaceTarget>& e = written[k];
+        const Texture& from = *e->target;
+        // (the surface is the target's size: the same rectangle of both)
+        const render::BlitRect s = rects[k];
+        if (!cb->cb->blit(from, 0, s, *e->surface, 0, s, false)) {
+            failed("the copy of IOSurface " + std::to_string(e->surfaceId) + "'s target into the surface: " +
+                   (cb->cb->error().empty() ? cb->cb->lastSkipped() : cb->cb->error()));
+            // (a copy left out: this target and those after it whole at their next copy)
+            std::lock_guard<std::recursive_mutex> g(cb->targets->lock);
+            for (size_t j = k; j < written.size(); j++) written[j]->wholeNext = true;
+            cb->cb->resetDamage();
+            return -1;
+        }
+        cb->cb->keepAlive(e->target);
+        cb->cb->keepAlive(e->surface);
+        copies++;
+    }
+    cb->cb->resetDamage();   // (what is written from here on is the next resolve's damage)
+    std::lock_guard<std::recursive_mutex> g(cb->targets->lock);
+    cb->resolvedUses = cb->cb->uses().size();   // (the copies' own uses: the surfaces, which are no target)
+    cb->targets->copies += unsigned(copies);
+    return copies;
+}
+
+void hakios_metal_cb_damage_stats(hakios_metal_cb* cb, unsigned* copies, uint64_t* targetPixels, uint64_t* damagePixels, unsigned* smallest,
+                                  unsigned* largest) {
+    if (copies) *copies = cb->damageCopies;
+    if (targetPixels) *targetPixels = cb->damageTargetPixels;
+    if (damagePixels) *damagePixels = cb->damagePixels;
+    if (smallest) *smallest = cb->damageSmallest;
+    if (largest) *largest = cb->damageLargest;
 }
 
 void hakios_metal_cb_skip_refused(hakios_metal_cb* cb, int on) {
@@ -1130,6 +1555,7 @@ hakios_metal_program* hakios_metal_program_new_bitcode_constants(const void* vsB
                                                                  unsigned colorPixelFormat) {
     std::string why;
     std::unique_ptr<CompiledStage> vs = compileStage(vsBitcode, vsSize, &why, constantsOf(vsConstants, vsCount));
+    noteStage(0, vs.get(), vsBitcode, vsSize, vsConstants, vsCount, 0, nullptr);
     if (vs == nullptr) {
         failed(why);
         return nullptr;
@@ -1144,6 +1570,7 @@ hakios_metal_program* hakios_metal_program_new_bitcode_constants(const void* vsB
     }
     // the FS's device buffers past the VS's in the one IBO table the two share
     std::unique_ptr<CompiledStage> fs = compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), vs->stage.k.numSsbos);
+    noteStage(1, fs.get(), fsBitcode, fsSize, fsConstants, fsCount, vs->stage.k.numSsbos, nullptr);
     if (fs == nullptr) {
         failed(why);
         return nullptr;
@@ -1163,6 +1590,7 @@ hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base
     known.bytes.assign(static_cast<const uint8_t*>(bytes), static_cast<const uint8_t*>(bytes) + length);
     const Program& was = base->program->program;
     std::unique_ptr<CompiledStage> fs = compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), was.fsIboBase, &known);
+    noteStage(1, fs.get(), fsBitcode, fsSize, fsConstants, fsCount, was.fsIboBase, &known);
     if (fs == nullptr) {
         failed(why);
         return nullptr;
@@ -1186,6 +1614,25 @@ hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base
 unsigned hakios_metal_program_stage_words(hakios_metal_program* p, unsigned stage) {
     if (p == nullptr || stage > 1) return 0;
     return (stage == 0 ? p->program->program.vs : p->program->program.fs).k.numWords;
+}
+
+int hakios_metal_program_stage_info(hakios_metal_program* p, unsigned stage, unsigned* source, uint64_t* digest, uint64_t* microseconds, char* name,
+                                    size_t size) {
+    const CompiledStage* s = p == nullptr || p->program == nullptr ? nullptr : stage == 0 ? p->program->vs.get() : stage == 1 ? p->program->fs.get() : nullptr;
+    if (s == nullptr) return -1;
+    if (source) *source = s->cacheSource;
+    if (digest) *digest = s->digest;
+    if (microseconds) *microseconds = s->compileUs;
+    if (name != nullptr && size != 0) snprintf(name, size, "%s", s->cacheName.c_str());
+    return 0;
+}
+
+const char* hakios_metal_cache_build(void) { return stageCacheBuild(); }
+
+void hakios_metal_set_stage_observer(void (*observer)(const hakios_metal_stage_event*, void*), void* context) {
+    gStageObserver.store(nullptr);
+    gStageContext.store(context);
+    gStageObserver.store(observer);
 }
 
 // FUNCTION of LIBRARY as WANT (a vertex or a fragment function): its bitcode, or nullptr with the reason left
@@ -1215,6 +1662,9 @@ hakios_metal_program* hakios_metal_program_new(hakios_metal_library* vsLibrary, 
 
 void hakios_metal_program_free(hakios_metal_program* p) { delete p; }
 const char* hakios_metal_program_name(hakios_metal_program* p) { return p->program->name.c_str(); }
+const char* hakios_metal_program_link_note(hakios_metal_program* p) {
+    return p == nullptr || p->program == nullptr ? "" : p->program->linkNote.c_str();
+}
 
 // STAGE 0 is the vertex stage, 1 the fragment stage; another number has no resources
 static const CompiledStage* stageOf(hakios_metal_program* p, unsigned stage) {

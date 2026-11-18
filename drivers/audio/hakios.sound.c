@@ -1,8 +1,9 @@
 /*
  * The phone's sound, step 3: what the audio DSP's services are told so that the speakers play.
- * Every address and number below belongs to the POCO X5 Pro (redwood), and nothing here happens
- * unless boot-arg sound=N asks for it, with adsp=1 (hakios.adsp.c), which starts the DSP and
- * calls hakios_sound_dsp_up() once its audio services are up.
+ * Every address and number below belongs to the POCO X5 Pro (redwood), unless said to be the
+ * POCO F4's (munch: "the phones" below), and nothing here happens unless boot-arg sound=N asks for
+ * it, with adsp=1 (hakios.adsp.c), which starts the DSP and calls hakios_sound_dsp_up() once its
+ * audio services are up.
  *
  * Under Android the speakers' sound goes from the audio server through three of the DSP's
  * services: ASM, a stream the samples are written into; ADM, the matrix that routes a stream to
@@ -71,6 +72,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/startup.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <libkern/OSAtomic.h>
@@ -78,7 +80,9 @@
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include <sys/hakios.version.h>
 #include <sys/hakios.audio.h>
+#include <sys/hakios.input.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -200,53 +204,170 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 	wr(b->base + offset, value);
 }
 
-/* ---- the TDM pins ------------------------------------------------------------------------------------- */
+/* ---- the phones, and their pins ------------------------------------------------------------------- */
 
 static struct block tlmm = { "pin controller", 0x0f100000, 0x100000 };
 #define GPIO_CFG(n)             (0x1000u * (n))         /* [1:0] pull, [5:2] function, [8:6] drive (mA / 2 - 1), [9] output */
 #define GPIO_IO(n)              (0x1000u * (n) + 4)     /* bit 0 in, bit 1 out */
-#define CFG_MI2S0               (1u << 2)
+#define CFG_FUNCTION(n)         ((n) << 2)
+#define CFG_MI2S0               CFG_FUNCTION(1)
 #define CFG_8MA                 (3u << 6)
 #define CFG_OUTPUT              (1u << 9)
 
-static const struct {
+/*
+ * The POCO F4 (munch, hw=munch) has its two amplifiers (NXP TFA9874s, hakios_munch_speaker.c) on
+ * the third MI2S interface, not on a TDM group: Android's TERT_MI2S_RX, AFE port 0x1004
+ * (msm-dai-q6-mi2s.2). Its numbers are its own kernel's (techpack/audio: asoc/kona.c, the
+ * interface, two channels, and its clock TER_MI2S_IBIT, 0x104, "couple no". kona.c's default is
+ * 48 kHz S16_LE, but Android's mixer paths (mixer_paths_overlay_static.xml) set the port to KHZ_96
+ * and S32_LE, and the amplifiers' registers read while it plays are those: 96000 x 2 x 32 = 6.144 MHz.
+ * At 48 kHz they said they were operating and nothing at all was heard, the bits on their pin or not;
+ * asoc/msm-dai-q6-v2.c, the I2S configuration: the data line the device
+ * tree gives the playback, qcom,msm-mi2s-rx-lines = <2>: SD1, stereo, the word select ours) and
+ * its live device tree's (tert_mi2s_*_active: GPIO 133 bit clock and 135 word select, function 1;
+ * 134 data 0, function 1; 137 data 1, function 3 -- pinctrl-kona.c --; all 8 mA, no pull). The DSP
+ * sees our memory there as it does on redwood (qcom,msm-audio-ion: stream 0x1801 of the SMMU at
+ * 0x15000000, addresses from 0x10000000). Of munch, the levels up to `levels' are written: its
+ * amplifiers are not driven yet.
+ */
+struct sound_pin {
 	unsigned pin;
 	const char *name;
 	uint32_t cfg, io;               /* Android's active state */
-} tdm_pins[] = {
+};
+
+static const struct sound_pin hakios_pins[] = {
 	{ 97, "gpio97 (bit clock)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
 	{ 100, "gpio100 (frame sync)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
 	{ 98, "gpio98 (data in)", CFG_MI2S0 | CFG_8MA, 0 },
 	{ 99, "gpio99 (data out)", CFG_MI2S0 | CFG_8MA, 0 },
 };
-#define TDM_PINS                (sizeof(tdm_pins) / sizeof(tdm_pins[0]))
-static uint32_t found_cfg[TDM_PINS], found_io[TDM_PINS];
+
+static const struct sound_pin munch_pins[] = {
+	{ 133, "gpio133 (bit clock)", CFG_FUNCTION(1) | CFG_8MA, 0 },
+	{ 135, "gpio135 (word select)", CFG_FUNCTION(1) | CFG_8MA, 0 },
+	{ 134, "gpio134 (data 0, from the amplifiers)", CFG_FUNCTION(1) | CFG_8MA, 0 },
+	{ 137, "gpio137 (data 1, to the amplifiers)", CFG_FUNCTION(3) | CFG_8MA, 0 },
+};
+
+struct sound_board {
+	const char *name;
+	uint32_t levels;                /* the highest sound=N written for this phone */
+	bool tdm;                       /* a TDM group and port (redwood), or an I2S port (munch) */
+	uint16_t port;
+	uint32_t clock, clock_hz;
+	uint16_t clock_attribute;
+	uint16_t adm_bits;
+	const char *what_port, *what_clock, *what_pins;
+	const struct sound_pin *pins;   /* the bit clock first, then the frame sync */
+	unsigned pin_count;
+	bool tfa;                       /* the amplifiers: NXP TFA9874s (hakios_munch_amp.c), or Awinic AW88261s (hakios_speaker.c) */
+	const char *amp_file, *amp_file_android;        /* their configuration in /fw, and where Android has it */
+};
+
+static const struct sound_board board_redwood = {
+	.name = "redwood", .levels = 4, .tdm = true, .port = 0x9000, .clock = 0x200, .clock_hz = 48000 * 32 * 2,
+	.clock_attribute = 4, .adm_bits = 24,
+	.what_port = "the port 0x9000 (PRI_TDM_RX_0)", .what_clock = "the TDM bit clock (0x200) at 3.072 MHz",
+	.what_pins = "the TDM pins (GPIO 97 to 100)", .pins = hakios_pins, .pin_count = 4,
+	.tfa = false, .amp_file = "aw882xx_acf.bin", .amp_file_android = "/vendor/etc/aw882xx_acf.bin",
+};
+
+static struct sound_board board_munch = {
+	.name = "munch", .levels = 4, .tdm = false, .port = 0x1004, .clock = 0x104, .clock_hz = 48000 * 2 * 32,
+	.clock_attribute = 1, .adm_bits = 24,
+	.what_port = "the port 0x1004 (TERT_MI2S_RX)", .what_clock = "the MI2S bit clock (0x104)",
+	.what_pins = "the MI2S pins (GPIO 133, 135, 134, 137)", .pins = munch_pins, .pin_count = 4,
+	.tfa = true, .amp_file = "tfa98xx.cnt", .amp_file_android = "/vendor/firmware/tfa98xx.cnt",
+};
+
+static const struct sound_board *board = &board_redwood;
+static uint32_t i2s_bits = 32;                  /* munch, boot-arg sound_bits=16 or 32: the width of the interface's slots */
+static uint32_t port_rate = 48000;              /* the port's and the device path's; the stream stays at RATE, the DSP resamples */
+
+/* The amplifiers, whichever the phone has (sys/hakios.audio.h). */
+static bool
+amp_prepare(const uint8_t *file, uint64_t size)
+{
+	return board->tfa ? hakios_munch_amp_prepare(file, size) : hakios_speaker_prepare(file, size);
+}
+
+static bool
+amp_start(void)
+{
+	return board->tfa ? hakios_munch_amp_start() : hakios_speaker_start();
+}
+
+static bool
+amp_volume(uint32_t level_below, uint32_t step_ms)
+{
+	return board->tfa ? hakios_munch_amp_volume(level_below, step_ms) : hakios_speaker_volume(level_below, step_ms);
+}
+
+static bool
+amp_healthy(void)
+{
+	return board->tfa ? hakios_munch_amp_healthy() : hakios_speaker_healthy();
+}
+
+static void
+amp_stop(void)
+{
+	if (board->tfa) {
+		hakios_munch_amp_stop();
+	} else {
+		hakios_speaker_stop();
+	}
+}
+
+/* (munch's amplifiers report no temperature to reckon a reduction from: none is asked for) */
+static uint32_t
+amp_monitor(bool tell)
+{
+	return board->tfa ? 0 : hakios_speaker_monitor(tell);
+}
+
+/* munch's volume is put on the samples (hakios_munch_amp.c): the TFA9874s have none that Android uses. */
+static void
+amp_scale(int16_t *frames, uint32_t count)
+{
+	if (board->tfa) {
+		hakios_munch_amp_scale(frames, count);
+	}
+}
+
+#define MAX_PINS                4
+static uint32_t found_cfg[MAX_PINS], found_io[MAX_PINS];
 static bool pins_taken;
 
 static void
 pins_on(void)
 {
-	for (unsigned i = 0; i < TDM_PINS; i++) {
-		found_cfg[i] = get(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin));
-		found_io[i] = get(&tlmm, tdm_pins[i].name, GPIO_IO(tdm_pins[i].pin));
+	const struct sound_pin *pins = board->pins;
+
+	for (unsigned i = 0; i < board->pin_count; i++) {
+		found_cfg[i] = get(&tlmm, pins[i].name, GPIO_CFG(pins[i].pin));
+		found_io[i] = get(&tlmm, pins[i].name, GPIO_IO(pins[i].pin));
 	}
 	pins_taken = true;
-	for (unsigned i = 0; i < TDM_PINS; i++) {
-		put(&tlmm, tdm_pins[i].name, GPIO_IO(tdm_pins[i].pin), tdm_pins[i].io);
-		put(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin), tdm_pins[i].cfg);
+	for (unsigned i = 0; i < board->pin_count; i++) {
+		put(&tlmm, pins[i].name, GPIO_IO(pins[i].pin), pins[i].io);
+		put(&tlmm, pins[i].name, GPIO_CFG(pins[i].pin), pins[i].cfg);
 	}
 }
 
 static void
 pins_off(void)
 {
+	const struct sound_pin *pins = board->pins;
+
 	if (!pins_taken) {
 		return;
 	}
-	for (unsigned i = 0; i < TDM_PINS; i++) {
-		put(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin), found_cfg[i]);
-		put(&tlmm, tdm_pins[i].name, GPIO_IO(tdm_pins[i].pin), found_io[i] & 2);
-		get(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin));
+	for (unsigned i = 0; i < board->pin_count; i++) {
+		put(&tlmm, pins[i].name, GPIO_CFG(pins[i].pin), found_cfg[i]);
+		put(&tlmm, pins[i].name, GPIO_IO(pins[i].pin), found_io[i] & 2);
+		get(&tlmm, pins[i].name, GPIO_CFG(pins[i].pin));
 	}
 	pins_taken = false;
 }
@@ -334,17 +455,19 @@ command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const
 #define AFE_PARAM_ID_GROUP_DEVICE_TDM_CONFIG    0x0001029eu
 #define AFE_MODULE_CLOCK_SET                    0x0001028fu
 #define AFE_PARAM_ID_CLOCK_SET                  0x00010290u
+#define AFE_PARAM_ID_I2S_CONFIG                 0x0001020du
 
-#define PORT                    0x9000          /* PRI_TDM_RX_0 */
 #define GROUP                   0x9100          /* PRI_TDM_RX */
 #define GROUP_OTHER_PORT        0x9002
 #define PORT_INVALID            0xffff
-#define CLOCK_PRI_TDM_IBIT      0x200
-#define CLOCK_INVERT_COUPLE_NO  4
 #define RATE                    48000
 #define SLOTS                   2
 #define SLOT_BITS               32
 #define PORT_BITS               32              /* the mixer path's S32_LE */
+#define I2S_BITS                32              /* munch: what its amplifiers are set to while Android plays (20=2890 21=c1f1 22=047c) */
+#define I2S_LINE_SD1            2
+#define I2S_STEREO              1
+#define I2S_WORD_SELECT_OURS    1
 
 struct afe_param {
 	uint32_t module, param;
@@ -374,6 +497,13 @@ struct afe_tdm {
 	uint32_t version, channels, rate, bits;
 	uint16_t data_format, sync_mode, sync_source, slots, data_out, invert_sync, data_delay, slot_bits;
 	uint32_t slot_mask;
+} __attribute__((packed));
+
+struct afe_i2s {
+	uint32_t version;
+	uint16_t bits, lines, stereo, word_select;
+	uint32_t rate;
+	uint16_t data_format, reserved;
 } __attribute__((packed));
 
 struct afe_slot_mapping {
@@ -408,7 +538,7 @@ afe_port_param(const char *what, uint32_t module, uint32_t param, const void *da
 	struct afe_param *p = (struct afe_param *)(packet + 16);
 
 	bzero(packet, sizeof(packet));
-	*(uint16_t *)packet = PORT;
+	*(uint16_t *)packet = board->port;
 	*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
 	p->module = module;
 	p->param = param;
@@ -422,17 +552,18 @@ static bool clock_on, group_on, port_on;
 static bool
 afe_clock(bool on)
 {
-	struct afe_clock_set clock = { 1, CLOCK_PRI_TDM_IBIT, RATE * SLOT_BITS * SLOTS, CLOCK_INVERT_COUPLE_NO, 0, on };
+	struct afe_clock_set clock = { 1, board->clock, board->clock_hz, board->clock_attribute, 0, on };
+	char what[96];
 
-	return afe_service_param(on ? "the TDM bit clock (0x200) at 3.072 MHz, on" : "the TDM bit clock, off", AFE_MODULE_CLOCK_SET,
-	           AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
+	snprintf(what, sizeof(what), "%s, %s", board->what_clock, on ? "on" : "off");
+	return afe_service_param(what, AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
 }
 
 static bool
 afe_on(void)
 {
 	struct afe_group_tdm group = {
-		.version = 1, .group = GROUP, .ports = { PORT, GROUP_OTHER_PORT, PORT_INVALID, PORT_INVALID, PORT_INVALID,
+		.version = 1, .group = GROUP, .ports = { board->port, GROUP_OTHER_PORT, PORT_INVALID, PORT_INVALID, PORT_INVALID,
 		                                         PORT_INVALID, PORT_INVALID, PORT_INVALID },
 		.channels = SLOTS, .rate = RATE, .bits = SLOT_BITS, .slots = SLOTS, .slot_bits = SLOT_BITS, .slot_mask = 3,
 	};
@@ -443,8 +574,21 @@ afe_on(void)
 	};
 	struct afe_slot_mapping mapping = { .version = 1, .channels = 2, .bits = PORT_BITS, .align = 0,
 		                            .offsets = { 0, 4, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
-	uint16_t start[2] = { PORT, 0 };
+	uint16_t start[2] = { board->port, 0 };
 
+	if (!board->tdm) {
+		struct afe_i2s i2s = { 1, (uint16_t)i2s_bits, I2S_LINE_SD1, I2S_STEREO, I2S_WORD_SELECT_OURS, port_rate, 0, 0 };
+
+		announce("the DSP is asked for the MI2S interface's bit clock, the port and its start (AFE)");
+		clock_on = afe_clock(true);
+		if (!clock_on || !afe_port_param("the port 0x1004: I2S, 2 channels on data line 1 (see the line above for the rate), the word "
+		    "select ours", AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s))) {
+			return false;
+		}
+		port_on = command("the port 0x1004, started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0,
+		    NULL);
+		return port_on;
+	}
 	announce("the DSP is asked for the TDM interface's bit clock, the group, the port and its start (AFE)");
 	clock_on = afe_clock(true);
 	if (!clock_on) {
@@ -470,11 +614,11 @@ afe_on(void)
 static void
 afe_off(void)
 {
-	uint16_t stop[2] = { PORT, 0 };
+	uint16_t stop[2] = { board->port, 0 };
 	struct afe_group_enable disable = { GROUP, 0 };
 
 	if (port_on) {
-		command("the port 0x9000, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
+		command("the port, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
 		port_on = false;
 	}
 	if (group_on) {
@@ -795,7 +939,6 @@ hakios_audio_dsp_memory_put(void)
 #define ADM_PATH_PLAYBACK                       1
 #define ADM_MATRIX_AUDIO_RX                     0
 #define ADM_TOPOLOGY_NONE                       0x00010312u
-#define ADM_BITS                                24
 
 #define ASM_CMD_SHARED_MEM_MAP_REGIONS          0x00010d92u
 #define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS       0x00010d93u
@@ -866,7 +1009,7 @@ stream_on(void)
 		uint16_t channels, bits;
 		uint32_t rate;
 		uint8_t map[8];
-	} __attribute__((packed)) open = { 0, ADM_PATH_PLAYBACK, PORT, 0xffff, ADM_TOPOLOGY_NONE, 2, ADM_BITS, RATE,
+	} __attribute__((packed)) open = { 0, ADM_PATH_PLAYBACK, board->port, 0xffff, ADM_TOPOLOGY_NONE, 2, board->adm_bits, port_rate,
 		                           { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
 	struct {
 		uint32_t matrix, sessions;
@@ -896,7 +1039,8 @@ stream_on(void)
 	mapped = true;
 	map_handle = answer.words[0];
 	say("sound: our %u KB at %#llx are the DSP's handle %#x\n", BUFFER_BYTES / 1024, buffer_address, map_handle);
-	if (!command("a device path to the port: playback, no processing, 2 channels of 24 bits at 48 kHz", APR_SVC_ADM, PORT,
+	if (!command(board->adm_bits == 16 ? "a device path to the port: playback, no processing, 2 channels of 16 bits at 48 kHz" :
+	    "a device path to the port: playback, no processing, 2 channels of 24 bits at 48 kHz", APR_SVC_ADM, board->port,
 	    ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5, &answer)) {
 		return false;
 	}
@@ -961,6 +1105,7 @@ period_fill(unsigned period, bool silent)
 		samples[2 * frame] = sample;
 		samples[2 * frame + 1] = sample;
 	}
+	amp_scale(samples, PERIOD_FRAMES);
 	for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + PERIOD_BYTES; line += 64) {
 		__asm__ volatile ("dc cvac, %0" : : "r" (line));        /* the DSP reads memory, not our caches */
 	}
@@ -985,7 +1130,7 @@ play(uint32_t ms, bool amplifiers)
 {
 	uint64_t began, last_look, ended;
 	uint32_t sent = 0, done_before = written_done, healthy_looks = 0;
-	bool ok = true, tone_over = false;
+	bool ok = true, tone_over = false, data_looked = false;
 
 	returned = 0;
 	tone_at = 0;
@@ -1020,6 +1165,14 @@ play(uint32_t ms, bool amplifiers)
 				sent++;
 			}
 		}
+		if (board->tfa && !data_looked && now - began >= 1000000) {
+			uint32_t changes, ones;
+
+			/* (the tone is on its way out: do its bits leave the chip, and on which of the data lines?) */
+			data_looked = true;
+			pin_activity(board->pins[2].pin, "during the tone: gpio134 (data 0)", &changes, &ones);
+			pin_activity(board->pins[3].pin, "during the tone: gpio137 (data 1, to the amplifiers)", &changes, &ones);
+		}
 		if (!tone_over && (now - began >= ms * 1000ull || stopping)) {
 			tone_over = true;
 		}
@@ -1040,7 +1193,7 @@ play(uint32_t ms, bool amplifiers)
 		if (amplifiers && now - last_look >= 200000) {
 			last_look = now;
 			healthy_looks++;
-			if (!hakios_speaker_healthy()) {
+			if (!amp_healthy()) {
 				ok = false;
 				tone_over = true;
 			}
@@ -1069,12 +1222,15 @@ play(uint32_t ms, bool amplifiers)
  * into a ring and does not wait; the feeder, a thread of ours, takes them from there into each
  * period the DSP gives back (and silence when there is nothing), so the stream never stops
  * while the run lasts. The amplifiers are only on while there is sound: the watcher starts them
- * (and fades them in to sound_below) when a write is not silence, and stops them after three
- * seconds of silence or no writes.
+ * (and fades them in to sound_below) when a write is not silence, and stops them after thirty
+ * seconds of silence or no writes. A sound that comes while they are off is held in the ring until
+ * they are up, and not sent past them: the munch's take a good part of a second to start over
+ * their slow bus, and a key's click, lock's or keyboard's, is over long before that (1 November:
+ * no short sound was ever heard). Thirty seconds, so that the next one finds them on.
  */
-#define RING_FRAMES             32768           /* 0.68 s; a power of two, the indices run on and wrap */
+#define RING_FRAMES             65536           /* 1.37 s; a power of two, the indices run on and wrap */
 #define SILENCE                 8               /* samples no larger than this are silence (as hakios.audio.c's) */
-#define QUIET_BEFORE_OFF_US     3000000ull
+#define QUIET_BEFORE_OFF_US     30000000ull
 
 static int16_t ring[RING_FRAMES * 2];
 static volatile uint32_t ring_head, ring_tail;  /* frames: written by the sink, taken by the feeder */
@@ -1082,6 +1238,9 @@ static volatile uint64_t last_sound_us;         /* when the latest write that wa
 static volatile bool feeder_runs, watcher_runs;
 static uint64_t fed_frames, silent_frames, darwin_frames;
 static volatile uint32_t darwin_peak;              /* the largest sample since the amplifiers last started */
+static volatile bool hold_allowed;              /* a sound may wait for the amplifiers: they are there, and not muted */
+static volatile bool holding;                   /* ... and one does: the ring is not drained */
+static volatile bool guard_on;                  /* the amplifiers are on: what the guard lets through is heard */
 
 /* From the writer's thread, under hakios.audio.c's lock: never waits. */
 static uint32_t
@@ -1106,12 +1265,14 @@ darwin_sink(const int16_t *frames, uint32_t count)
 	darwin_frames += taken;
 	if (sound) {
 		last_sound_us = now_us();
+		if (hold_allowed && !guard_on) {
+			holding = true;
+		}
 	}
 	return taken;
 }
 
 static uint32_t guard_periods;                  /* periods through the guard */
-static volatile bool guard_on;                  /* the amplifiers are on: what the guard lets through is heard */
 
 /* tenths of a dB as text: "-5.7" */
 static const char *
@@ -1147,9 +1308,33 @@ static void
 period_fill_darwin(unsigned period)
 {
 	int16_t *samples = (int16_t *)(buffer + 4096 * period);
-	uint32_t tail = ring_tail, available = ring_head - tail, n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
+	uint32_t tail = ring_tail, available = ring_head - tail, n;
 
 	OSMemoryBarrier();
+	if (holding && hold_allowed && !guard_on) {
+		available = 0;                          /* (the amplifiers are starting: the sound waits in the ring) */
+	} else {
+		holding = false;
+		/*
+		 * What held a sound back has left the rest late by as much. Silence is what can be left out to catch up: the
+		 * amplifiers do not miss it, and the sound comes when it was meant to again.
+		 */
+		while (available > 2 * PERIOD_FRAMES) {
+			bool silent = true;
+
+			for (uint32_t i = 0; i < 2 * PERIOD_FRAMES && silent; i++) {
+				int32_t v = ring[(2 * (uint64_t)(tail % RING_FRAMES) + i) % (2 * RING_FRAMES)];
+
+				silent = v <= SILENCE && v >= -SILENCE;
+			}
+			if (!silent) {
+				break;
+			}
+			tail += PERIOD_FRAMES;
+			available -= PERIOD_FRAMES;
+		}
+	}
+	n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
 	for (uint32_t i = 0; i < n; i++) {
 		samples[2 * i] = ring[2 * ((tail + i) % RING_FRAMES)];
 		samples[2 * i + 1] = ring[2 * ((tail + i) % RING_FRAMES) + 1];
@@ -1161,6 +1346,7 @@ period_fill_darwin(unsigned period)
 	silent_frames += PERIOD_FRAMES - n;
 	/* the guard, on every period, silence too: its filter and its averages go on (hakios.guard.c) */
 	hakios_guard_process(samples, PERIOD_FRAMES);
+	amp_scale(samples, PERIOD_FRAMES);
 	if (n != 0 && hakios_audio_recording_fed()) {
 		hakios_audio_record_fed(samples, n);
 	}
@@ -1181,9 +1367,18 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 		period_fill_darwin(p);
 		sent += period_write(p);
 	}
+	uint64_t last_heartbeat = now_us();
+
 	while (!stopping) {
 		uint32_t back = returned;
 		static bool was_on;
+
+		if (now_us() - last_heartbeat >= 30000000) {
+			/* (a run that hangs keeps no log of its end: this says how far the stream had got) */
+			last_heartbeat = now_us();
+			say("sound: the feeder so far: %u periods written (%u could not be sent), %u given back (%u with an error), "
+			    "%u underflows; from iOS %llu frames\n", sent, failed, written_done, write_errors, underflows, darwin_frames);
+		}
 
 		if (guard_on && !was_on) {
 			guard_say("", true);    /* (what it did to the silence meanwhile is of no interest) */
@@ -1273,6 +1468,8 @@ watch(void)
 		uint32_t extra_now, generation_now;
 		bool muted_now;
 
+		hold_allowed = !given_up && !muted;
+
 		if (hakios_audio_volume(&extra_now, &muted_now, &generation_now) && generation_now != generation) {
 			generation = generation_now;
 			extra = extra_now;
@@ -1284,10 +1481,10 @@ watch(void)
 			if (muted) {
 				guard_off(true);
 				if (on) {
-					hakios_speaker_stop();
+					amp_stop();
 					on = false;
 				}
-			} else if (on && !hakios_speaker_volume(below_with(extra), 1)) {
+			} else if (on && !amp_volume(below_with(extra), 1)) {
 				guard_off(true);
 				on = false;
 				given_up = true;
@@ -1299,7 +1496,7 @@ watch(void)
 			say_when("Darwin plays: the amplifiers are started");
 			starts++;
 			darwin_peak = 0;
-			if (!hakios_speaker_start() || !hakios_speaker_volume(below_with(extra), 1)) {
+			if (!amp_start() || !amp_volume(below_with(extra), 1)) {
 				say("sound: THE AMPLIFIERS DID NOT START; Darwin's sound goes on to the DSP, unheard\n");
 				guard_off(true);
 				given_up = true;
@@ -1315,15 +1512,15 @@ watch(void)
 				    PERIODS * PERIOD_FRAMES / 48);
 			}
 		} else if (on && now - sounded > QUIET_BEFORE_OFF_US) {
-			say_when("three seconds of silence: the amplifiers are stopped");
+			say_when("thirty seconds of silence: the amplifiers are stopped");
 			say("sound: what Darwin wrote while they were on peaked at %u%% of full scale (%u)\n", darwin_peak * 100 / 32768,
 			    darwin_peak);
 			guard_off(false);
-			hakios_speaker_stop();
+			amp_stop();
 			on = false;
 		} else if (on && now - last_look >= 200000) {
 			last_look = now;
-			if (!hakios_speaker_healthy()) {
+			if (!amp_healthy()) {
 				guard_off(true);
 				on = false;
 				given_up = true;
@@ -1332,7 +1529,7 @@ watch(void)
 				uint32_t wanted;
 
 				last_monitor = now;
-				wanted = hakios_speaker_monitor(monitor_looks++ % 10 == 0);
+				wanted = amp_monitor(monitor_looks++ % 10 == 0);
 				if (wanted != monitor) {
 					say("sound: the amplifiers' watch asks for %u.%03u dB less (it was %u.%03u)\n", wanted / 8, wanted % 8 * 125,
 					    monitor / 8, monitor % 8 * 125);
@@ -1366,7 +1563,7 @@ take_down(void)
 	lck_mtx_lock(&sound_lock);
 	if (running && !taken_down) {
 		taken_down = true;
-		hakios_speaker_stop();
+		amp_stop();
 		stream_off();
 		afe_off();
 		pins_off();
@@ -1395,15 +1592,16 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	if (level == 4) {
 		say("sound: level 4: what Darwin plays, through the port, a stream and the amplifiers, until the run ends\n");
 	} else {
-		say("sound: level %u: %s, for %u s\n", level, level == 1 ? "the speakers' TDM port" : level == 2 ?
+		say("sound: level %u: %s, for %u s\n", level, level == 1 ? "the speakers' port" : level == 2 ?
 		    "the port and a stream with a test tone, the amplifiers off" :
 		    "the port, a stream with a test tone, and the amplifiers", seconds);
 	}
 	if (level >= 3) {
-		acf = hakios_adsp_fw_file("aw882xx_acf.bin", &acf_size);
+		acf = hakios_adsp_fw_file(board->amp_file, &acf_size);
 		if (acf == NULL) {
-			say("sound: no /fw/aw882xx_acf.bin: put the phone's /vendor/etc/aw882xx_acf.bin into fw-audio/ and run SYSTEM=1 "
-			    "userland/build.sh\n");
+			say("sound: no /fw/%s: put the phone's %s into fw-audio/ and run SYSTEM=1 ", board->amp_file,
+			    board->amp_file_android);
+			say("userland/build.sh\n");
 			goto out;
 		}
 	}
@@ -1417,16 +1615,21 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		ok = false;
 		hakios_adsp_apr_events(events);
 	}
-	announce("the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");
+	{
+		char what[160];
+
+		snprintf(what, sizeof(what), "%s to the interface, as Android's active state has them", board->what_pins);
+		announce(what);
+	}
 	pins_on();
 	if (!afe_on()) {
 		goto out;
 	}
 	sleep_ms(20);
-	pin_activity(97, "the bit clock (gpio97)", &changes, &ones);
-	pin_activity(100, "the frame sync (gpio100)", &sync_changes, &sync_ones);
-	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE TDM CLOCK AND FRAME SYNC RUN at the pins" :
-	    "THE PINS DO NOT SHOW A RUNNING TDM CLOCK");
+	pin_activity(board->pins[0].pin, board->pins[0].name, &changes, &ones);
+	pin_activity(board->pins[1].pin, board->pins[1].name, &sync_changes, &sync_ones);
+	say("sound: %s, %s\n", board->what_port, changes > 100 && sync_changes > 4 ? "THE BIT CLOCK AND FRAME SYNC RUN at the pins" :
+	    "THE PINS DO NOT SHOW A RUNNING BIT CLOCK");
 	if (level == 1) {
 		sleep_ms(seconds * 1000);
 		ok = true;
@@ -1439,7 +1642,7 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_t feeder;
 
 		announce("the amplifiers, set up from Android's Music profile, powered down until Darwin plays");
-		if (!hakios_speaker_prepare(acf, acf_size)) {
+		if (!amp_prepare(acf, acf_size)) {
 			goto out;
 		}
 		hakios_adsp_fw_free(acf, acf_size);
@@ -1468,12 +1671,12 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	if (level >= 3) {
 		/* the clock runs (the port is started, the stream as well): the amplifiers can lock to it */
 		announce("the amplifiers, set up from Android's Music profile, then started at the lowest volume");
-		if (!hakios_speaker_prepare(acf, acf_size) || !hakios_speaker_start()) {
+		if (!amp_prepare(acf, acf_size) || !amp_start()) {
 			goto out;
 		}
 	}
 	/* (the amplifiers are faded in before the tone begins: they fade in on silence, and the tone starts at that level) */
-	if (level >= 3 && !hakios_speaker_volume(below, 50)) {
+	if (level >= 3 && !amp_volume(below, 50)) {
 		goto out;
 	}
 	if (level >= 3) {
@@ -1494,6 +1697,33 @@ out:
 	thread_terminate(current_thread());
 }
 
+/*
+ * The DSP's buffers taken at the start, once: the audio DSP comes up beside the system's start, and by the time it
+ * has (half a minute, more with Wi-Fi) the window server's GPU buffers may have taken the kernel's data range, and a
+ * megabyte of it is no longer there: kmem_alloc() then panics (the POCO F4, 6 November, gpu=1: "kmem_alloc(..., 1048576,
+ * 0x100021): failed with 3" from sound_thread). shared_get() takes this one when it is there.
+ */
+__startup_func
+static void
+sound_reserve(void)
+{
+	uint32_t wanted = 0;
+
+	if (!PE_parse_boot_argn("sound", &wanted, sizeof(wanted)) || wanted < 2) {
+		return;
+	}
+	if (kmem_alloc(kernel_map, &buffer, SHARED_BYTES, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		buffer = 0;
+	}
+	/*
+	 * And the pin controller's megabyte of addresses, at the start rather than where pins_on() first needs it: ml_io_map()
+	 * takes from a submap that was once full by then (osfmk/arm/io_map.c, IO_MAP_SIZE), and the kernel stopped right
+	 * after "the MI2S pins ..." (the POCO F4, 6 November, gpu=1 wifi=1 sound=4).
+	 */
+	tlmm.base = ml_io_map(tlmm.phys, tlmm.size);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, sound_reserve);
+
 void
 hakios_sound_dsp_up(void)
 {
@@ -1502,11 +1732,26 @@ hakios_sound_dsp_up(void)
 	if (!PE_parse_boot_argn("sound", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	if (level > 4) {
-		level = 4;
+	if (hakios_soc_is("sm8250")) {
+		PE_parse_boot_argn("sound_bits", &i2s_bits, sizeof(i2s_bits));
+		port_rate = 96000;
+		PE_parse_boot_argn("sound_rate", &port_rate, sizeof(port_rate));
+		board_munch.clock_hz = port_rate * 2 * i2s_bits;
+		say("sound: the interface: %u Hz, 2 slots of %u bits, its bit clock %u Hz\n", port_rate, i2s_bits, board_munch.clock_hz);
+		board_munch.adm_bits = i2s_bits == 16 ? 16 : 24;
+		hakios_munch_amp_slots(i2s_bits);
+		board = &board_munch;
+	} else if (!hakios_soc_is("sc7280")) {
+		return;
+	}
+	if (level > board->levels) {
+		say("sound: on %s only the levels up to %u are written: sound=%u\n", board->name, board->levels, board->levels);
+		level = board->levels;
 	}
 	PE_parse_boot_argn("sound_secs", &seconds, sizeof(seconds));
-	PE_parse_boot_argn("sound_below", &below, sizeof(below));
+	if (!PE_parse_boot_argn("sound_below", &below, sizeof(below)) && hakios_soc_is("sm8250")) {
+		below = 96;     /* 12 dB under full scale, which is Android's level there (its gain is all in the samples) */
+	}
 	PE_parse_boot_argn("sound_pause", &pause_ms, sizeof(pause_ms));
 	PE_parse_boot_argn("sound_guard_as", &guard_as, sizeof(guard_as));
 	PE_parse_boot_argn("sound_gain", &gain, sizeof(gain));
@@ -1538,4 +1783,5 @@ void
 hakios_sound_quiesce(void)
 {
 	hakios_speaker_quiesce();
+	hakios_munch_amp_quiesce();
 }

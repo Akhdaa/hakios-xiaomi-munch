@@ -12,6 +12,7 @@
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
+#include <sys/sysctl.h>
 #include <pexpert/pexpert.h>
 
 #define TOUCH_QUEUE     512             /* records; a power of two */
@@ -159,6 +160,60 @@ touch_feel_add(uint32_t type, uint32_t finger, uint64_t now)
 	}
 }
 
+/*
+ * Auto-Lock, done here (9 November: SpringBoard's own never fires on this phone -- its timeouts are to come from the
+ * AttentionAwareness service in backboardd, which is connected to and never sends them). SpringBoard's library
+ * (userland/src/inject_sb.c) writes the timeout its idle timer has now into kern.hakios.autolock: the setting's, the
+ * lock screen's shorter one, 0 while something holds the screen on (a video) or Auto-Lock is Never. When no touch and
+ * no key has come from a driver for that long and the screen is on, the power key is pressed as the lock button's own
+ * press is posted -- what a hand would do. The screen's state is the display driver's (hakios_input_screen()).
+ */
+static uint64_t last_activity;          /* mach_absolute_time() of the last touch or key from a driver */
+static volatile bool screen_on = true;
+static int autolock_seconds;
+static thread_call_t autolock_call;
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_INT(_kern_hakios, OID_AUTO, autolock, CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, &autolock_seconds, 0,
+    "lock the screen after this many seconds without a touch or a key (0: never); SpringBoard's library keeps it");
+
+static void touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver);
+
+void
+hakios_input_screen(bool on)
+{
+	if (on && !screen_on) {
+		last_activity = mach_absolute_time();   /* (a screen just woken is not idle) */
+	}
+	screen_on = on;
+}
+
+static void
+autolock_check(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	static bool pressed;
+	uint64_t now = mach_absolute_time(), idle_ns, deadline;
+	int seconds = autolock_seconds;
+
+	absolutetime_to_nanoseconds(now - last_activity, &idle_ns);
+	if (!screen_on) {
+		pressed = false;
+	} else if (seconds > 0 && !pressed && idle_ns >= (uint64_t)seconds * NSEC_PER_SEC) {
+		pressed = true;                 /* (once: until the screen has been off) */
+		char line[128];
+
+		snprintf(line, sizeof(line), "hakios: autolock: %llu s without a touch or a key (Auto-Lock %d s): the power key is pressed\n",
+		    idle_ns / NSEC_PER_SEC, seconds);
+		loader_log_line(line);          /* (the loader's log: a thread call's printf did not reach it, run 211052) */
+		printf("%s", line);
+		touch_post(HAKIOS_BUTTON_DOWN, HAKIOS_BUTTON_LOCK, 0, 0, false);
+		delay_for_interval(120, NSEC_PER_MSEC);
+		touch_post(HAKIOS_BUTTON_UP, HAKIOS_BUTTON_LOCK, 0, 0, false);
+	}
+	clock_interval_to_deadline(2, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(autolock_call, deadline);
+}
+
 static void
 touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
 {
@@ -172,6 +227,7 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	t->time = mach_absolute_time();
 	if (from_driver) {
 		touch_feel_add(type, finger, t->time);
+		last_activity = t->time;
 	}
 	if (latency_lines()) {
 		uint64_t ns;
@@ -281,6 +337,9 @@ hakios_input_init(void)
 		printf("hakios-touch: cannot create the device\n");
 	}
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
+	last_activity = mach_absolute_time();
+	autolock_call = thread_call_allocate(autolock_check, NULL);
+	autolock_check(NULL, NULL);
 	hakios_cpufreq_init();
 	hakios_virtio_input_init();
 	hakios_goodix_init();

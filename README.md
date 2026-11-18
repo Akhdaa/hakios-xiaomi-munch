@@ -1,62 +1,95 @@
-# HakiOS
+# HakiOS for the POCO F4 (`munch`)
 
-English · [中文](README.zh.md) · [Українська](README.uk.md)
+HakiOS on the **Xiaomi POCO F4** (`munch`, also sold as the Redmi K40S): Qualcomm Snapdragon 870 (**SM8250-AC**),
+Adreno 650, UFS. Apple's open-source Darwin kernel (XNU, xnu-8796.121.2) with an iOS 16.5 user space, built on
+[HakiOS](https://github.com/oosexgang/hakios-xnu-kernel).
 
-**Apple's open-source Darwin kernel (XNU, xnu-8796.121.2) on Android phones**, the way Android is Linux on phones: a boot loader of its
-own, drivers of its own, a configuration system and a version of its own. The same kernel runs in QEMU with nothing of Apple's and
-nothing of any phone's (`make qemu-open`). A research bench, not a ROM: by default it runs from RAM, and a reboot gives the phone back to
-Android.
+It runs from RAM: the phone is started with `fastboot boot`, nothing is flashed, no partition is written, and a
+reboot gives the phone back to Android. This is a research bench with known defects, not a daily system.
 
-**Documentation:** [docs/](docs/index.md), and the site, [hackios-web.vercel.app](https://hackios-web.vercel.app).
+**This branch.** `SM8250-AC` holds the port: HakiOS's tree with the device under `devices/munch/` and the changes
+the port needed in the common tree. `main` is upstream as it was forked.
 
-**News, 4 November 2026:** on the POCO X5 Pro 5G the window server draws through Metal on the Adreno 642L, two ways. hakios-metal: page
-swipes 110 to 115 frames a second, Settings' scroll 118, the home button 106, rendering at 828x1792 stretched to the panel; 101, about 90 and about 90 at the full 1125x2436. UniXNU's Metal on Vulkan: swipes 50 to 57, scroll 41. The panel is 120 Hz,
-and **120 frames a second has not been reached**. [Metal on the Adreno](docs/reference/metal.md),
-[the measurements](docs/reference/metal-measurements.md).
+## What works
 
-Start with [Getting started](docs/getting-started/index.md), [On the phone](docs/getting-started/phone.md) or
-[Port a device](docs/porting/index.md). What works, part by part: [the documentation's front page](docs/index.md#what-works).
+"Works" means seen working on the phone in a RAM run, not only built. Details and measurements, part by part:
+[devices/munch/README.md](devices/munch/README.md).
 
-## Repositories
+| Part | State | In short |
+|---|---|---|
+| Boot | works | Mu-Silicium UEFI and the loader by `fastboot boot`; the system image uploaded to RAM (about 100 s); several kernels per loader session |
+| Display | works | 1080 x 2400 at 60 Hz; physical brightness from Settings and Control Center (`panel=2 fb_backlight=1`); the panel sleeps when the screen is off |
+| Touch | works | FocalTech FT3658U on SPI, 10 fingers |
+| Buttons | works | power and volume |
+| CPU | works | all 8 cores; each group's clock follows its load (`cpugov`, schedutil-like with the device tree's frequency tables); lower caps with the screen off |
+| GPU | works | Adreno 650 through Mesa (OpenGL ES), the default; clock follows the load between 305 and 670 MHz (`gpu_dcvs`) |
+| Metal | partial | with `metal=1` the desktop (CoreAnimation) draws through hakios-metal on the A650; smoother since 18 November but still a bit choppy, and one Reachability area is drawn wrong. Compute, copy/fill and offscreen render through Metal.framework pass |
+| Wi-Fi | works | QCA6390 on PCIe 0 with the phone's own firmware; joins a network from Settings |
+| Bluetooth | partial | QCA6390 on QUP0 SE6; Classic earbuds connect from Settings and play A2DP (AAC-LC). Control Center tile and CoreBluetooth discovery open |
+| Sound | works | both speakers (TFA9874) through the audio DSP |
+| Microphone | no | the driver is built; switching it on breaks touch |
+| Camera | partial | OV64B40 wide and IMX596 front preview in Camera.app; the OV8856 ultra-wide is not started |
+| Flashlight | works | from Control Center, with its levels (`munch_torch=3`) |
+| Haptics | works | Awinic AW86927 |
+| Battery | partial | level, voltage, current and temperature in the status bar; charging under this kernel is not done |
+| Auto-Lock | works | follows the Settings timeout; no dimming before the lock |
+| Thermal | partial | 25 sensors read; the prime core and the GPU slowed when hot; the stop at 105 °C not yet seen |
+| Cellular | no | the Snapdragon X55 is found on PCIe 2, but its boot ROM refuses the boot loader over BHI (`0xef0e0003`) |
+| Deep sleep | no | idle cores wait in WFI; no power collapse, no system suspend |
+| Passcode, Apple ID, Face ID | no | there is no Secure Enclave |
+| Sileo | works | with the `JB=1` image (Procursus bootstrap) |
+| Data across reboots | no, by design | everything lives in RAM |
 
-| Repository | Contents |
+Known problems: the music panel on the lock screen flickers (MediaRemoteUI crashes and is started again); a tear
+line can show while things move fast.
+
+## What is here
+
+| Path | What |
 |---|---|
-| [hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel) | **common**: the kernel port, every common driver, the loader, user space, the tools, this documentation, and `devices/qemu` |
-| [`hakios-metal/`](hakios-metal) | Metal's command model on the Adreno, through the kernel's GPU driver |
-| [hakios-sm7325](https://github.com/oosexgang/hakios-sm7325) | POCO X5 Pro 5G: its defconfig, status, UEFI platform, firmware script, and its SoC's layer (Qualcomm SC7280 family) |
-| [hakios-mt6768](https://github.com/oosexgang/hakios-mt6768) | Infinix Hot 20 (MediaTek Helio G85): an experimental port with its own loader. Not in this repository's manifest |
-| [hakios-uefi](https://github.com/oosexgang/hakios-uefi) | the firmware that starts the loader: Mu-Silicium with HakiOS's boot path, banner and name, and HakiOS's U-Boot |
-| [hackios-web](https://github.com/oosexgang/hackios-web) | the website |
-| [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland) | old: a pointer kept for its links. User space is `userland/` here |
+| `devices/munch/` | the device: drivers (display, touch, camera, torch, modem, Wi-Fi, audio, Bluetooth), configuration, UEFI platform sources, firmware script |
+| `hakios-metal/` | the Metal driver for the Adreno, through the kernel's GPU driver, with its host tests |
+| `userland/src/HakiosMetalCA.m` | the CoreAnimation plug-in that puts the desktop on Metal |
+| `drivers/`, `xnuloader/`, `xnu/`, `userland/`, `tools/` | HakiOS's common tree with the changes this port needed |
 
-How they fit: [the repositories](docs/porting/repositories.md).
+## Not here, by design
 
-## What you bring, and what is never here
+- No file of iOS. The user space is laid out from an iPhone X IPSW (iOS 16.5, 20F66) you get yourself.
+- No firmware of Qualcomm's or Xiaomi's. It comes off your own phone (`devices/munch/pull-firmware.sh`).
+- No UEFI binaries or device tree taken from a phone, no serial numbers, MAC addresses, IMEI or calibration data.
+- No keys, no activation, no Apple services (Apple ID, iCloud, App Store), no DRM circumvention.
+- No writes to the phone's storage: no `fastboot flash`, no partition written. The modem's file systems, once
+  cellular gets that far, are to be served read only.
 
-Nothing of Apple's and no vendor's firmware is in these repositories. The Darwin user space, if you want it, you lay out yourself from an
-IPSW you get yourself, and the firmware comes off your own phone; nothing is downloaded for you, decrypted or circumvented. Apple's
-services (activation, Apple ID, iCloud, the App Store) are not supported and not a goal.
-[What is in the repository, and what never is](docs/index.md#what-is-in-the-repository-and-what-never-is).
+## Building and running
 
-## Contributing
+What you need and the full steps: [devices/munch/README.md](devices/munch/README.md#what-you-need). In short:
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [COMMUNITY.md](COMMUNITY.md).
+```sh
+make munch_defconfig DEVICE=munch
+make kernel JOBS=12
+(cd userland && GL=1 REST=1 ./build.sh)
+./xl ramdisk userland/system.apfs      # once per loader session
+XL_SECS=1800 ./xl run
+```
 
-## License and legal
+Every kernel argument: [docs/boot-args.md](docs/boot-args.md). From Windows without WSL, `tools/mk-winboot.sh`
+makes a folder with `boot-ios.bat`. HakiOS's general guides: [docs/](docs/index.md).
 
-The XNU patch and the files derived from it are under the Apple Public Source License 2.0 ([LICENSE.APSL](LICENSE.APSL)), the rest under
-MIT ([LICENSE](LICENSE)), as the file headers say. Third parties: [NOTICE](NOTICE),
-[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md), [COMPLIANCE.md](COMPLIANCE.md). What is and is not distributed: [LEGAL.md](LEGAL.md).
-None of this is legal advice.
+## Credits
 
-HakiOS is an independent research project. It is **not affiliated with or endorsed by Apple**; "Darwin", "iPhone", "XNU" and "Apple" are
-named only to describe what the code works with. If you believe a file here infringes anyone's rights, open an issue and it will be
-removed.
+[HakiOS](https://github.com/oosexgang/hakios-xnu-kernel) and its team (the kernel port, loader, common drivers,
+user space and hakios-metal), [Mu-Silicium](https://github.com/Project-Silicium/Mu-Silicium) (UEFI), Mesa
+(freedreno, ir3), Apple's open-source releases (xnu and friends), and Qualcomm's and Xiaomi's published Linux
+kernel sources for the hardware details.
 
-## Team
+## Licenses
 
-hakios is an experimental project focused on bringing darwin to android hardware. our goal is to make hakios free and accessible to everyone.
+The XNU patch and the files derived from it are under the Apple Public Source License 2.0 ([LICENSE.APSL](LICENSE.APSL)),
+the rest under MIT ([LICENSE](LICENSE)), as the file headers say. Third parties: [NOTICE](NOTICE),
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md), [COMPLIANCE.md](COMPLIANCE.md). What is and is not distributed:
+[LEGAL.md](LEGAL.md). None of this is legal advice.
 
-@oodze - founder, @netusd - advertising / ceo-dev, @wannqn - dev, @hxfuxyyXD - dev, Rhaenja Hun（杭润嘉） - developer / sponsor
-
-tym sicilium for the sources!
+This is an independent research project, **not affiliated with or endorsed by Apple Inc. or Xiaomi**; "Darwin",
+"iPhone", "XNU", "Apple" and "POCO" are named only to describe what the code works with. If you believe a file here
+infringes anyone's rights, open an issue and it will be removed.

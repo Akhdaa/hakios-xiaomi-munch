@@ -55,6 +55,9 @@
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
 # On a Mac: flock, GNU timeout and stat, and Android's platform-tools, from tools/macos-bin (see its README)
 [ "$(uname)" = Darwin ] && PATH=$PWD/tools/macos-bin:$PWD/tools/macos-bin/platform-tools:$PATH
+# the device: $DEVICE, else the .config's CONFIG_DEVICE (make <name>_defconfig), else redwood
+DEVICE=${DEVICE:-$(sed -n 's/^CONFIG_DEVICE="\(.*\)"$/\1/p' .config 2>/dev/null)}
+DEVICE=${DEVICE:-redwood}
 # the kernel and the loader built here, or else the ones that come with the repository
 K=hakios-kernel                 # make kernel makes it
 [ -f $K ] || K=prebuilt/hakios-kernel
@@ -70,7 +73,12 @@ PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone
 # adb starts a server of its own the first time, and the server inherits every open descriptor: started during a run it
 # kept the run's lock (descriptor 8, below) for as long as it lived, and every later command said a run was in progress
 # (27 October). So adb never gets that descriptor.
-adb() { command adb "$@" 8>&-; }
+# The phone over USB, when adb also sees it (or another one) over the network (wireless debugging reconnects by
+# itself): "adb get-state" with two devices answers nothing, and the phone was taken for absent. XL_ADB_SERIAL=S: that one.
+adb() {
+	local serial=${XL_ADB_SERIAL:-$(command adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" && $1 !~ /:/ { print $1; exit }')}
+	command adb ${serial:+-s "$serial"} "$@" 8>&-
+}
 
 # one fastboot at a time (a run in one terminal, "xl screenshot" in another): each takes the lock for itself
 fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
@@ -128,7 +136,7 @@ firmware() {
 	case "${XL_FIRMWARE:-}" in
 	u-boot|silicium) echo "$XL_FIRMWARE"; return ;;
 	esac
-	if [ -f Mu-Silicium/Build/redwoodPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd ] || [ -f devices/redwood/prebuilt/SILICIUM_UEFI.fd ]; then
+	if [ -f "Mu-Silicium/Build/${DEVICE}Pkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd" ] || [ -f "devices/$DEVICE/prebuilt/SILICIUM_UEFI.fd" ]; then
 		echo silicium
 	else
 		echo u-boot
@@ -147,9 +155,16 @@ enter() {
 	esac
 	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L --usb >/dev/null || { echo "xl: payload build failed"; return 1; }
 	case "$(firmware)" in
-	u-boot) tools/mkubootimg.py -d "${DEVICE:-redwood}" -l $L -p usb-payload.bin -o xnu-usb.img >/dev/null ;;
-	*) ./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img >/dev/null ;;
+	u-boot) tools/mkubootimg.py -d "$DEVICE" -l $L -p usb-payload.bin -o xnu-usb.img >/dev/null ;;
+	*) DEVICE=$DEVICE ./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img >/dev/null ;;
 	esac || { echo "xl: image build failed ($(firmware))"; return 1; }
+	# a UEFI is made for one phone's memory map: boot it on no other (devices/<device>/uefi/image.conf says which)
+	local want product
+	want=$(sed -n 's/^PRODUCT=\([^ #]*\).*/\1/p' "devices/$DEVICE/uefi/image.conf" 2>/dev/null)
+	if [ -n "$want" ]; then
+		product=$(fb getvar product 2>&1 | sed -n 's/^product: *//p' | tr -d '\r')
+		[ "$product" = "$want" ] || { echo "xl: the phone says product '$product'; devices/$DEVICE's UEFI is for '$want'"; return 1; }
+	fi
 	# Right after the phone enters fastboot the first "boot" is sometimes not taken: try twice.
 	local try
 	for try in 1 2; do
@@ -167,18 +182,16 @@ fetch_log() { # fetch_log <file>
 	[ -s "$1" ] && tr -d '\0' < "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
-# A second kernel in one session of the loader dies at once (27 October, four runs: every run after one that returned,
-# whatever its arguments, gave no answer within 5 s; every first run of a session lived). Restart the phone into its own
-# bootloader between runs ("xl run" warns when this session has run a kernel already).
+# A second kernel in one session of the loader looked as if it died at once (27 October, 9 November). It did not: the
+# loader formatted the result "running" at the end of its log buffer, which the first run had filled, so "getvar result"
+# answered an empty value, and this loop took that for a run that was over. The loader now keeps room for the result;
+# an empty one is waited out here as well, for a loader built before that.
 run() { # run <oem command> <label>
-	if [ "$(state)" = loader ] && [ -f $PHONE.ran ]; then
-		echo "xl: warning: a kernel has already run in this session of the loader, and a second one has died at once every time it was tried"
-	fi
 	enter || return 1
 	exec 8> $PHONE.run
 	flock -n 8 || { echo "xl: a run is in progress, started from $(cat $PHONE.who 2>/dev/null) (xl stop ends it)"; return 1; }
 	pwd > $PHONE.who
-	local stamp log result
+	local stamp log result value
 	stamp=$(date +%H%M%S); log="logs/$stamp-$2.log"
 	if [ "$1" != "oem selftest" ]; then
 		# The kernel hands control back after XL_SECS seconds even if it is just waiting.
@@ -225,7 +238,9 @@ run() { # run <oem command> <label>
 		local deadline=$(( $(date +%s) + ${XL_SECS:-8} + 100 )) followed=$(date +%s)
 		while :; do
 			result=$(FB_TIMEOUT=15 fb getvar result | grep '^result:')
-			case "$result" in ""|*running*) ;; *) break ;; esac
+			# (over only when there is a result and it is not "running": no answer, or an empty one, is waited out)
+			value=${result#result:}; value=${value//[[:space:]]/}
+			case "$value" in ""|running*) ;; *) break ;; esac
 			[ "$(date +%s)" -ge "$deadline" ] && { result=; break; }
 			if [ -n "$XL_FOLLOW" ] && [ $(( $(date +%s) - followed )) -ge "$XL_FOLLOW" ]; then
 				followed=$(date +%s)
@@ -253,7 +268,8 @@ run() { # run <oem command> <label>
 	*hung*|*no-such-core*)
 		# (bootcpu=N) the kernel is stuck on the core it was given and nothing can take the core back
 		echo "xl: the kernel did not come back from its core; restarting the phone"
-		fb reboot >/dev/null
+		# (XL_HOME=fastboot: into its bootloader, as after any run, not into Android)
+		if [ "${XL_HOME:-android}" = fastboot ]; then fb oem reboot-bootloader >/dev/null; else fb reboot >/dev/null; fi
 		return 2 ;;
 	esac
 	# XL_REBOOT_AFTER=1: the run is over and the phone goes back to Android, which charges it. A phone left in the loader
@@ -369,7 +385,7 @@ log) enter && fb oem log >/dev/null && fetch_log logs/loader.log && cat logs/loa
 stop) not_anothers_run stop && fb oem stop | grep -q OKAY && echo "xl: asked the kernel to come back" ;;
 memmap) enter && fb oem memmap >/dev/null && fb oem log >/dev/null && fetch_log logs/loader.log && sed -n '/^memory map/,$p' logs/loader.log ;;
 hang) enter && fb oem hang; echo "xl: waiting for the watchdog..."; t0=$(date +%s); wait_for android 150 && echo "xl: back in Android after $(( $(date +%s) - t0 )) s" || echo "xl: not back (state: $(state))" ;;
-reboot) not_anothers_run reboot && fb reboot ;;
+reboot) not_anothers_run reboot && if [ "${XL_HOME:-android}" = fastboot ]; then fb oem reboot-bootloader; else fb reboot; fi ;;
 reload) [ "$(state)" = loader ] && { fb reboot >/dev/null; wait_for android 120; }; enter && echo "xl: loader is up" ;;
 state) state ;;
 *) awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0" ;;

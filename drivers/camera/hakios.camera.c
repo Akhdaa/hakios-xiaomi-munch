@@ -84,6 +84,7 @@
 #include <sys/hakios.audio.h>
 #include <sys/hakios.camera.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.version.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
@@ -240,8 +241,40 @@ static const struct sensor_hw sensors[] = {
 		.pattern_bayer = 2, .chip = "S5K4H7", .gain_unity = 32, .gain_max = 0x200,
 	},
 };
+/*
+ * The POCO F4 (munch, SM8250): its macro camera, a GalaxyCore GC02M1 (1600x1200 RAW10, RGGB; its
+ * table camera-gc02m1.tab from munch_sunny_gc02m1_macro's module file). On that phone this driver
+ * makes cam_fake's frames only: everything of the hardware above is the POCO X5 Pro's, and the
+ * POCO F4's is devices/munch/drivers/camera/hakios.munch_camera.c's, so any other cam= is refused
+ * there (hakios_camera_init()). Whichever sensor Darwin asks for, the frames are this one's, with
+ * the number it asked for in their header. Its gain registers are not known here yet: the OV02B10's
+ * scale, for the chart's light only.
+ */
+static const struct sensor_hw sensor_munch_macro = {
+	.name = "macro (GC02M1)", .tab = "camera-gc02m1.tab", .bus_name = "(the POCO F4's: not done here)", .regs = REGS_SMIA,
+	.bayer = 0, .pattern_bayer = 0, .chip = "GC02M1", .gain_unity = 16, .gain_max = 0xf8,
+};
+static const struct sensor_hw sensor_munch_wide = {
+	.name = "wide (OV64B40)", .tab = "camera-munch-ov64b40.tab", .bus_name = "CCI 0 master 0",
+	.regs = REGS_OV16, .bayer = 3, .chip = "OV64B40", .gain_unity = 0x100, .gain_max = 0x800,
+};
+static const struct sensor_hw sensor_munch_front = {
+	.name = "front (IMX596)", .tab = "camera-munch-imx596.tab", .bus_name = "CCI 1 master 1",
+	.regs = REGS_SMIA, .bayer = 0, .chip = "IMX596", .gain_unity = 0x100, .gain_max = 0x800,
+};
+extern bool hakios_munch_camera_stream_start(vm_offset_t, uint64_t, uint32_t, uint32_t, unsigned) __attribute__((weak));
+extern void hakios_munch_camera_stream_stop(void) __attribute__((weak));
+extern void hakios_munch_camera_stream_status(bool *, bool *) __attribute__((weak));
+extern void hakios_munch_camera_stream_queue(uint64_t) __attribute__((weak));
+extern bool hakios_munch_camera_stream_faulted(void) __attribute__((weak));
+extern bool hakios_munch_camera_stream_exposure(uint32_t, uint32_t, uint32_t) __attribute__((weak));
+extern void hakios_munch_camera_stream_focus(uint32_t) __attribute__((weak));
+extern uint32_t hakios_munch_camera_focus_position(uint32_t *, uint32_t *) __attribute__((weak));
+static bool munch_live;
+
 static const struct sensor_hw *hw = &sensors[0];
 static unsigned hw_index;
+static bool munch;              /* the POCO F4: cam_fake only, with sensor_munch_macro */
 
 static void
 show_pin(unsigned pin, const char *what)
@@ -1093,7 +1126,7 @@ static void
 select_sensor(unsigned i)
 {
 	hw_index = i;
-	hw = &sensors[i];
+	hw = munch_live ? (i == 2 ? &sensor_munch_front : &sensor_munch_wide) : munch ? &sensor_munch_macro : &sensors[i];
 	cci_bus.name = hw->bus_name;
 	cci_bus.sda = hw->sda;
 	cci_bus.scl = hw->scl;
@@ -3335,6 +3368,9 @@ exposure_limits(uint32_t *lines, uint32_t *gain, uint32_t *frame_lines)
 static bool
 exposure_write(uint32_t lines, uint32_t gain, uint32_t frame_lines)
 {
+	if (munch_live) {
+		return hakios_munch_camera_stream_exposure(lines, gain, frame_lines);
+	}
 	bool ok;
 
 	switch (hw->regs) {
@@ -3422,11 +3458,16 @@ darwin_stop(const char *why)
 {
 	lck_mtx_lock(&darwin_lock);
 	darwin_streaming = false;
+	darwin_ask.focus_pending = false;
 	for (int i = 0; i < RING; i++) {
 		place[i].state = PLACE_FREE;
 	}
 	lck_mtx_unlock(&darwin_lock);
 	wakeup(&darwin_frames_done);
+	if (munch_live) {
+		hakios_munch_camera_stream_stop();
+		goto release_ring;
+	}
 	if (!broken && darwin_source != SOURCE_CSID_TPG) {
 		(void)sensor_table("off");
 	}
@@ -3439,6 +3480,8 @@ darwin_stop(const char *why)
 	csiphy_down();
 	titan_down();
 	power_down();
+
+release_ring:
 	darwin_drain_readers();
 	ring_free();
 	say("camera: the frames for Darwin stopped (%s): %llu done, %llu given, %llu written over\n", why, darwin_frames_done, darwin_given,
@@ -3477,7 +3520,11 @@ darwin_start(void)
 		say("camera: the frames for Darwin: the CSID's colour bars, %ux%u (no sensor)\n", darwin_mode->width, darwin_mode->height);
 		return true;
 	}
-	if (!power_up() || !healthy() || !read_chip_id() || !sensor_table("init") || !sensor_table(darwin_res()) || !healthy() ||
+	if (munch_live) {
+		if (!hakios_munch_camera_stream_start(ring, ring_bytes, RAW10_STRIDE(darwin_mode->width), darwin_mode->height, hw_index)) {
+			return false;
+		}
+	} else if (!power_up() || !healthy() || !read_chip_id() || !sensor_table("init") || !sensor_table(darwin_res()) || !healthy() ||
 	    !titan_up() || !smmu_up() || !csid_reset() ||
 	    !csid_config((int)hw->csiphy, darwin_mode->lanes, ctab->lane_assign & ((1u << (4 * darwin_mode->lanes)) - 1), 0, darwin_mode->width,
 	    darwin_mode->height, darwin_mode->cphy != 0) || !ife_config(FRAME_ADDRESSES, ring_frame_bytes, 0) ||
@@ -3499,10 +3546,12 @@ darwin_start(void)
 	darwin_ask.pending = false;
 	lck_mtx_unlock(&darwin_lock);
 	exposure_limits(&lines, &gain, &frame_lines);
-	if (!sensor_table("on") || !exposure_write(lines, gain, frame_lines)) {
+	if ((!munch_live && !sensor_table("on")) || !exposure_write(lines, gain, frame_lines)) {
 		return false;
 	}
-	af_up(darwin_source == SOURCE_SENSOR);
+	if (!munch_live) {
+		af_up(darwin_source == SOURCE_SENSOR);
+	}
 	darwin_now.lines = darwin_next.lines = lines;
 	darwin_now.gain = darwin_next.gain = gain;
 	darwin_now.frame_lines = darwin_next.frame_lines = frame_lines;
@@ -3515,7 +3564,8 @@ darwin_start(void)
 static void
 darwin_session(void)
 {
-	int writing = 0, next = 0;      /* (place 0's address is the write master's from ife_config(): taken at the first SOF) */
+	int writing = 0, next = 0;
+	unsigned warmup = munch_live ? 4 : 0;      /* (place 0's address is the write master's from ife_config(): taken at the first SOF) */
 	uint64_t last_frame;
 
 	if (!darwin_start()) {
@@ -3524,23 +3574,39 @@ darwin_session(void)
 		return;
 	}
 	last_frame = darwin_ms();
-	blk_put(ife, "IFE", IFE_IRQ_CLEAR0, 0xffffffff, false);
-	blk_put(ife, "IFE", IFE_IRQ_GLOBAL_CLEAR, 1, false);
+	if (!munch_live) {
+		blk_put(ife, "IFE", IFE_IRQ_CLEAR0, 0xffffffff, false);
+		blk_put(ife, "IFE", IFE_IRQ_GLOBAL_CLEAR, 1, false);
+	}
 	lck_mtx_lock(&darwin_lock);
 	darwin_streaming = true;
 	darwin_last_read = darwin_ms();
 	lck_mtx_unlock(&darwin_lock);
 	while (!broken && darwin_open && darwin_switch_to == 0) {
-		uint32_t top, bus;
+		bool sof, done;
 		uint64_t now;
 
 		wait_ms(1);
 		now = darwin_ms();
-		top = rd(ife + IFE_IRQ_STATUS0);
-		bus = rd(ife + BUS_IRQ_STATUS1);
-		if (!(top & RDI0_SOF) && !(bus & WM0_DONE)) {
+		if (munch_live) {
+			hakios_munch_camera_stream_status(&sof, &done);
+		} else {
+			uint32_t top = rd(ife + IFE_IRQ_STATUS0);
+			uint32_t bus = rd(ife + BUS_IRQ_STATUS1);
+			sof = (top & RDI0_SOF) != 0;
+			done = (bus & WM0_DONE) != 0;
+			if (sof || done) {
+				blk_put(ife, "IFE", IFE_IRQ_CLEAR0, top & RDI0_SOF, false);
+				blk_put(ife, "IFE", IFE_IRQ_GLOBAL_CLEAR, 1, false);
+				blk_put(ife, "IFE", BUS_IRQ_CLEAR1, bus & WM0_DONE, false);
+				blk_put(ife, "IFE", BUS_IRQ_GLOBAL_CLEAR, 1, false);
+			}
+		}
+		if (!sof && !done) {
 			if (now - last_frame > FRAME_TIMEOUT_MS) {
-				show_paths("no frame");
+				if (!munch_live) {
+					show_paths("no frame");
+				}
 				give_up("no frame for 1.5 s");
 				break;
 			}
@@ -3549,18 +3615,14 @@ darwin_session(void)
 			}
 			continue;
 		}
-		blk_put(ife, "IFE", IFE_IRQ_CLEAR0, top & RDI0_SOF, false);
-		blk_put(ife, "IFE", IFE_IRQ_GLOBAL_CLEAR, 1, false);
-		blk_put(ife, "IFE", BUS_IRQ_CLEAR1, bus & WM0_DONE, false);
-		blk_put(ife, "IFE", BUS_IRQ_GLOBAL_CLEAR, 1, false);
 		lck_mtx_lock(&darwin_lock);
-		if (bus & WM0_DONE) {
-			uint32_t ping = rd(csid + CSID_RDI0_BYTES_PING), pong = rd(csid + CSID_RDI0_BYTES_PONG);
+		if (done) {
+			uint32_t ping = munch_live ? 0 : rd(csid + CSID_RDI0_BYTES_PING), pong = munch_live ? 0 : rd(csid + CSID_RDI0_BYTES_PONG);
 			uint32_t data = darwin_mode->width * 10 / 8 * darwin_mode->height;
 
 			last_frame = now;
 			darwin_frames_done++;
-			if ((ping != data || (pong != data && darwin_frames_done > 1)) && darwin_odd_frames++ < 8) {
+			if (!munch_live && (ping != data || (pong != data && darwin_frames_done > 1)) && darwin_odd_frames++ < 8) {
 				say("camera: frame %llu: the CSID counted %u and %u bytes (the mode's frame is %u)\n", darwin_frames_done, ping, pong,
 				    data);
 			}
@@ -3568,14 +3630,27 @@ darwin_session(void)
 				darwin_now = darwin_next;
 				darwin_next.from = 0;
 			}
-			place[writing].state = PLACE_READY;
+			place[writing].state = warmup > 0 ? PLACE_FREE : PLACE_READY;
+			if (warmup > 0) {
+				warmup--;
+			}
 			place[writing].sequence = darwin_frames_done;
 			place[writing].time = mach_absolute_time();
 			place[writing].exposure_lines = darwin_now.lines;
 			place[writing].gain = darwin_now.gain;
 			place[writing].frame_lines = darwin_now.frame_lines;
 		}
-		if (top & RDI0_SOF) {
+		if (munch_live && done) {
+			int target = (writing + 1) % RING;
+
+			while (place[target].state == PLACE_READING) {
+				target = (target + 1) % RING;
+			}
+			/* If readers hold every other buffer, overwrite this frame and skip publishing it. */
+			writing = target;
+			place[writing].state = PLACE_WRITING;
+			hakios_munch_camera_stream_queue((uint64_t)writing * ring_place_bytes);
+		} else if (!munch_live && sof) {
 			if (next >= 0) {
 				writing = next;         /* (the address given at the last SOF, taken at this one) */
 				next = -1;
@@ -3596,16 +3671,20 @@ darwin_session(void)
 				blk_put(ife, "IFE", IFE_REG_UPDATE, 0x2, false);
 			}
 		}
-		bool ask = (bus & WM0_DONE) && darwin_ask.pending, focus = (bus & WM0_DONE) && darwin_ask.focus_pending;
+		bool ask = done && darwin_ask.pending, focus = done && darwin_ask.focus_pending;
 		uint32_t lines = darwin_ask.lines, gain = darwin_ask.gain, frame_lines = darwin_ask.frame_lines, position = darwin_ask.focus;
 
 		darwin_ask.pending = darwin_ask.pending && !ask;
 		darwin_ask.focus_pending = darwin_ask.focus_pending && !focus;
 		lck_mtx_unlock(&darwin_lock);
 		if (focus) {
-			af_move(position);
+			if (munch_live && hakios_munch_camera_stream_focus != NULL) {
+				hakios_munch_camera_stream_focus(position);
+			} else if (!munch_live) {
+				af_move(position);
+			}
 		}
-		if (bus & WM0_DONE) {
+		if (done) {
 			wakeup(&darwin_frames_done);
 		}
 		if (ask && darwin_source != SOURCE_CSID_TPG) {
@@ -3620,7 +3699,15 @@ darwin_session(void)
 				darwin_next.from = darwin_frames_done + 2;
 			}
 		}
-		if ((bus & WM0_DONE) && darwin_frames_done % 30 == 0) {
+		if (munch_live && done && darwin_frames_done % 30 == 0) {
+			if (hakios_munch_camera_stream_faulted()) {
+				give_up("the munch IFE reported a fault");
+				break;
+			}
+			if (darwin_frames_done == 30) {
+				say("camera: munch %s completed 30 live frames\n", hw->chip);
+			}
+		} else if (!munch_live && done && darwin_frames_done % 30 == 0) {
 			uint32_t fsr = rd(smmu_context + SMMU_CB_FSR);
 
 			if (!healthy()) {
@@ -3896,7 +3983,8 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	f.frame_lines_max = FRAME_LINES_MAX;
 	f.margin = EXPOSURE_MARGIN;
 	f.sensor = hw_index;
-	f.focus = af_position;
+	f.focus = munch_live && hakios_munch_camera_focus_position != NULL ?
+	    hakios_munch_camera_focus_position(&f.focus_min, &f.focus_max) : af_position;
 	lck_mtx_unlock(&darwin_lock);
 
 	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
@@ -4008,10 +4096,14 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		return 0;
 	}
 	if (c.command == HAKIOS_CAMERA_SENSOR) {
-		if (c.a >= sizeof(sensors) / sizeof(sensors[0])) {
+		if (c.a >= sizeof(sensors) / sizeof(sensors[0]) || (munch_live && c.a != 1 && c.a != 2)) {
 			return EINVAL;
 		}
 		lck_mtx_lock(&darwin_lock);
+		if (c.b == ~0u && c.a == hw_index && darwin_switch_to == 0) {
+			lck_mtx_unlock(&darwin_lock);
+			return 0;
+		}
 		darwin_switch_mode = c.b;
 		darwin_switch_to = c.a + 1;
 		lck_mtx_unlock(&darwin_lock);
@@ -4051,13 +4143,18 @@ static bool
 darwin_select(unsigned index, uint32_t mode_n)
 {
 	select_sensor(index);
-	if (!fake) {
+	if (!fake && !munch_live) {
 		find_pins();
 	}
 	if (!ctab_load()) {
 		return false;
 	}
-	if (mode_n >= ctab->modes) {
+	if (munch_live) {
+		mode_n = index == 2 ? 1 : 2;
+		if (ctab->modes <= mode_n) {
+			return false;
+		}
+	} else if (mode_n >= ctab->modes) {
 		uint64_t best = 0;
 
 		mode_n = 0;
@@ -4216,6 +4313,11 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 		}
 	}
+	if (munch_live) {
+		serve_darwin();
+		thread_terminate(current_thread());
+		return;
+	}
 	if (fake) {
 		say("camera: cam=5 cam_fake=1: the %s camera's frames for Darwin are a chart made here; nothing of the phone is touched\n",
 		    hw->name);
@@ -4272,6 +4374,18 @@ hakios_camera_init(void)
 	uint32_t fake_n = 0;
 
 	fake = level == 5 && PE_parse_boot_argn("cam_fake", &fake_n, sizeof(fake_n)) && fake_n != 0;
+	munch = hakios_soc_is("sm8250");
+	munch_live = munch && !fake && level == 5 && hakios_munch_camera_stream_start != NULL &&
+	    hakios_munch_camera_stream_stop != NULL && hakios_munch_camera_stream_status != NULL &&
+	    hakios_munch_camera_stream_queue != NULL && hakios_munch_camera_stream_faulted != NULL &&
+	    hakios_munch_camera_stream_exposure != NULL;
+	if (munch && !fake && !munch_live) {
+		/* (this driver's pins, PMICs and clocks are another phone's: on this one they would be written blind) */
+		printf("camera: cam=%u refused: on the POCO F4 this driver makes only cam=5 cam_fake=1's chart; its hardware is "
+		    "munch_cam='s\n", level);
+		level = 0;
+		return;
+	}
 	if (level >= 3) {
 		/*
 		 * Memory in one piece for the host (cam_keep_mb, default 24: a 12-megapixel NV12 picture of cam=5,
@@ -4295,9 +4409,14 @@ hakios_camera_init(void)
 }
 
 /* At the run's end and on a panic's way out: whatever was switched on, off. */
+extern void hakios_munch_camera_quiesce(void) __attribute__((weak));      /* devices/munch/drivers/camera (munch_cam=3) */
+
 void
 hakios_camera_quiesce(void)
 {
+	if (hakios_munch_camera_quiesce != NULL && hakios_soc_is("sm8250")) {
+		hakios_munch_camera_quiesce();
+	}
 	if (level < 2 || tlmm == 0) {
 		return;
 	}

@@ -247,7 +247,14 @@ struct air_resource {
 };
 
 struct air_varying {
-   const char *name;  /* the AIR name that links vertex to fragment */
+   const char *name;  /* vertex: the link name; fragment: air.arg_name */
+   /* The identity Metal links the two stages by: the string after the
+    * air.vertex_output / air.fragment_input key, e.g. "generated(5colorDv4_f)".
+    * The same as `name` on the vertex side; NULL for a fragment input that has
+    * no air.fragment_input key. The slot is only the declaration order within
+    * one function, so a runtime that pairs stages must match on this.
+    */
+   const char *link_name;
    unsigned slot;     /* gl_varying_slot assigned by the translator */
    unsigned components;
    bool flat, centroid, sample, no_perspective;

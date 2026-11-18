@@ -121,6 +121,13 @@ __pycache__/
 !/devices/manifest.conf
 !/devices/README.md
 !/devices/qemu/
+# the POCO F4 (munch) lives in this fork itself; what was taken from the phone stays out
+!/devices/munch/
+/devices/munch/prebuilt/SILICIUM_UEFI.fd
+/devices/munch/prebuilt/device-tree.dtb
+/devices/munch/prebuilt/BootShim.bin
+/devices/munch/prebuilt/ramdisk
 
 # Android platform-tools for xl on a Mac (tools/macos-bin/README.md): not part of the repository
 /tools/macos-bin/platform-tools
+win-boot/

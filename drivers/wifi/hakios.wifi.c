@@ -169,6 +169,7 @@
 #include <sys/hakios.sta.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
+#include <sys/hakios.version.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -2799,6 +2800,7 @@ static struct {
 static uint32_t qrtr_peer;                      /* the DSP's node; 0: it has not said */
 static uint32_t qrtr_next_port = QRTR_FIRST_PORT, qrtr_in, qrtr_out, qrtr_hellos;
 static thread_t link_thread_is;
+static int (*qrtr_link)(const void *data, uint32_t length) = glink_send;      /* what carries the datagrams */
 
 /* One datagram out, of any type. */
 static int
@@ -2823,7 +2825,7 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
 	packet->to_node = to_node;
 	packet->to_port = to_port;
 	memcpy(packet + 1, data, length);
-	error = glink_send(packet, (uint32_t)sizeof(*packet) + padded);
+	error = qrtr_link(packet, (uint32_t)sizeof(*packet) + padded);
 	kfree_data(packet, sizeof(*packet) + padded);
 	qrtr_out += error == 0;
 	return error;
@@ -3090,6 +3092,37 @@ qrtr_close(struct hakios_qrtr_port *port)
 }
 
 static const struct hakios_qrtr_ops qrtr_ops = { .open = qrtr_open, .send = qrtr_send, .lookup = qrtr_lookup, .close = qrtr_close };
+
+/*
+ * The POCO F4's QCA6390 (hakios_munch_mhi.c) speaks QRTR too, over MHI's channels 20 and 21 instead
+ * of GLINK: one datagram in each transfer either way, as Linux's net/qrtr/mhi.c sends them. It hands
+ * its sender here, and from its own thread -- which is this layer's link thread from then on -- what
+ * the chip sends, and asks for the lookups' news; send NULL when the channels are gone. The QMI
+ * helpers get the transport here as they do for redwood.
+ */
+void
+hakios_wifi_qrtr_over(int (*send)(const void *data, uint32_t length))
+{
+	lck_mtx_lock(&qrtr_lock);
+	qrtr_link = send != NULL ? send : glink_send;
+	qrtr_peer = 0;
+	qrtr_hellos = qrtr_in = qrtr_out = 0;
+	bzero(qrtr_servers, sizeof(qrtr_servers));
+	lck_mtx_unlock(&qrtr_lock);
+	hakios_qmi_set_transport(send != NULL ? &qrtr_ops : NULL);
+}
+
+void
+hakios_wifi_qrtr_input(const uint8_t *data, uint32_t length)
+{
+	link_thread_is = current_thread();
+	lck_mtx_lock(&qrtr_calling);
+	if (data != NULL) {
+		qrtr_input(data, length);
+	}
+	qrtr_fresh();
+	lck_mtx_unlock(&qrtr_calling);
+}
 
 /* ---- the link's thread -------------------------------------------------------------------------------- */
 
@@ -3658,7 +3691,7 @@ smmu_look(void)
  */
 #define RADIO_ADDRESSES         0xa0000000ull
 #define RADIO_ADDRESSES_SIZE    0x10000000u
-#define RADIO_TABLES            32              /* of 4K: the root, one of the second level, and 2 MB of addresses each other */
+#define RADIO_TABLES            48              /* of 4K: the root, one of the second level, and 2 MB of addresses each other */
 #define RADIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11) /* a page; for requests of either
 	                                                                                  * privilege; shared, accessed, not
 	                                                                                  * global: Linux's for a device */
@@ -3702,13 +3735,15 @@ smmu_look(void)
 
 static struct {
 	uint32_t wanted;                /* wifi_smmu */
+	uint32_t stream, stream_mask;   /* what the match register is to match: RADIO_STREAM, RADIO_STREAM_MASK but on munch */
 	bool found, on;
 	uint32_t page, pages;           /* of the SMMU's registers: a page's size, and how many before the contexts' */
 	uint32_t match, context;        /* the stream match register and the context taken for the radio */
 	uint32_t old_smr, old_s2cr, old_sctlr;
 	vm_offset_t tables;             /* RADIO_TABLES of them, the root first */
 	uint32_t table_count;
-	uint64_t next;                  /* of the radio's addresses, the first not handed out (from RADIO_ADDRESSES) */
+	uint64_t next;                  /* of the radio's addresses, the first not handed out (from base) */
+	uint64_t base;                  /* where the radio's addresses begin: RADIO_ADDRESSES unless asked otherwise */
 } radio_space;
 static struct block apps_smmu_second = { "apps smmu", 0, 0x1000 };              /* the second page: a word per context */
 static struct block apps_smmu_context = { "apps smmu, the radio's context", 0, 0x1000 };
@@ -3854,13 +3889,14 @@ radio_space_faults(void)
 static bool
 radio_space_on(void)
 {
-	uint32_t smr = SMMU_SMR(radio_space.match), s2cr = SMMU_S2CR(radio_space.match), sees = 1u << 31 | RADIO_STREAM_MASK << 16 |
-	    RADIO_STREAM;
+	bool munch = radio_space.stream != 0;
+	uint32_t stream = munch ? radio_space.stream : RADIO_STREAM, stream_mask = munch ? radio_space.stream_mask : RADIO_STREAM_MASK;
+	uint32_t smr = SMMU_SMR(radio_space.match), s2cr = SMMU_S2CR(radio_space.match), sees = 1u << 31 | stream_mask << 16 | stream;
 	uint64_t root = kvtophys(radio_space.tables) | (uint64_t)radio_space.context << 48;     /* tagged with the context's number */
 
 	printf("wifi: %u: THE SMMU IS ABOUT TO BE WRITTEN: context %u gets page tables of ours (root %#llx) and is switched on, and "
 	    "match register %u sends stream %#x mask %#x through it; before: smr %#x, s2cr %#x, the context's sctlr %#x\n", step,
-	    radio_space.context, root & PTE_ADDRESS, radio_space.match, RADIO_STREAM, RADIO_STREAM_MASK, radio_space.old_smr,
+	    radio_space.context, root & PTE_ADDRESS, radio_space.match, stream, stream_mask, radio_space.old_smr,
 	    radio_space.old_s2cr, radio_space.old_sctlr);
 	sleep_ms(pause_ms);
 	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, 0);
@@ -3896,7 +3932,7 @@ radio_space_on(void)
 	    get(&apps_smmu_context, "ttbr0, low", SMMU_CB_TTBR0) != (uint32_t)root ||
 	    get(&apps_smmu_context, "ttbr0, high", SMMU_CB_TTBR0 + 4) != (uint32_t)(root >> 32)) {
 		printf("wifi: %u: THE SMMU DID NOT TAKE WHAT WAS WRITTEN: stream %#x is not going through context %u\n", step,
-		    RADIO_STREAM, radio_space.context);
+		    stream, radio_space.context);
 		return false;
 	}
 	get(&apps_smmu_context, "tcr", SMMU_CB_TCR);
@@ -3937,7 +3973,7 @@ radio_map(uint64_t physical, uint64_t size, uint64_t attributes, unsigned long l
 	if (radio_space.next + size > RADIO_ADDRESSES_SIZE) {
 		return false;
 	}
-	*address = RADIO_ADDRESSES + radio_space.next;
+	*address = (radio_space.base != 0 ? radio_space.base : RADIO_ADDRESSES) + radio_space.next;
 	radio_space.next += size;
 	if (whole) {
 		radio_space.wanted = 2;
@@ -3969,6 +4005,45 @@ bool
 hakios_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address)
 {
 	return radio_map(physical, size, RADIO_PTE, address);
+}
+
+/*
+ * The POCO F4's QCA6390 (hakios_munch_mhi.c) is behind the same stream: PCIe 0's, 0x1c00 for the
+ * root port and 0x1c01 for bus 1 (dt: iommu-map of qcom,pcie@1c00000), which the mask 1 covers; its
+ * addresses are where Android puts them too (cnss_pci_iommu_group: 256 MB from 0xa0000000) and its
+ * MSI goes to the same register of the GIC, SPI 768 on (qcom,pci-msi). So all of the above serves
+ * it as it is: asked for, without wifi_smmu=2, and taken back when the card is in reset again. But
+ * one thing: munch's hypervisor does not take a match register with a mask for these streams (30
+ * October: 0x80011c00 written, 0 read back; the sound's 0x80001801 is taken), so the stream is
+ * matched alone, as Android's arm-smmu matches it: the card's, 0x1c01, by default.
+ */
+void
+hakios_wifi_radio_space_want(uint32_t stream, uint32_t mask)
+{
+	radio_space.wanted = 2;
+	radio_space.stream = stream;
+	radio_space.stream_mask = mask;
+}
+
+/*
+ * Where the device's addresses begin, before the first is handed out: the device tree's pool for it, as Android has
+ * it. The QCA6390's is RADIO_ADDRESSES (cnss_pci_iommu_group); the POCO F4's X55 has 0x20000000 (qcom,mhi@0's
+ * mhi_0_iommu_group, qcom,iommu-dma-addr-pool), and at 0xa0000000 its boot ROM failed to read its boot loader.
+ */
+void
+hakios_wifi_radio_space_base(uint64_t base)
+{
+	if (radio_space.next == 0 && base != 0 && base + RADIO_ADDRESSES_SIZE <= (1ull << 39)) {
+		radio_space.base = base;
+	}
+}
+
+void
+hakios_wifi_radio_space_off(void)
+{
+	lck_mtx_lock(&hakios_smmu_lock);
+	radio_space_off();
+	lck_mtx_unlock(&hakios_smmu_lock);
 }
 
 /*
@@ -4037,9 +4112,19 @@ const uint8_t *
 hakios_wifi_driver_file(const char *name, uint64_t *size)
 {
 	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
+	/* munch: what Android's cnss2 loads on a global phone (qmi.c: ro.boot.hwc GLOBAL, ELF_BDF_FILE_NAME_L11R_GLOBAL) */
+	static const char *const munch_files[][2] = { { "board.bin", "bd_l11rgl.elf" }, { "regdb.bin", "regdb.bin" }, { "m3.bin", "m3.bin" } };
 	const char *last = strrchr(name, '/');
 
 	last = last == NULL ? name : last + 1;
+	if (hakios_soc_is("sm8250")) {
+		for (unsigned i = 0; i < sizeof(munch_files) / sizeof(munch_files[0]); i++) {
+			if (strcmp(last, munch_files[i][0]) == 0) {
+				return image_file(munch_files[i][1], size);
+			}
+		}
+		return NULL;
+	}
 	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
 		if (strcmp(last, files[i][0]) == 0) {
 			return image_file(files[i][1], size);
@@ -4150,6 +4235,40 @@ static bool(*const steps[])(void) = {
  * Where a run ends in order while the DSP runs (the run's time is up, the host asks for its
  * end), and when the steps are over: the DSP is stopped (dsp_shutdown()).
  */
+/*
+ * The driver's way down can wait for ever, for a firmware that has gone (its mode "off", with no network joined: 2 November,
+ * xl stop did not come back, and the run went on without its GPU). battery_stop and thermal_stop end a run this way as well,
+ * and they must get to the end: it is given five seconds, in a thread of its own.
+ */
+static volatile bool lx_is_down;
+
+static void
+lx_stop_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	hakios_lx_stop();
+	lx_is_down = true;
+	thread_terminate(current_thread());
+}
+
+static bool
+lx_stopped_in_time(void)
+{
+	thread_t thread;
+
+	if (kernel_thread_start(lx_stop_thread, NULL, &thread) != KERN_SUCCESS) {
+		hakios_lx_stop();
+		return true;
+	}
+	thread_deallocate(thread);
+	for (unsigned waited = 0; waited < 500 && !lx_is_down; waited++) {
+		delay_for_interval(10, NSEC_PER_MSEC);
+	}
+	if (!lx_is_down) {
+		tell("wifi: the driver has not come down after 5 s: the card is cut off without it\n");
+	}
+	return lx_is_down;
+}
+
 void
 hakios_wifi_stop(void)
 {
@@ -4158,6 +4277,19 @@ hakios_wifi_stop(void)
 		sleep_ms(10);
 	}
 	hakios_apple80211_summary();
+	if (hakios_soc_is("sm8250")) {
+		if (whole) {
+			if (!lx_stopped_in_time()) {
+				hakios_munch_wifi_quiesce();
+				return;
+			}
+			hakios_munch_wifi_down();
+			hakios_wifi_qrtr_over(NULL);
+			hakios_wifi_radio_space_off();
+			tell("wifi: the radio is off: the card held in reset, without power\n");
+		}
+		return;
+	}
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started && !dirty) {
 		bool down = dsp_shutdown("the run is about to end");
@@ -4182,6 +4314,11 @@ void
 hakios_wifi_quiesce(void)
 {
 	hakios_apple80211_summary();           /* (also when the run is ended from the phone: five fingers) */
+	if (hakios_soc_is("sm8250")) {
+		hakios_munch_wifi_quiesce();   /* (the card, if it is still up, can reach no memory after this) */
+		radio_space_off();
+		return;
+	}
 	if (!dsp_started || dirty) {
 		return;
 	}
@@ -4307,6 +4444,73 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 }
 
 /*
+ * wifi=1 on the POCO F4 (munch): no DSP and no GLINK. The memory the radio is shown, QRTR over the
+ * channels of hakios_munch_mhi.c for the QMI helpers, and the driver, which powers the card
+ * through lx_os_rproc_boot() (hakios_munch_wifi_up()) once its service lookup is in place.
+ */
+static void
+munch_whole_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint64_t began = now_us();
+	uint32_t stream = 0x1c01, mask = 0;
+	int error;
+
+	PE_parse_boot_argn("pcie_sid", &stream, sizeof(stream));
+	PE_parse_boot_argn("pcie_sid_mask", &mask, sizeof(mask));
+	hakios_wifi_radio_space_want(stream, mask);
+	if (hakios_lx_prepare() != 0) {
+		tell("wifi: NO MEMORY FOR THE RADIO in one piece: it is not brought up\n");
+		whole_runs = false;
+		thread_terminate(current_thread());
+	}
+	hakios_wifi_qrtr_over(hakios_munch_qrtr_send);
+	step = 15;
+	error = hakios_lx_start();
+	if (error == 0) {
+		tell("wifi: THE RADIO IS UP, %llu.%llu s after the kernel began on it\n", (now_us() - began) / 1000000,
+		    (now_us() - began) / 100000 % 10);
+		join_given(began);
+	} else {
+		tell("wifi: THE RADIO DID NOT COME UP (%d), %llu s in. The last of what was said on the way:\n", error,
+		    (now_us() - began) / 1000000);
+		say_kept();
+		hakios_munch_wifi_down();
+		hakios_wifi_qrtr_over(NULL);
+		hakios_wifi_radio_space_off();
+	}
+	whole_runs = false;
+	thread_terminate(current_thread());
+}
+
+static void
+munch_wifi_init(void)
+{
+	uint32_t on = 0, back = 0;
+	uint64_t size = 0;
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on != 1) {
+		return;
+	}
+	if (image_file("amss20.bin", &size) == NULL) {
+		printf("wifi: wifi=1, but the QCA6390's firmware is not in the small image (fw-wifi/): no Wi-Fi\n");
+		return;
+	}
+	whole = whole_runs = true;
+	quiet = !(PE_parse_boot_argn("wifi_loud", &back, sizeof(back)) && back);
+	hakios_lx_net_early();
+	pause_ms = watch_seconds = 0;
+	new_from = STEPS + 1;
+	if (kernel_thread_start(munch_whole_thread, NULL, &thread) != KERN_SUCCESS) {
+		whole_runs = false;
+		tell("wifi: no thread: the radio is not brought up\n");
+		return;
+	}
+	thread_deallocate(thread);
+	tell("wifi: the radio is being brought up beside the system's start (wifi=1)\n");
+}
+
+/*
  * Called while the system starts, before there is a root file system. With wifi_step=N the start
  * waits until the steps are over (see hakios_adreno_init()); with wifi=1 it does not.
  */
@@ -4317,6 +4521,13 @@ hakios_wifi_init(void)
 	uint64_t size = 0;
 	thread_t thread;
 
+	if (hakios_soc_is("sm8250")) {
+		munch_wifi_init();
+		return;
+	}
+	if (!hakios_soc_is("sc7280")) {
+		return;                 /* (the addresses below are the POCO X5 Pro's) */
+	}
 	PE_parse_boot_argn("wifi_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on == 0)) {
 		return;

@@ -10,9 +10,18 @@
  * says more).
  *
  * Register layout: Linux drivers/cpufreq/qcom-cpufreq-hw.c ("epss" variant).
+ *
+ * The POCO F4 (munch, hw=munch) has the same block at the same address (dt qcom,cpufreq-hw-epss,
+ * a 4-byte row as here) and the same groups: cores 0-3 Cortex-A55s, 4-6 Cortex-A77s, 7 the prime
+ * A77. Its prime core is not raised to its top row (3187 MHz) but to the highest at or under
+ * 2800 MHz: boot-arg cpufreq_prime_mhz=N for another limit, 0 for none. It goes back to the highest at
+ * or under 2400 MHz (2361.6), what it ran at before, while bsd/dev/hakios_thermal.c finds the phone
+ * hot (hakios_cpufreq_hot()). Its memory bandwidth vote is off unless ddr=2 asks for it. There, the rows are not
+ * kept at the top: the governor below (cpugov) moves each group between its lowest row and that limit with the load.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <kern/locks.h>
 #include <os/atomic_private.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -20,6 +29,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
+#include <sys/hakios.version.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -27,6 +37,7 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
+extern lck_mtx_t hakios_rsc_lock;      /* RPMh's sequencer, shared with the supplies' and the touch screen's drivers */
 
 /*
  * The loader's log as well: this runs early, and the kernel's own log of a run keeps only its end. With
@@ -86,6 +97,72 @@ domain_of(uint32_t phys_id)
 	return core < 4 ? 0 : core < 7 ? 1 : 2;
 }
 
+/* The most a group is raised to, in kHz; 0: its top row. */
+static uint32_t domain_cap_khz[EPSS_DOMAINS];
+#define PRIME_HOT_KHZ           2400000         /* the most the prime core runs at while the phone is hot */
+#define PRIME_DOMAIN            2
+static vm_offset_t prime_base;
+static uint32_t prime_row, prime_hot_row, prime_khz, prime_hot_khz;
+
+/*
+ * The governor (boot-arg cpugov; on by default on munch, cpugov=0 keeps every group at its top row as
+ * before), made to do what the E404 kernel's configuration does on this phone (schedutil, the device
+ * tree's qcom,cpufreq-table-N, no effcpu, no input boost):
+ *
+ *   the rows     only those whose frequency is in the device tree's qcom,cpufreq-table-N for the group
+ *                (qcom-cpufreq-hw.c invalidates the others): small 883.2 to 1804.8 MHz, big 825.6 to 2419.2,
+ *                prime 844.8 to 3187.2 -- under the cap (cpufreq_prime_mhz=, 2800) and the prime core's hot
+ *                row while hakios_thermal.c finds the phone hot
+ *   the load     each core's busy share every GOV_EVERY_MS, made frequency-invariant (times the row's speed
+ *                over the group's top speed, as the scheduler's capacity is); per group the busiest core's,
+ *                kept as PELT keeps a utilisation: an average that halves in GOV_HALF_LIFE_MS, but never below
+ *                what was just seen (util_est: up at once, down at PELT's pace)
+ *   the speed    schedutil's get_next_freq(): 1.25 x the top speed x the utilisation, the lowest allowed row at
+ *                or above it; every look may change it (E404's rate_limit_us is 2000, under one look)
+ */
+#define GOV_EVERY_MS            10
+#define GOV_HALF_LIFE_MS        32
+#define GOV_DECAY_256           206             /* 256 x 0.5^(10/32) */
+#define GOV_HEADROOM            125             /* percent */
+#define GOV_NOTE_SECONDS        30
+static bool gov_on;
+static vm_offset_t gov_base[EPSS_DOMAINS];
+static uint32_t gov_khz[EPSS_DOMAINS][EPSS_TABLE_ROWS], gov_now[EPSS_DOMAINS], gov_cores[EPSS_DOMAINS], gov_top_khz[EPSS_DOMAINS];
+static bool gov_allowed[EPSS_DOMAINS][EPSS_TABLE_ROWS];
+static volatile uint32_t gov_cap[EPSS_DOMAINS];        /* the highest row allowed */
+/*
+ * While the panel sleeps (the screen blanked: hakios_cpufreq_screen()), no group above these, as the POCO F4 port of
+ * danya2271/ios-munch caps them (devices/poco-f4/POWER-MANAGEMENT.md): what runs then is background work.
+ */
+static const uint32_t gov_screen_off_khz[EPSS_DOMAINS] = { 1171200, 1382400, 1401600 };
+static volatile bool gov_screen_off;
+
+/* munch's dt cpufreq-hw node: qcom,cpufreq-table-0..2 (kHz), the frequencies E404 lets each group run at */
+static const uint32_t munch_table0[] = { 883200, 979200, 1075200, 1171200, 1248000, 1344000, 1420800, 1516800, 1612800,
+	                                  1708800, 1804800 };
+static const uint32_t munch_table1[] = { 825600, 940800, 1056000, 1171200, 1286400, 1382400, 1478400, 1574400, 1670400,
+	                                  1766400, 1862400, 1958400, 2054400, 2150400, 2246400, 2342400, 2419200 };
+static const uint32_t munch_table2[] = { 844800, 960000, 1075200, 1190400, 1305600, 1401600, 1516800, 1632000, 1747200,
+	                                  1862400, 1977600, 2073600, 2169600, 2265600, 2361600, 2457600, 2553600, 2649600,
+	                                  2745600, 2841600, 3187200 };
+
+static bool
+gov_in_table(uint32_t domain, uint32_t khz)
+{
+	const uint32_t *t = domain == 0 ? munch_table0 : domain == 1 ? munch_table1 : munch_table2;
+	unsigned n = domain == 0 ? sizeof(munch_table0) / 4 : domain == 1 ? sizeof(munch_table1) / 4 : sizeof(munch_table2) / 4;
+
+	if (!hakios_soc_is("sm8250")) {
+		return true;
+	}
+	for (unsigned i = 0; i < n; i++) {
+		if (t[i] == khz) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
 raise_domain(uint32_t domain, uint32_t cores)
 {
@@ -100,14 +177,149 @@ raise_domain(uint32_t domain, uint32_t cores)
 		if (row > 0 && khz <= top_khz) {
 			break;                  /* the table ends by repeating its last row */
 		}
+		gov_top_khz[domain] = khz;      /* (the group's top speed, cap or not: the scale of its utilisation) */
+		if (row > 0 && domain_cap_khz[domain] != 0 && khz > domain_cap_khz[domain]) {
+			break;                  /* (the rows go up: the ones after this are faster still) */
+		}
 		top = row;
 		top_khz = khz;
+		gov_khz[domain][row] = khz;
+		gov_allowed[domain][row] = gov_in_table(domain, khz);
+		if (domain == PRIME_DOMAIN && khz <= PRIME_HOT_KHZ) {
+			prime_hot_row = row;
+			prime_hot_khz = khz;
+		}
 	}
+	if (domain == PRIME_DOMAIN) {
+		prime_base = base;
+		prime_row = top;
+		prime_khz = top_khz;
+	}
+	gov_base[domain] = base;
+	gov_cores[domain] = cores;
+	gov_cap[domain] = top;
+	gov_now[domain] = top;
 	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
 	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
 	delay_for_interval(20, NSEC_PER_MSEC);
-	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz\n", domain, cores, was, top,
-	    top_khz / 1000);
+	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz%s\n", domain, cores, was, top,
+	    top_khz / 1000, domain_cap_khz[domain] != 0 ? " (limited)" : "");
+}
+
+static void
+gov_set(uint32_t domain, uint32_t row)
+{
+	if (row != gov_now[domain]) {
+		gov_now[domain] = row;
+		*(volatile uint32_t *)(gov_base[domain] + EPSS_PERF_STATE) = row;
+	}
+}
+
+static void
+gov_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	const ml_topology_info_t *topology = ml_get_topology_info();
+	static const char *const names[EPSS_DOMAINS] = { "small", "big", "prime" };
+	uint64_t idle_before[MAX_CPUS] = { 0 }, then, last_note, note_every, khz_sum[EPSS_DOMAINS] = { 0 }, samples = 0;
+	uint32_t changes = 0, at_top[EPSS_DOMAINS] = { 0 }, util[EPSS_DOMAINS] = { 0 };      /* utilisation in 1/1024 of the top */
+
+	nanoseconds_to_absolutetime((uint64_t)GOV_NOTE_SECONDS * NSEC_PER_SEC, &note_every);
+	for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
+		(void)ml_cpu_idle_time((int)i, &idle_before[i]);
+	}
+	then = last_note = mach_absolute_time();
+	tell("cpugov: schedutil as E404 has it: every %u ms, the device tree's cpufreq tables, 1.25 x the utilisation (half-life "
+	    "%u ms); cpugov=0: always the top row\n", GOV_EVERY_MS, GOV_HALF_LIFE_MS);
+	for (;;) {
+		uint32_t seen[EPSS_DOMAINS] = { 0 };
+		uint64_t now;
+
+		delay_for_interval(GOV_EVERY_MS, NSEC_PER_MSEC);
+		now = mach_absolute_time();
+		for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
+			uint64_t idle = 0, busy;
+			uint32_t d = domain_of(topology->cpus[i].phys_id), invariant;
+
+			if (now <= then || !ml_cpu_idle_time((int)i, &idle) || gov_top_khz[d] == 0) {
+				continue;
+			}
+			busy = (now - then) > (idle - idle_before[i]) ? (now - then) - (idle - idle_before[i]) : 0;
+			idle_before[i] = idle;
+			invariant = (uint32_t)(1024 * busy / (now - then) * gov_khz[d][gov_now[d]] / gov_top_khz[d]);
+			seen[d] = invariant > seen[d] ? invariant : seen[d];
+		}
+		then = now;
+		for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+			uint32_t cap = gov_cap[d], want = 0, before = gov_now[d];
+			uint64_t need;
+
+			if (gov_cores[d] == 0 || gov_base[d] == 0) {
+				continue;
+			}
+			while (gov_screen_off && cap > 0 && gov_khz[d][cap] > gov_screen_off_khz[d]) {
+				cap--;
+			}
+			util[d] = (util[d] * GOV_DECAY_256 + seen[d] * (256 - GOV_DECAY_256)) / 256;
+			util[d] = seen[d] > util[d] ? seen[d] : util[d];
+			need = (uint64_t)gov_top_khz[d] * util[d] * GOV_HEADROOM / 100 / 1024;
+			/* the lowest allowed row at or above it; the highest allowed one under the cap if none is */
+			for (want = 0; want < cap && !(gov_allowed[d][want] && gov_khz[d][want] >= need); want++) {
+			}
+			while (want > 0 && !gov_allowed[d][want]) {
+				want--;
+			}
+			gov_set(d, want);
+			changes += gov_now[d] != before;
+			khz_sum[d] += gov_khz[d][gov_now[d]];
+			at_top[d] += gov_now[d] == cap;
+		}
+		samples++;
+		if (now - last_note >= note_every && samples != 0) {
+			char line[200];
+			int at = snprintf(line, sizeof(line), "cpugov: the last %u s on average:", GOV_NOTE_SECONDS);
+
+			for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+				if (gov_cores[d] != 0 && at < (int)sizeof(line) - 40) {
+					at += snprintf(line + at, sizeof(line) - at, " %s %llu MHz (%llu %% at the top),", names[d],
+					    khz_sum[d] / samples / 1000, 100ull * at_top[d] / samples);
+				}
+				khz_sum[d] = 0;
+				at_top[d] = 0;
+			}
+			tell("%s %u changes\n", line, changes);
+			samples = 0;
+			changes = 0;
+			last_note = now;
+		}
+	}
+}
+
+/* From the panel's driver (devices/munch/drivers/display/hakios.munch_panel.c): the screen is blanked, or back. */
+void
+hakios_cpufreq_screen(bool off)
+{
+	if (gov_on && gov_screen_off != off) {
+		gov_screen_off = off;
+		tell("cpugov: the screen is %s: %s\n", off ? "off" : "on", off ? "no group above 1171/1382/1401 MHz" : "the caps lifted");
+	}
+}
+
+/* From bsd/dev/hakios_thermal.c: the prime core down to where it is cool, or back up. */
+void
+hakios_cpufreq_hot(bool hot)
+{
+	if (prime_base == 0 || prime_hot_row >= prime_row) {
+		return;
+	}
+	if (gov_on) {
+		/* (the governor keeps to it from its next look on, at most GOV_EVERY_MS from now) */
+		gov_cap[PRIME_DOMAIN] = hot ? prime_hot_row : prime_row;
+		tell("cpufreq: the prime core at most %u MHz (row %u)\n", (hot ? prime_hot_khz : prime_khz) / 1000,
+		    hot ? prime_hot_row : prime_row);
+		return;
+	}
+	*(volatile uint32_t *)(prime_base + EPSS_PERF_STATE) = hot ? prime_hot_row : prime_row;
+	tell("cpufreq: the prime core at %u MHz (row %u)\n", (hot ? prime_hot_khz : prime_khz) / 1000, hot ? prime_hot_row : prime_row);
 }
 
 /*
@@ -535,6 +747,73 @@ ddr_raise(void)
 	tell("ddr: memory bandwidth vote %u on MC0 (%#x) and SH0 (%#x)%s\n", vote, ddr_mc0, ddr_sh0, ddr_voted ? "" : ": FAILED");
 }
 
+/*
+ * Boot-arg ddr=3 (munch): what each vote gives the memory, before a governor for it can be written (E404 lowers the
+ * memory's clock with the load; here nobody knows yet which vote is which clock). 20 s after the start, each vote of
+ * the list on MC0 and SH0 in turn, 300 ms to settle, then one core writing and reading 16 MB four times: a line each.
+ * Then DDR_REST (ddr_rest=N), the middle of the range the firmware had voted in our name (see ddr_raise()), which the
+ * way back to the loader leaves too.
+ */
+static void
+ddr_sweep(void *arg __unused, wait_result_t wr __unused)
+{
+	static const uint32_t votes[] = { 0x3fff, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 16, 4 };
+	const vm_size_t size = 16u << 20;
+	vm_offset_t a = 0, b = 0;
+	uint32_t rest = DDR_REST;
+	volatile uint64_t sum = 0;
+
+	delay_for_interval(20, NSEC_PER_SEC);
+	ddr_mc0 = cmd_db_address("MC0");
+	ddr_sh0 = cmd_db_address("SH0");
+	ddr_acv = cmd_db_address("ACV");
+	if (ddr_mc0 == 0 || ddr_sh0 == 0 || ddr_acv == 0 ||
+	    kmem_alloc(kernel_map, &a, size, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS ||
+	    kmem_alloc(kernel_map, &b, size, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) {
+		tell("ddr: sweep: not done (MC0 %#x, SH0 %#x, ACV %#x, or no memory)\n", ddr_mc0, ddr_sh0, ddr_acv);
+		return;
+	}
+	ddr_rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	memset((void *)a, 1, size);
+	memset((void *)b, 2, size);
+	tell("ddr: sweep: each vote on MC0 (%#x) and SH0 (%#x), then one core writing and reading 16 MB four times\n", ddr_mc0, ddr_sh0);
+	for (unsigned v = 0; v < sizeof(votes) / sizeof(votes[0]); v++) {
+		uint64_t ns[2] = { 0, 0 };
+		bool voted;
+
+		lck_mtx_lock(&hakios_rsc_lock);
+		voted = ddr_vote(votes[v]);
+		lck_mtx_unlock(&hakios_rsc_lock);
+
+		ddr_voted |= voted;
+		delay_for_interval(300, NSEC_PER_MSEC);
+		for (int round = 0; round < 4; round++) {
+			uint64_t began = mach_absolute_time(), t;
+
+			memset((void *)a, round, size);
+			absolutetime_to_nanoseconds(mach_absolute_time() - began, &t);
+			ns[0] += t;
+			began = mach_absolute_time();
+			for (const uint64_t *p = (const uint64_t *)b, *end = (const uint64_t *)(b + size); p < end; p += 8) {
+				sum += p[0] + p[1] + p[2] + p[3] + p[4] + p[5] + p[6] + p[7];
+			}
+			absolutetime_to_nanoseconds(mach_absolute_time() - began, &t);
+			ns[1] += t;
+		}
+		tell("ddr: sweep: vote %5u%s: writing %llu MB/s, reading %llu MB/s (on core %llu)\n", votes[v], voted ? "" : " (NOT TAKEN)",
+		    ns[0] ? 4ull * (size >> 20) * 1000000000ull / ns[0] : 0, ns[1] ? 4ull * (size >> 20) * 1000000000ull / ns[1] : 0,
+		    (__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff);
+	}
+	PE_parse_boot_argn("ddr_rest", &rest, sizeof(rest));
+	rest = MIN(rest, 0x3fff);
+	lck_mtx_lock(&hakios_rsc_lock);
+	bool left = ddr_vote(rest);
+	lck_mtx_unlock(&hakios_rsc_lock);
+	tell("ddr: sweep: done; the vote left at %u: %s\n", rest, left ? "taken" : "NOT TAKEN");
+	kmem_free(kernel_map, a, size);
+	kmem_free(kernel_map, b, size);
+}
+
 /* On the way back to the loader (osfmk/arm64/loader_return.c: loader_return(), whatever the reason; the other processors are stopped) */
 void hakios_ddr_quiesce(void);
 
@@ -564,12 +843,27 @@ hakios_cpufreq_init(void)
 
 	load_start();
 	enabled = 2;
+	if (hakios_soc_is("sm8250")) {
+		uint32_t prime_mhz = 2800;
+
+		PE_parse_boot_argn("cpufreq_prime_mhz", &prime_mhz, sizeof(prime_mhz));
+		domain_cap_khz[2] = prime_mhz * 1000;
+		enabled = 0;                            /* (no memory bandwidth vote unless ddr=2) */
+	} else if (!hakios_soc_is("sc7280")) {
+		return;                                 /* another device's clocks are elsewhere */
+	}
 	PE_parse_boot_argn("ddr", &enabled, sizeof(enabled));
 	if (enabled == 1) {
 		ddr_look();
 		ddr_slots();
 	} else if (enabled == 2 && cpufreq_wanted()) {
 		ddr_raise();
+	} else if (enabled == 3) {
+		thread_t thread;
+
+		if (kernel_thread_start(ddr_sweep, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
 	}
 	enabled = 0;
 	if (!PE_parse_boot_argn("cpufreq", &enabled, sizeof(enabled)) || !enabled) {
@@ -587,6 +881,18 @@ hakios_cpufreq_init(void)
 		}
 	}
 	printf("cpufreq: on core %u a loop ran at %u, now at %u\n", here, before, loop_speed());
+	{
+		uint32_t gov = hakios_soc_is("sm8250") ? 1 : 0;
+		thread_t thread;
+
+		PE_parse_boot_argn("cpugov", &gov, sizeof(gov));
+		gov_on = gov != 0;
+		if (gov_on && kernel_thread_start(gov_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			gov_on = false;
+		}
+	}
 	/* membench has its own variable: when the boot-arg is absent, the cpufreq value (2 means on) must not start the benchmark */
 	PE_parse_boot_argn("membench", &membench, sizeof(membench));
 	if (membench == 1) {

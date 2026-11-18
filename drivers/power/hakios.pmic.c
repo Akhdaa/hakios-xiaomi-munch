@@ -1,8 +1,8 @@
 /*
  * What is on the phone's power-management chips, and what time their clock says. Only with boot-arg pmic=1.
  *
- * The phone's PMICs (the PMK8350 and PM7325 beside the SoC, with a PM8350C and others on the board) hang on
- * one serial bus, SPMI, and the SoC reaches them through the "PMIC arbiter" (dt: qcom,spmi@c440000). Each chip
+ * The phone's PMICs (on the POCO X5 Pro the PMK8350, PM7325 and PM8350C; on the POCO F4 the PM8150, PM8150B, PM8150L and
+ * PM8009) hang on one serial bus, SPMI, and the SoC reaches them through the "PMIC arbiter" (dt: qcom,spmi@c440000). Each chip
  * is a set of small blocks ("peripherals", 256 registers each) with a type and a subtype in registers 0x04
  * and 0x05: a GPIO, a regulator, the power-on block, a temperature alarm, a flash LED driver, a charger, the
  * real-time clock. Android's drivers find theirs from the device tree. This one asks the arbiter what it has
@@ -10,12 +10,12 @@
  * be written for one of these blocks starts from what the phone really has instead of from what a table
  * for another phone says (this phone's device tree has no node for its real-time clock, for instance).
  *
- * THIS DRIVER ONLY READS. It reads through the arbiter's "observer" channels exactly as drivers/input/hakios.buttons.c
+ * THIS DRIVER ONLY READS. It reads through the arbiter's "observer" channels exactly as bsd/dev/hakios_buttons.c
  * does, one bus transfer at a time under the same lock (hakios_spmi_lock()), and writes only the command word
  * that asks the arbiter for a read. Nothing is written to a PMIC: they make the phone's supplies. Where the arbiter
  * answers "denied" or "failed" for a block, the line says so and the driver goes on.
  *
- * Register layout and the version (5) of the arbiter: Linux drivers/spmi/spmi-pmic-arb.c, as drivers/input/hakios.buttons.c
+ * Register layout and the version (5) of the arbiter: Linux drivers/spmi/spmi-pmic-arb.c, as bsd/dev/hakios_buttons.c
  * has it and has run it on this phone. A phone whose arbiter is another version gets one line and nothing else.
  *
  * The clock. The PMICs have a real-time clock that Android sets, and keeps while the phone is off (Linux:
@@ -27,14 +27,10 @@
  * counter reads 60110539 seconds, 695 days of counting, which as a date is 1971. It is a counter, not wall-clock time; see
  * the comment at the report.)
  *
- * Status (what has and has not been seen): RUN ON THE PHONE (POCO X5 Pro, 2026-10-27, four runs): the arbiter is version 0x50020000
- * (5.2) with 512 channels, 444 distinct peripherals; slaves 0 to 3 answer (0, 1 and 2 are the PMK8350, PM7325 and PM8350C, as the buttons and flashlight drivers have them), the
- * peripherals of slaves 4, 8 and 9 answer "failed" (no chip there: 98 of them); the clock is found where Linux has it
- * (slave 0 0x6100, type 0x07 subtype 0x01) and ticks once a second. The access is the buttons driver's, which is
- * known to work on this phone; what is new is the walk over all channels and the clock's registers (0x48 for the read), taken from Linux's rtc-pm8xxx.c
- * as remembered. The first run on the phone (2026-10-27) found the clock's blocks where Linux has them: slave 0 0x6100 is type 0x07
- * subtype 0x01 (the write block) and 0x6200 type 0x07 subtype 0x03 (the alarm); the type is 0x07, not the 0x06 first assumed. Nothing here has a recorded run on the phone until a
- * line below says so; it is not run in QEMU, which has no arbiter.
+ * Status: from hackios-xnu-kernel's hakios.pmic.c, RUN THERE on the POCO X5 Pro (version 0x50020000, 444 peripherals; the clock
+ * at slave 0 0x6100 ticks once a second, and is a counter rather than a date). On the POCO F4 its arbiter is version 0x50010000
+ * with 512 channels, the access is bsd/dev/hakios_buttons.c's, which runs on that phone. The walk over all channels has
+ * not been seen there yet.
  *
  * Boot-args:
  *   pmic=1            do it (once, from a thread of its own)
@@ -87,7 +83,7 @@ wr(vm_offset_t address, uint32_t value)
 	*(volatile uint32_t *)address = value;
 }
 
-/* the arbiter, as drivers/input/hakios.buttons.c maps it */
+/* the arbiter, as bsd/dev/hakios_buttons.c maps it */
 #define ARB_CORE_PHYS           0x0c440000UL
 #define ARB_CORE_SIZE           0x1100UL
 #define ARB_CNFG_PHYS           0x0c40a000UL

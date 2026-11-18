@@ -23,6 +23,18 @@ main(int argc, char **argv, char **envp)
 	if (fd > 2) {
 		close(fd);
 	}
+	struct stat target;
+	if (stat("/storage-bootstrap", &target) == 0) {
+		static const char outgoing[] = "/system/storage-bootstrap-old";
+		static const char switch_args[] = "/system storage-bootstrap-old";
+		if (mount("apfs", "/system", MNT_RDONLY, (void *)"/dev/ufs_system_image") != 0 ||
+		    sysctlbyname("kern.apfs_synthetic", NULL, NULL, outgoing, sizeof(outgoing) - 1) != 0 ||
+		    sysctlbyname("kern.hakios_switch_root", NULL, NULL, switch_args, sizeof(switch_args) - 1) != 0) {
+			printf("stage0: storage root failed: %s\n", strerror(errno));
+			goto halt;
+		}
+		chdir("/");
+	}
 
 	if (mount("apfs", "/redwood", MNT_RDONLY, (void *)"/dev/md1") != 0) {
 		printf("stage0: cannot mount /dev/md1 on /hakios: %s\n", strerror(errno));
@@ -30,6 +42,7 @@ main(int argc, char **argv, char **envp)
 		execve(init_argv[0], init_argv, envp);
 		printf("stage0: cannot run %s: %s\n", init_argv[0], strerror(errno));
 	}
+halt:
 	reboot(0x08 /* RB_HALT */);
 	return 1;
 }

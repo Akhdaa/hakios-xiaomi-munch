@@ -43,3 +43,15 @@ hakios_version_init(void)
 	}
 	printf("hakios-kernel: version %s\n", hakios_version_string);
 }
+
+bool
+hakios_soc_is(const char *soc)
+{
+	char value[HAKIOS_VERSION_MAX], word[32];
+
+	if (!PE_parse_boot_argn("hakios_kver", value, sizeof(value))) {
+		return false;
+	}
+	snprintf(word, sizeof(word), "-%s-", soc);
+	return strnstr(value, word, sizeof(value)) != NULL;
+}

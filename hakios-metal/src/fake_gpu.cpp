@@ -213,6 +213,46 @@ void FakeGpu::resume() {
     changed_.notify_all();
 }
 
+void FakeGpu::setChipId(uint64_t chip) {
+    std::lock_guard<std::mutex> g(lock_);
+    chip_ = chip;
+}
+
+FakeGpu::Submission FakeGpu::lastSubmission() {
+    std::lock_guard<std::mutex> g(lock_);
+    return last_;
+}
+
+std::vector<FakeGpu::Write> FakeGpu::writes(bool clear) {
+    std::lock_guard<std::mutex> g(lock_);
+    std::vector<Write> r(writes_.begin(), writes_.end());
+    if (clear) writes_.clear();
+    return r;
+}
+
+std::vector<uint32_t> FakeGpu::executedWords(bool clear) {
+    std::lock_guard<std::mutex> g(lock_);
+    std::vector<uint32_t> r = executed_;
+    if (clear) executed_.clear();
+    return r;
+}
+
+// (under lock_, from the 2D engine's model)
+void FakeGpu::wrote(bool fill, uint64_t base, uint64_t pitch, uint32_t bpp, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
+    Write w;
+    w.fence = running_;
+    w.fill = fill;
+    w.base = base;
+    w.pitch = pitch;
+    w.bpp = bpp;
+    w.x0 = x0;
+    w.y0 = y0;
+    w.x1 = x1;
+    w.y1 = y1;
+    writes_.push_back(w);
+    if (writes_.size() > 4096) writes_.pop_front();
+}
+
 void FakeGpu::addSurface(uint32_t id, uint32_t width, uint32_t height, uint32_t rowBytes, uint32_t pixelFormat, uint32_t offset, uint32_t planes,
                          bool client) {
     std::lock_guard<std::mutex> g(lock_);
@@ -1000,6 +1040,7 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     for (uint32_t y = y0; y <= y1; y++) {
         for (uint32_t x = x0; x <= x1; x++) memcpy(d + (y - y0) * pitch + uint64_t(x) * bpp, pixel, bpp);
     }
+    wrote(true, base, pitch, bpp, x0, y0, x1, y1);
     stats_.fills++;
     drawsInSubmission_++;   // the fill sits in the CCU as a draw's colour does: the same two flushes must follow it
     drawsWithoutCcuFlush_++;
@@ -1096,6 +1137,7 @@ bool FakeGpu::execCopy(uint32_t fmt, uint32_t bpp, uint32_t ifmt, uint32_t x0, u
             }
         }
     }
+    wrote(false, base, pitch, bpp, x0, y0, x1, y1);
     stats_.copies++;
     drawsInSubmission_++;   // the copy sits in the CCU as a fill does: the same two flushes must follow it
     drawsWithoutCcuFlush_++;
@@ -1919,6 +1961,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
         fault("the command stream is not inside a buffer");
         return false;
     }
+    if (executed_.size() + words <= (4u << 20)) executed_.insert(executed_.end(), w, w + words);
     for (uint32_t i = 0; i < words;) {
         pm4::Header h = readHeader(w[i]);
         if (h.kind == pm4::Header::kBad) {
@@ -2369,6 +2412,7 @@ void FakeGpu::hung() {
 
 void FakeGpu::run(const Job& job) {
     stats_.submits++;
+    running_ = job.fence;
     // a submission starts with nothing loaded and no pass begun: the hardware keeps no state across them that this models
     // (the registers it does keep, regs_, stay)
     cs_ = CsState{};
@@ -2438,7 +2482,7 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         switch (p->param) {
         case kParamGpuId: p->value = 0; return 0;                   // "none, the chip ID says it"
         case kParamGmemSize: p->value = kGmemBytes; return 0;
-        case kParamChipId: p->value = kChipId | kSpeedBin << 32; return 0;
+        case kParamChipId: p->value = chip_ | kSpeedBin << 32; return 0;
         case kParamMaxFreq: p->value = kMaxFrequencyHz; return 0;
         case kParamTimestamp: p->value = uint64_t(nowNs()); return 0;
         case kParamGmemBase: p->value = 0; return 0;
@@ -2539,6 +2583,19 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         if (uint64_t(cmd->submit_offset) + cmd->size > c.bytes.size()) return EINVAL;
         Job job{++submitted_, c.iova + cmd->submit_offset, cmd->size / 4};
         s->fence = job.fence;
+        last_.fence = job.fence;
+        last_.bos.clear();
+        for (uint32_t i = 0; i < s->nr_bos; i++) {
+            SubmittedBo u;
+            u.handle = bos[i].handle;
+            u.flags = bos[i].flags;
+            const Buffer& b = buffers_.at(bos[i].handle);
+            u.iova = b.iova;
+            u.size = b.bytes.size();
+            auto sb = bufferSurface_.find(bos[i].handle);
+            u.surface = sb != bufferSurface_.end() ? sb->second : 0;
+            last_.bos.push_back(u);
+        }
         // (a wedged GPU still takes submissions, as the kernel's ring does until it is full: they are never run)
         if (wedged_) {
             return 0;
