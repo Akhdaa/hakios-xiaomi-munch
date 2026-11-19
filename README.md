@@ -34,7 +34,7 @@ the port needed in the common tree. `main` is upstream as it was forked.
 | Battery | works | level, voltage, current and temperature in the status bar; charges with `munch_charge=1` (charger watchdog petted, input 1500 mA, battery 1800 mA): 55 to 58 % in about 5 minutes on a wall charger; slow from a computer's port (500 mA) |
 | Auto-Lock | works | follows the Settings timeout; no dimming before the lock |
 | Thermal | partial | 25 sensors read; the prime core and the GPU slowed when hot; the stop at 105 °C not yet seen |
-| Cellular | partial | the Snapdragon X55 on PCIe 2 (gen 3 x2) now takes its boot loader over BHI and runs it (SBL), with `munch_modem=5` when the loader is entered from Android (`adb reboot bootloader`, which leaves the X55 powered); Sahara (the rest of its firmware) is next: no SIM, signal or data yet |
+| Cellular | partial | the Snapdragon X55 boots to its mission mode: boot loader over BHI, the rest of its firmware over Sahara, its services over QRTR (DMS online, NAS answers), its carrier configurations over TFTP; it restarts itself about a minute later, before registering: no signal, SIM, Cellular pane or data yet |
 | Deep sleep | no | idle cores wait in WFI; no power collapse, no system suspend |
 | Passcode, Apple ID, Face ID | no | there is no Secure Enclave |
 | Sileo | works | with the `JB=1` image (Procursus bootstrap) |
