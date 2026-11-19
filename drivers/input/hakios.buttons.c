@@ -572,6 +572,224 @@ hakios_munch_charger(uint8_t *input_status, uint8_t *port_kind, uint8_t *charger
 }
 
 /*
+ * boot-arg munch_charger_look=1, for the fuel gauge's driver once: the PM8150B's charger blocks (Android's smb5-reg.h: CHGR
+ * 0x10, DCDC 0x11, BATIF 0x12, USBIN 0x13, DCIN 0x14, TYPEC 0x15, MISC 0x16 of slave 2), each block's channel and the
+ * system that may write through it, and its 256 registers, READ only. Why the phone charges slowly here is in them: the
+ * input's current limit as set and as the hardware's AICL found it, the fast-charge current, the port detection's result,
+ * the Type-C current the charger advertises. Nothing is written: whether any of it is this system's to change is what the
+ * owners say.
+ */
+void hakios_munch_charger_look(void);
+void
+hakios_munch_charger_look(void)
+{
+	static const char *const names[] = { "CHGR", "DCDC", "BATIF", "USBIN", "DCIN", "TYPEC", "MISC" };
+	uint8_t a, b, c;
+	uint32_t channels;
+
+	if (!hakios_munch_charger(&a, &b, &c)) {
+		printf("battery: munch: charger look: the charger cannot be read\n");
+		return;
+	}
+	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
+	if (channels == 0 || channels > ARB_MAX_CHANNELS) {
+		channels = ARB_MAX_CHANNELS;
+	}
+	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		struct peripheral p = { .name = names[i], .id = (uint16_t)(0x210 + i) };
+
+		find_channel(&p, channels);
+		if (!p.found) {
+			continue;
+		}
+		printf("battery: munch: charger look: %s (0x%x00 of slave 2), channel %u, written by system %u%s\n", names[i], 0x10 + i,
+		    p.channel, rd(arb_cnfg + ARB_OWNER(p.channel)) & 7,
+		    (rd(arb_cnfg + ARB_OWNER(p.channel)) & 7) == ARB_SYSTEM ? " (ours)" : " (NOT ours)");
+		for (unsigned row = 0; row < 256; row += 16) {
+			uint8_t v[16];
+			bool ok = spmi_read(&p, (uint8_t)row, v, 8) == NULL && spmi_read(&p, (uint8_t)(row + 8), v + 8, 8) == NULL;
+
+			if (!ok) {
+				printf("battery: munch: charger look: %s %02x: not read\n", names[i], row);
+				continue;
+			}
+			printf("battery: munch: charger look: %s %02x: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			    names[i], row, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+		}
+	}
+}
+
+/*
+ * boot-arg munch_charge=1: the POCO F4's charger kept charging, as Android's qpnp-smb5 keeps it, for the fuel gauge's
+ * driver every 10 s (hakios_munch_charger_keep()). Two things only, and only through channels the arbiter gives this system
+ * (the owner is read; a block that is another system's is never written):
+ *
+ *  - the charger's watchdog petted (MISC 0x43 <- 1). Android sets it up (qpnp-smb5.c smb5_init_hw: bark after 16 s, bite
+ *    8 s later, BITE_WDOG_DISABLE_CHARGING) and enables it on plugin, and pets it at every bark; the PMIC keeps that set-up
+ *    through a reboot to the bootloader, so under this kernel nothing pets it and the bite stops the charging. A pet with
+ *    the watchdog off does nothing.
+ *  - on a charger (APSD: DCP) or a computer's charging port (CDP), the input's current limit and the fast-charge current
+ *    raised to what Android uses on such a port, if they are below it: the input to 1500 mA in high-current mode
+ *    (smblib_set_icl_current() with SW_OVERRIDE_HC_MODE: USBIN 0x70 in 50 mA steps, ICL_OPTIONS bit 0 set, ICL_OVERRIDE
+ *    cleared, ICL_OVERRIDE_AFTER_APSD set), the battery to 1800 mA (CHGR 0x61 in 50 mA steps; the device tree's
+ *    qcom,thermal-mitigation-dcp level 0). A computer's ordinary port (SDP) keeps its 500 mA. The hardware's AICL still
+ *    lowers the input if the charger cannot give it. The float voltage, the termination and the temperature limits are
+ *    never touched.
+ *
+ * Every write is read back; a write that does not read back, or a refusal, ends all writing for the run.
+ */
+#define CHARGER_ARB_CHNLS_PHYS  0x0c600000UL    /* "chnls": 0x10000 per channel, for its owner's writes */
+#define CHARGER_CHANNEL_WDATA0  0x10
+#define CHARGER_COMMAND_WRITE   (0u << 27)
+#define CHARGE_ICL_MA           1500
+#define CHARGE_FCC_MA           1800
+#define APSD_CDP                (1u << 2)
+#define APSD_DCP                (1u << 3)
+
+struct charger_block {
+	struct peripheral p;
+	vm_offset_t write;              /* its write window, if it is ours */
+};
+static struct charger_block keep_usbin = { { .name = "the PM8150B's USB input (to write)", .id = 0x213 }, 0 };
+static struct charger_block keep_chgr = { { .name = "the PM8150B's charger (to write)", .id = 0x210 }, 0 };
+static struct charger_block keep_misc = { { .name = "the PM8150B's misc block (to write)", .id = 0x216 }, 0 };
+static bool keep_broken;
+
+static bool
+charger_block_open(struct charger_block *b, uint32_t channels)
+{
+	uint32_t owner;
+
+	find_channel(&b->p, channels);
+	if (!b->p.found) {
+		return false;
+	}
+	owner = rd(arb_cnfg + ARB_OWNER(b->p.channel)) & 7;
+	if (owner != ARB_SYSTEM) {
+		printf("battery: munch: charge: %s is system %u's, not ours: it is not written\n", b->p.name, owner);
+		return false;
+	}
+	b->write = ml_io_map(CHARGER_ARB_CHNLS_PHYS + 0x10000UL * b->p.channel, 0x1000);
+	return b->write != 0;
+}
+
+/*
+ * (value & mask) into reg, read back; false, and no more writing this run, if it cannot be. mask 0: value written as it is,
+ * not read first nor back (the watchdog's pet, a command that reads 0 again)
+ */
+static bool
+charger_put(struct charger_block *b, uint8_t reg, uint8_t mask, uint8_t value, const char *what)
+{
+	uint8_t was = 0, now = 0, back = 0;
+	const char *problem;
+	uint64_t start, interval;
+	uint32_t status;
+
+	if (keep_broken || b->write == 0 || ((rd(arb_core + ARB_CHANNEL(b->p.channel)) >> 8) & 0xfff) != b->p.id) {
+		return false;
+	}
+	if (mask == 0) {
+		now = value;
+	} else if ((problem = spmi_read(&b->p, reg, &was, 1)) != NULL) {
+		printf("battery: munch: charge: %s: %s\n", what, problem);
+		keep_broken = true;
+		return false;
+	} else {
+		now = (uint8_t)((was & ~mask) | (value & mask));
+		if (now == was) {
+			return true;
+		}
+	}
+	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
+	hakios_spmi_lock();
+	wr(b->write + CHARGER_CHANNEL_WDATA0, now);
+	wr(b->write + OBSERVER_COMMAND, CHARGER_COMMAND_WRITE | (uint32_t)reg << 4);
+	start = mach_absolute_time();
+	do {
+		status = rd(b->write + OBSERVER_STATUS);
+	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
+	hakios_spmi_unlock();
+	problem = !(status & STATUS_DONE) ? "no answer from the arbiter" : (status & STATUS_DENIED) ? "the arbiter refuses" :
+	    (status & STATUS_FAILURE) ? "the write failed" : (status & STATUS_DROPPED) ? "the write was dropped" : NULL;
+	if (problem == NULL && mask != 0) {
+		problem = spmi_read(&b->p, reg, &back, 1);
+		if (problem == NULL && (back & mask) != (now & mask)) {
+			problem = "it does not read back";
+		}
+	}
+	if (problem != NULL) {
+		printf("battery: munch: charge: %s (%#x <- %#x, was %#x): %s: no more writing this run\n", what, reg, now, was, problem);
+		keep_broken = true;
+		return false;
+	}
+	if (mask != 0) {
+		printf("battery: munch: charge: %s: %#x -> %#x\n", what, was, now);
+	}
+	return true;
+}
+
+void hakios_munch_charger_keep(void);
+void
+hakios_munch_charger_keep(void)
+{
+	static bool tried, usable;
+	uint8_t apsd = 0, icl = 0, fcc = 0, input = 0, port = 0, state = 0;
+
+	if (keep_broken) {
+		return;
+	}
+	if (!tried) {
+		uint32_t channels;
+
+		tried = true;
+		if (!hakios_munch_charger(&input, &port, &state)) {
+			printf("battery: munch: charge: the charger cannot be read: nothing is written\n");
+			return;
+		}
+		channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
+		if (channels == 0 || channels > ARB_MAX_CHANNELS) {
+			channels = ARB_MAX_CHANNELS;
+		}
+		usable = charger_block_open(&keep_misc, channels);
+		/* (the currents only if both the input's and the charger's blocks are ours; the watchdog alone otherwise) */
+		if (usable && charger_block_open(&keep_usbin, channels) && charger_block_open(&keep_chgr, channels)) {
+			printf("battery: munch: charge: the charger's blocks are ours: its watchdog petted, and on a charger or a "
+			    "charging port its input %u mA and the battery %u mA at most (munch_charge=1)\n", CHARGE_ICL_MA, CHARGE_FCC_MA);
+		} else if (usable) {
+			printf("battery: munch: charge: only the watchdog is petted (the current limits are not ours)\n");
+		}
+	}
+	if (!usable) {
+		return;
+	}
+	/* the watchdog: a pet is a write of 1 (the register reads 0 again) */
+	(void)charger_put(&keep_misc, 0x43, 0, 0x01, "the watchdog petted");
+	if (keep_usbin.write == 0 || keep_chgr.write == 0) {
+		return;
+	}
+	if (spmi_read(&keep_usbin.p, REG_RT_STATUS, &input, 1) != NULL || !(input & (1u << 4)) ||
+	    spmi_read(&keep_usbin.p, 0x08, &apsd, 1) != NULL || !(apsd & (APSD_DCP | APSD_CDP))) {
+		return;         /* nothing plugged in, or a computer's ordinary port: as it is */
+	}
+	if (spmi_read(&keep_usbin.p, 0x70, &icl, 1) == NULL && icl < CHARGE_ICL_MA / 50) {
+		(void)(charger_put(&keep_usbin, 0x70, 0xff, CHARGE_ICL_MA / 50, "the input's current limit: 1500 mA") &&
+		    charger_put(&keep_usbin, 0x66, 0x01, 0x01, "ICL options: high-current mode") &&
+		    charger_put(&keep_usbin, 0x42, 0x01, 0x00, "ICL override: off") &&
+		    charger_put(&keep_usbin, 0x65, 0x10, 0x10, "ICL override after APSD: on"));
+		if (spmi_read(&keep_usbin.p, 0x70, &icl, 1) == NULL) {
+			printf("battery: munch: charge: the input's current limit now %u mA (port %s)\n", icl * 50,
+			    (apsd & APSD_DCP) ? "a charger" : "a charging port");
+		}
+	}
+	if (spmi_read(&keep_chgr.p, 0x61, &fcc, 1) == NULL && fcc < CHARGE_FCC_MA / 50) {
+		if (charger_put(&keep_chgr, 0x61, 0xff, CHARGE_FCC_MA / 50, "the fast-charge current: 1800 mA") &&
+		    spmi_read(&keep_chgr.p, 0x61, &fcc, 1) == NULL) {
+			printf("battery: munch: charge: the fast-charge current now %u mA (was below %u)\n", fcc * 50, CHARGE_FCC_MA);
+		}
+	}
+}
+
+/*
  * boot-arg press_power=<seconds>: a short press of the power key that many seconds after boot, and another ten
  * seconds later, given to Darwin as the key's own are (hakios_touch_post): the lock and the wake, tried with nobody at the phone.
  * press_power_ms=<ms> is how long each is held (default 150: a tap). press_power_n=<n>: so many presses (default 2).

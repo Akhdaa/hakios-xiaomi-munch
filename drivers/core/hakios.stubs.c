@@ -88,6 +88,8 @@ int hakios_munch_qrtr_send(__unused const void *data, __unused uint32_t length) 
 /* an SM8250 phone's charger, read by the buttons' driver for the POCO F4's fuel gauge */
 #ifndef HAKIOS_BUTTONS
 bool hakios_munch_charger(__unused uint8_t *input_status, __unused uint8_t *port_kind, __unused uint8_t *charger_state) { return false; }
+void hakios_munch_charger_look(void) {}
+void hakios_munch_charger_keep(void) {}
 #endif
 
 #ifndef HAKIOS_CPUFREQ

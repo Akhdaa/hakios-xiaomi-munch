@@ -221,6 +221,10 @@ gauge_read(uint8_t reg, uint16_t *value)
 #define STATUS_DISCHARGING      (1u << 6)
 #define STATUS_FULL             (1u << 5)
 /* the PM8150B, as bsd/dev/hakios_buttons.c reads it (hakios_munch_charger()) */
+extern void hakios_munch_charger_look(void);
+extern void hakios_munch_charger_keep(void);
+static uint32_t charge_keep;           /* boot-arg munch_charge=1: the charger kept charging (hakios.buttons.c) */
+static uint32_t charger_look;           /* boot-arg munch_charger_look=1: the charger's blocks and their owners, once, read only */
 #define USBIN_PLUGIN            (1u << 4)
 #define PORT_SDP                (1u << 0)
 #define PORT_CDP                (1u << 2)
@@ -268,6 +272,8 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	tile_south = ml_io_map(0x0f500000UL, 0x80000UL);
 	PE_parse_boot_argn("battery_stop", &stop_percent, sizeof(stop_percent));
+	PE_parse_boot_argn("munch_charger_look", &charger_look, sizeof(charger_look));
+	PE_parse_boot_argn("munch_charge", &charge_keep, sizeof(charge_keep));
 	if (stop_percent > 99) {
 		stop_percent = 0;
 	}
@@ -299,6 +305,13 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 			b.current_ua = current * 1000;
 			b.temperature_hundredths = ((int)v[3] - 2731) * 10;
 			b.present = 1;
+			if (charger_look) {
+				charger_look = 0;
+				hakios_munch_charger_look();    /* (munch_charger_look=1: once, read only) */
+			}
+			if (charge_keep) {
+				hakios_munch_charger_keep();
+			}
 			if (hakios_munch_charger(&input, &port, &state)) {
 				/* the charger's own word: plugged in, and charging while it is in trickle, pre-charge, full current or taper */
 				state &= 7;

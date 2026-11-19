@@ -218,6 +218,8 @@ MODEM_WAIT	arg	modem_wait	Cellular	k	hakios.mpss.c
 MODEM_WDA_OFF	arg	modem_wda_off	Cellular	k	hakios.mpss.c	
 MUNCH_BT	arg	munch_bt	User space	k	hakios.munch_bt.c	
 MUNCH_CAM	arg	munch_cam	User space	k	hakios.munch_camera.c	read IDs from the three Camera.app sensors
+MUNCH_CHARGE	arg	munch_charge	User space	k	hakios.munch_battery.c	
+MUNCH_CHARGER_LOOK	arg	munch_charger_look	User space	k	hakios.munch_battery.c	
 MUNCH_MODEM	arg	munch_modem	User space	k	hakios.munch_modem.c	
 MUNCH_MODEM_AP2MDM	arg	munch_modem_ap2mdm	User space	k	hakios.munch_modem.c	left as they are.
 MUNCH_MODEM_IOVA	arg	munch_modem_iova	User space	k	hakios.munch_modem.c	

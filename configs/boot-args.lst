@@ -236,6 +236,8 @@ modem_wait	k
 modem_wda_off	k
 munch_bt	k
 munch_cam	k
+munch_charge	k
+munch_charger_look	k
 munch_modem	k
 munch_modem_ap2mdm	k
 munch_modem_iova	k

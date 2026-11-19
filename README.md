@@ -31,7 +31,7 @@ the port needed in the common tree. `main` is upstream as it was forked.
 | Camera | partial | OV64B40 wide and IMX596 front preview in Camera.app; the OV8856 ultra-wide is not started |
 | Flashlight | works | from Control Center, with its levels (`munch_torch=3`) |
 | Haptics | works | Awinic AW86927 |
-| Battery | partial | level, voltage, current and temperature in the status bar; charging under this kernel is not done |
+| Battery | works | level, voltage, current and temperature in the status bar; charges with `munch_charge=1` (charger watchdog petted, input 1500 mA, battery 1800 mA): 55 to 58 % in about 5 minutes on a wall charger; slow from a computer's port (500 mA) |
 | Auto-Lock | works | follows the Settings timeout; no dimming before the lock |
 | Thermal | partial | 25 sensors read; the prime core and the GPU slowed when hot; the stop at 105 °C not yet seen |
 | Cellular | partial | the Snapdragon X55 is found on PCIe 2, but its boot ROM refuses the boot loader over BHI (`0xef0e0003`) |
