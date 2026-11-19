@@ -27,14 +27,14 @@ the port needed in the common tree. `main` is upstream as it was forked.
 | Wi-Fi | works | QCA6390 on PCIe 0 with the phone's own firmware; joins a network from Settings |
 | Bluetooth | partial | QCA6390 on QUP0 SE6; Classic earbuds connect from Settings and play A2DP (AAC-LC). Control Center tile and CoreBluetooth discovery open |
 | Sound | works | both speakers (TFA9874) through the audio DSP |
-| Microphone | no | the driver is built; switching it on breaks touch |
+| Microphone | partial | the driver is built; switching it on breaks touch |
 | Camera | partial | OV64B40 wide and IMX596 front preview in Camera.app; the OV8856 ultra-wide is not started |
 | Flashlight | works | from Control Center, with its levels (`munch_torch=3`) |
 | Haptics | works | Awinic AW86927 |
 | Battery | partial | level, voltage, current and temperature in the status bar; charging under this kernel is not done |
 | Auto-Lock | works | follows the Settings timeout; no dimming before the lock |
 | Thermal | partial | 25 sensors read; the prime core and the GPU slowed when hot; the stop at 105 °C not yet seen |
-| Cellular | no | the Snapdragon X55 is found on PCIe 2, but its boot ROM refuses the boot loader over BHI (`0xef0e0003`) |
+| Cellular | partial | the Snapdragon X55 is found on PCIe 2, but its boot ROM refuses the boot loader over BHI (`0xef0e0003`) |
 | Deep sleep | no | idle cores wait in WFI; no power collapse, no system suspend |
 | Passcode, Apple ID, Face ID | no | there is no Secure Enclave |
 | Sileo | works | with the `JB=1` image (Procursus bootstrap) |
