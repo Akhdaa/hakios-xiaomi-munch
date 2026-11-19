@@ -55,9 +55,17 @@
  *            175.5 Hz in the samples)
  *
  * The POCO F4 (munch) has the same WCD938x with the same SoundWire ID, the TX and VA macros, the TX master and the LPASS
- * pins at the same addresses and the same two clocks (its kona-audio-overlay.dtsi), and for now only mic=1 there, reading:
- * its master is version 1.5 (0x01050001), its data lines are LPASS GPIOs 1 and 2 without a third, its codec's reset is GPIO
- * 32 (south tile, function 2) and its microphone routes are not yet read from its own mixer paths.
+ * pins at the same addresses and the same two clocks (its kona-audio-overlay.dtsi). What differs, from its own device tree:
+ * the master is version 1.5 (0x01050001: HCTL is left alone, that workaround is for 1.6 and later), the data lines are LPASS
+ * GPIOs 1 and 2 without a third, the codec's reset is GPIO 32 (south tile, driven as a gpio: the tree's "func2" is NA on it), the digital codec is bolero 1.0
+ * (no "qcom,bolero-version": the SoundWire mics' clocks in the TX macro, as on 2.0), and the codec's supplies are S4 and BoB,
+ * on from boot. Its own mixer paths (mixer_paths_overlay_static.xml) record "handset-mic" from ADC1 into decimator 1
+ * ("TX SMIC MUX1" ADC0, "ADC1 Volume" 6) and ADC4 (INP5) into decimator 0: the main microphone is the same path as here.
+ * With mic=1 touch was seen to stop there: the read of HCTL (a 1.6 block) never came back on its 1.5 master and held the
+ * core and mic_lock (19 November; HCTL is now left alone below 1.6). Every step logs how the touch thread is doing.
+ * From the OnePlus 8 Pro's port (dekefake/hackios-op8pro, the same SoC), kept here: never vote the VA core clock (0x30b) nor write the VA macro's
+ * clock mux (0x33a0000): a NoC crash; a digital microphone's clock pin must be an output (only for a DMIC path, not this
+ * one); /dev/hakios-mic appears with mic=4 only.
  *
  * What is asked for is given back at the end, and before the DSP is shut down (hakios_mic_dsp_down()).
  */
@@ -174,6 +182,35 @@ spin_us(uint32_t us)
 
 static bool broken;                     /* a write that did not read back: nothing more is written, all is undone */
 static char last_write[120] = "nothing written";
+
+/*
+ * The POCO F4's touch screen (devices/munch/drivers/input), looked at around each step: with mic=1 touch was once seen to
+ * stop, cause unknown. Each line says how many times the touch thread has looked and read since the step before; a thread
+ * that no longer looks, or reads that fail, show which step it was. Nothing here on a phone without that driver.
+ */
+extern void hakios_munch_touch_seen(uint32_t *polls, uint32_t *reports, uint32_t *bad) __attribute__((weak));
+
+static void
+touch_check(const char *after)
+{
+	static uint32_t last_polls, last_bad;
+	static uint64_t last_time;
+	uint32_t polls, reports, bad;
+	uint64_t now = mach_absolute_time(), ns = 0;
+
+	if (hakios_munch_touch_seen == NULL) {
+		return;
+	}
+	hakios_munch_touch_seen(&polls, &reports, &bad);
+	if (last_time != 0) {
+		absolutetime_to_nanoseconds(now - last_time, &ns);
+	}
+	say("mic: touch after %s: %u looks in %llu ms, %u bad reads (%u reports in all)\n", after, polls - last_polls,
+	    ns / NSEC_PER_MSEC, bad - last_bad, reports);
+	last_polls = polls;
+	last_bad = bad;
+	last_time = now;
+}
 
 struct block {
 	const char *name;
@@ -401,10 +438,17 @@ static struct block tx_macro = { "the TX macro", 0x03220000, 0x1000 };
 static struct block va_macro = { "the VA macro", 0x03370000, 0x1000 };
 static struct block tx_swr = { "the TX SoundWire master", 0x03230000, 0x2000 };
 static struct block tx_hctl = { "the TX SoundWire master's HCTL", 0x032a9000, 0x1000 };
-static struct block lpi = { "the LPASS pins", 0x033c0000, 0x10000 };
+static struct block lpi = { "the LPASS pins", 0x033c0000, 0x3000 };     /* (gpio 0 to 2 only: see tlmm below) */
 static struct block lpi_high = { "the LPASS pins", 0x033ce000, 0x1000 };
-static struct block tlmm = { "the pin controller", 0x0f100000, 0x100000 };
+/*
+ * The codec's reset pin, and only its page: a megabyte of the pin controller mapped here once used up the kernel's 8 MB of
+ * I/O mappings, and MiniIOMobileFramebuffer::mapDisplay panicked for want of one (seen on the OnePlus 8 Pro's port). Its
+ * place is set in hakios_mic_dsp_up(): the tile's base + 0x1000 * the pin; its config register at 0, in/out at 4.
+ */
+static struct block tlmm = { "the pin controller", 0x0f100000, 0x1000 };
 static unsigned reset_gpio = 83;                /* the codec's */
+static unsigned reset_function;                 /* its mux: gpio (mic_reset_func=N for another) */
+static unsigned swr_pin_count = 4;              /* the master's pins (swr_pins below); 3 on the POCO F4: no third data line */
 
 static void
 look(void)
@@ -436,21 +480,29 @@ look(void)
 		snprintf(name, sizeof(name), "gpio%u in/out", pins[i]);
 		(void)get(&lpi, name, 0x1000 * pins[i] + 4);
 	}
-	(void)get(&lpi_high, "gpio14 config (SoundWire TX data 2)", 0);
-	(void)get(&lpi_high, "gpio14 in/out", 4);
-	(void)get(&tlmm, "the codec's reset pin, config", 0x1000 * reset_gpio);
-	(void)get(&tlmm, "the codec's reset pin, in/out", 0x1000 * reset_gpio + 4);
+	if (swr_pin_count > 3) {
+		(void)get(&lpi_high, "gpio14 config (SoundWire TX data 2)", 0);
+		(void)get(&lpi_high, "gpio14 in/out", 4);
+	}
+	(void)get(&tlmm, "the codec's reset pin, config", 0);
+	(void)get(&tlmm, "the codec's reset pin, in/out", 4);
 	/* (last: the master is a block of its own, and not yet known; with its version above 1.5.1 the votes are all it needs) */
 	for (size_t i = 0; i < sizeof(swr) / sizeof(swr[0]); i++) {
 		(void)get(&tx_swr, swr[i].name, swr[i].offset);
 	}
-	(void)get(&tx_hctl, "HCTL (0x32a90a8)", 0x0a8);
+	/*
+	 * HCTL only with a master of 1.6 or later (redwood's): on the POCO F4's 1.5 a read of 0x32a90a8 never came back, the
+	 * core stayed stuck on the bus with mic_lock held, touch stopped and the run could not end (19 November)
+	 */
+	if (get(&tx_swr, "COMP_HW_VERSION", 0x000) >= 0x01060000) {
+		(void)get(&tx_hctl, "HCTL (0x32a90a8)", 0x0a8);
+	}
 }
 
 /* ---- the codec's reset, the master's pins ------------------------------------------------------------ */
 
-#define TLMM_CFG_83             (0x1000 * reset_gpio)
-#define TLMM_IO_83              (0x1000 * reset_gpio + 4)
+#define TLMM_CFG_83             0               /* (in the reset pin's own page) */
+#define TLMM_IO_83              4
 static uint32_t found_reset_cfg, found_reset_io;
 static bool reset_taken;
 
@@ -464,12 +516,12 @@ reset_release(void)
 	found_reset_io = rd(tlmm.base + TLMM_IO_83);
 	reset_taken = true;
 	/* the sleep state: gpio, 16 mA, no pull, output low; 20 us; the active state: output high */
-	if (!put(&tlmm, "gpio83 out (the codec's reset)", TLMM_IO_83, 0, 2) ||
-	    !put(&tlmm, "gpio83 config: gpio, 16 mA, no pull, output", TLMM_CFG_83, 0x3c0, 0x3ff)) {
+	if (!put(&tlmm, "the codec's reset pin out: low", TLMM_IO_83, 0, 2) ||
+	    !put(&tlmm, "the codec's reset pin config: 16 mA, no pull, output", TLMM_CFG_83, 0x3c0 | reset_function << 2, 0x3ff)) {
 		return false;
 	}
 	spin_us(30);
-	if (!put(&tlmm, "gpio83 out: high (the codec out of reset)", TLMM_IO_83, 2, 2)) {
+	if (!put(&tlmm, "the codec's reset pin out: high (the codec out of reset)", TLMM_IO_83, 2, 2)) {
 		return false;
 	}
 	spin_us(30);
@@ -483,9 +535,9 @@ reset_restore(void)
 		return;
 	}
 	broken = false;         /* (putting back is done whatever went before) */
-	(void)put(&tlmm, "gpio83 out: low (the codec in reset)", TLMM_IO_83, 0, 2);
-	(void)put(&tlmm, "gpio83 config, as it was found", TLMM_CFG_83, found_reset_cfg, 0x3ff);
-	(void)put(&tlmm, "gpio83 out, as it was found", TLMM_IO_83, found_reset_io & 2, 2);
+	(void)put(&tlmm, "the codec's reset pin out: low (the codec in reset)", TLMM_IO_83, 0, 2);
+	(void)put(&tlmm, "the codec's reset pin config, as it was found", TLMM_CFG_83, found_reset_cfg, 0x3ff);
+	(void)put(&tlmm, "the codec's reset pin out, as it was found", TLMM_IO_83, found_reset_io & 2, 2);
 	reset_taken = false;
 }
 
@@ -509,20 +561,20 @@ pins_on(void)
 	if (lpi_slew.base == 0) {
 		lpi_slew.base = ml_io_map(lpi_slew.phys, lpi_slew.size);
 	}
-	for (unsigned i = 0; i < SWR_PINS; i++) {
+	for (unsigned i = 0; i < swr_pin_count; i++) {
 		found_pin_cfg[i] = rd(lpi.base + 0x1000 * swr_pins[i].pin);
 		found_pin_dir[i] = rd(lpi.base + 0x1000 * swr_pins[i].pin + 4);
 	}
 	found_slew = rd(lpi_slew.base);
 	pins_taken = true;
 	slew = found_slew;
-	for (unsigned i = 0; i < SWR_PINS; i++) {
+	for (unsigned i = 0; i < swr_pin_count; i++) {
 		slew = (slew & ~(3u << swr_pins[i].slew_bit)) | (1u << swr_pins[i].slew_bit);
 	}
-	if (!put(&lpi_slew, "slew rates: 1 for the four", 0, slew, 0xff)) {
+	if (!put(&lpi_slew, "slew rates: 1 for the master's pins", 0, slew, 0xff)) {
 		return false;
 	}
-	for (unsigned i = 0; i < SWR_PINS; i++) {
+	for (unsigned i = 0; i < swr_pin_count; i++) {
 		/* [1:0] pull, [5:2] function, [8:6] drive (mA / 2 - 1), [9] output: function 1, 2 mA, not an output */
 		uint32_t cfg = (found_pin_cfg[i] & ~0x3ffu) | swr_pins[i].pull | 1u << 2;
 
@@ -541,7 +593,7 @@ pins_restore(void)
 		return;
 	}
 	broken = false;
-	for (unsigned i = 0; i < SWR_PINS; i++) {
+	for (unsigned i = 0; i < swr_pin_count; i++) {
 		(void)put(&lpi, "a pin, as it was found", 0x1000 * swr_pins[i].pin, found_pin_cfg[i], 0x3ff);
 		(void)put(&lpi, "its direction, as it was found", 0x1000 * swr_pins[i].pin + 4, found_pin_dir[i], 2);
 	}
@@ -638,22 +690,30 @@ swr_rd(uint32_t offset)
 	return rd(tx_swr.base + offset);
 }
 
+static uint32_t master_version;         /* COMP_HW_VERSION: 1.6 on redwood, 1.5 (0x01050001) on the POCO F4 */
+
 static bool
 master_on(void)
 {
 	uint32_t ssp = SWR_BUS_HZ * 2 / (SWR_ROWS * SWR_COLUMNS * SWR_FRAME_SYNC_HZ), cfg;
 	bool linked = false;
 
-	if (tx_hctl.base == 0) {
-		tx_hctl.base = ml_io_map(tx_hctl.phys, tx_hctl.size);
-	}
-	found_hctl = rd(tx_hctl.base + 0x0a8);
+	master_version = get(&tx_swr, "COMP_HW_VERSION", 0x000);
 	master_taken = true;
-	/* "SW workaround to gate hw_ctl for SWR version >= 1.6" */
-	if (!put(&tx_hctl, "HCTL: bit 1 cleared", 0x0a8, found_hctl & ~2u, 0x3)) {
-		return false;
+	/*
+	 * "SW workaround to gate hw_ctl for SWR version >= 1.6". The POCO F4's is 1.5, and there HCTL is not even read: a read
+	 * of it never came back (see look())
+	 */
+	if (master_version >= 0x01060000) {
+		if (tx_hctl.base == 0) {
+			tx_hctl.base = ml_io_map(tx_hctl.phys, tx_hctl.size);
+		}
+		found_hctl = rd(tx_hctl.base + 0x0a8);
+		if (!put(&tx_hctl, "HCTL: bit 1 cleared", 0x0a8, found_hctl & ~2u, 0x3)) {
+			return false;
+		}
+		spin_us(505);
 	}
-	spin_us(505);
 	/* swrm_runtime_resume() */
 	if (!put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0) || !put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0) ||
 	    !put(&tx_swr, "MCP_BUS_CTRL", SWRM_MCP_BUS_CTRL, 1, 0)) {
@@ -698,7 +758,9 @@ master_off(void)
 	(void)put(&tx_swr, "INTERRUPT_EN: none", SWRM_INTERRUPT_EN, 0, 0);
 	(void)put(&tx_swr, "CPU1_INTERRUPT_EN: none", SWRM_CPU1_INTERRUPT_EN, 0, 0);
 	(void)put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0);
-	(void)put(&tx_hctl, "HCTL, as it was found", 0x0a8, found_hctl, 0x3);
+	if (master_version >= 0x01060000) {
+		(void)put(&tx_hctl, "HCTL, as it was found", 0x0a8, found_hctl, 0x3);
+	}
 	master_taken = false;
 }
 
@@ -966,11 +1028,26 @@ static uint32_t main_timing;            /* boot-arg mic_main=1 (a test): the bus
 static uint32_t tap;                    /* boot-arg mic_tap=1 (a test): the vibration motor (haptic=5) runs from 2 s to 3 s of listening */
 static uint32_t test_bits;              /* boot-arg mic_test=N (tests): 1 no mic bias, 2 the ADC's input held (HPF init) */
 
+/*
+ * The POCO F4 (kona, master 1.5): its machine driver's sm_port_map (kona-port-config.h, tx_frame_params_default) puts
+ * ADC1 on the master's port 2 ("TX1"; port 1 is PCM OUT: qcom,swr-port-mapping <2 ADC1 0x1>) with si 1, offsets 1 0,
+ * lane 0 and no hstart/hstop, on both sides (swrm_copy_data()). With redwood's (master port 1, lane 1) the decimator
+ * read exact zeros (mic=3, 19 November). Boot-args for trying others without a build: mic_mport, mic_si, mic_off1,
+ * mic_lane.
+ */
+static uint32_t kona_port;
+static uint32_t mport = 1, port_si = 0xff, port_off1 = 0, port_lane = 1;
+
 static bool
 port_config(uint8_t bank, bool first)
 {
 	uint8_t codec_interval = main_timing ? 7 : 3, master_interval = 7;
+	uint8_t off1 = (uint8_t)port_off1, lane = (uint8_t)port_lane;
+	char what[96];
 
+	if (port_si != 0xff) {
+		codec_interval = master_interval = (uint8_t)port_si;
+	}
 	/* the codec's side (swrm_apply_port_config() first: the devices' clock halved in that bank) */
 	if (first) {
 		to_all(SWRS_SCP_HOST_CLK_DIV2_CTL_BANK(bank), 0x01);
@@ -982,19 +1059,28 @@ port_config(uint8_t bank, bool first)
 	write_id = write_id < 14 ? write_id + 1 : 0;
 	swr_write(codec_device, SWRS_DP_SAMPLE_CONTROL_2_BANK(0, bank), 0, write_id);
 	write_id = write_id < 14 ? write_id + 1 : 0;
-	swr_write(codec_device, SWRS_DP_OFFSET_CONTROL_1_BANK(0, bank), 0, write_id);
+	swr_write(codec_device, SWRS_DP_OFFSET_CONTROL_1_BANK(0, bank), off1, write_id);
 	write_id = write_id < 14 ? write_id + 1 : 0;
 	swr_write(codec_device, SWRS_DP_OFFSET_CONTROL_2_BANK(0, bank), 0, write_id);
 	write_id = write_id < 14 ? write_id + 1 : 0;
-	swr_write(codec_device, SWRS_DP_LANE_CONTROL_BANK(0, bank), 1, write_id);
-	note("mic: the codec's data port 1, bank %u: channel 1 on, sample interval %u, offsets 0 0, lane 1\n", bank, codec_interval);
-	/* the master's port 1 */
-	return put(&tx_swr, "DP_PORT_CTRL (port 1): channel 1, offsets 0 0, interval 7", SWRM_DP_PORT_CTRL_BANK(1, bank),
-	           0x01u << 24 | 0u << 16 | 0u << 8 | master_interval, 0xffffffff) &&
-	       put(&tx_swr, "DP_SAMPLECTRL2 (port 1)", SWRM_DP_SAMPLECTRL2_BANK(1, bank), 0, 0xff) &&
-	       put(&tx_swr, "DP_PORT_CTRL_2 (port 1): lane 1", SWRM_DP_PORT_CTRL_2_BANK(1, bank), 1, 0xff) &&
-	       /* (it reads 0 back on the phone whatever is written; Android writes it and never reads it) */
-	       put(&tx_swr, "DP_PORT_HCTRL (port 1): hstop 15, hstart 0", SWRM_DP_PORT_HCTRL_BANK(1, bank), 0xf0, 0);
+	swr_write(codec_device, SWRS_DP_LANE_CONTROL_BANK(0, bank), lane, write_id);
+	note("mic: the codec's data port 1, bank %u: channel 1 on, sample interval %u, offsets %u 0, lane %u\n", bank, codec_interval,
+	    off1, lane);
+	snprintf(what, sizeof(what), "DP_PORT_CTRL (port %u): channel 1, offsets %u 0, interval %u", mport, off1, master_interval);
+	if (!put(&tx_swr, what, SWRM_DP_PORT_CTRL_BANK(mport, bank),
+	         /* offset1 in bits 8-15, offset2 in 16-23 (swr-mstr-ctrl.c / Linux qcom.c SWRM_DP_PORT_CTRL_OFFSET1_SHFT 8, as
+	          * hakios-alioth writes it); until 20 November offset1 went into offset2's field, so the master took the samples
+	          * one slot before the codec put them: exact zeros */
+	         0x01u << 24 | 0u << 16 | (uint32_t)off1 << 8 | master_interval, 0xffffffff) ||
+	    !put(&tx_swr, "DP_SAMPLECTRL2", SWRM_DP_SAMPLECTRL2_BANK(mport, bank), 0, 0xff) ||
+	    !put(&tx_swr, "DP_PORT_CTRL_2: the lane", SWRM_DP_PORT_CTRL_2_BANK(mport, bank), lane, 0xff)) {
+		return false;
+	}
+	if (kona_port) {
+		return true;    /* (hstart/hstop 0xFF in kona's table: not written) */
+	}
+	/* (it reads 0 back on the phone whatever is written; Android writes it and never reads it) */
+	return put(&tx_swr, "DP_PORT_HCTRL: hstop 15, hstart 0", SWRM_DP_PORT_HCTRL_BANK(mport, bank), 0xf0, 0);
 }
 
 static bool
@@ -1064,6 +1150,8 @@ datapath_on(void)
 }
 
 /* "MIC BIAS1" (wcd938x_micbias_control(MICB_ENABLE)), then ADC1's request (wcd938x_enable_req()) in "low power" mode */
+static uint32_t mic_dec = 1;           /* the TX macro's decimator for the microphone (see the decimator's block below) */
+
 static bool
 adc1_on(void)
 {
@@ -1071,11 +1159,12 @@ adc1_on(void)
 	       codec_bits(WCD_CDC_ANA_TX_CLK_CTL, 0x01, 0x01) && codec_bits(WCD_MICB1_TEST_CTL_2, 0x01, 0x01) &&
 	       codec_bits(WCD_MICB2_TEST_CTL_2, 0x01, 0x01) && codec_bits(WCD_MICB3_TEST_CTL_2, 0x01, 0x01) &&
 	       codec_bits(WCD_MICB4_TEST_CTL_2, 0x01, 0x01) && codec_bits(WCD_ANA_MICB1, 0xc0, (test_bits & 1) ? 0x00 : 0x40) &&
-	       /* "ADC1 Volume" 6 (Xiaomi's mixer paths) */
-	       codec_bits(WCD_ANA_TX_CH1, 0x1f, 6) &&
+	       /* "ADC1 Volume" 6 (Xiaomi's mixer paths); 20 with decimator 0 (kona's "main-mic", hakios-alioth's) */
+	       codec_bits(WCD_ANA_TX_CH1, 0x1f, mic_dec == 0 ? 20 : 6) &&
 	       codec_bits(WCD_CDC_ANA_CLK_CTL, 0x08, 0x08) && codec_bits(WCD_CDC_ANA_CLK_CTL, 0x10, 0x10) &&
 	       codec_bits(WCD_CDC_REQ_CTL, 0x02, 0x02) && codec_bits(WCD_CDC_REQ_CTL, 0x01, 0x00) &&
-	       codec_bits(WCD_ANA_TX_CH2, 0x40, 0x40) && codec_bits(WCD_CDC_TX_ANA_MODE_0_1, 0x0f, 0x05) &&
+	       /* ADC1 low power (5); NORMAL (3, mainline's default) with decimator 0, as hakios-alioth */
+	       codec_bits(WCD_ANA_TX_CH2, 0x40, 0x40) && codec_bits(WCD_CDC_TX_ANA_MODE_0_1, 0x0f, mic_dec == 0 ? 0x03 : 0x05) &&
 	       codec_bits(WCD_CDC_DIG_CLK_CTL, 0x10, 0x10) && codec_bits(WCD_ANA_TX_CH2, 0x40, (test_bits & 2) ? 0x40 : 0x00);
 }
 
@@ -1085,12 +1174,22 @@ adc1_on(void)
 #define TX_SWR_MIC0_CTL                 0x0d0
 #define TX_SWR_MIC1_CTL                 0x0d4
 #define TX_SWR_MIC2_CTL                 0x0c0
-#define TX_ADC_MUX1_CFG0                0x108
-#define TX_ADC_MUX1_CFG1                0x10c
-#define TX1_PATH_CTL                    0x480
-#define TX1_PATH_CFG0                   0x484
-#define TX1_VOL_CTL                     0x48c
-#define TX1_PATH_SEC2                   0x498
+/*
+ * The decimator the microphone goes through: 1 by default (redwood's, and munch's own "handset-mic", which records two
+ * channels), 0 on the POCO F4 (kona's generic "main-mic": "TX SMIC MUX0" ADC0 into "TX DEC0 MUX" SWR_MIC, one channel).
+ * With decimator 1 and the codec DMA's one channel the POCO F4 recorded exact zeros (19 November, five runs); the Redmi K40
+ * (alioth, the same SM8250 and WCD938x) records with decimator 0. From xiongnemo/hakios-alioth
+ * (devices/redmi-k40/tools/patch-mic-alioth.py, MIT/APSL as this file): decimator 0, its TX0_TX_PATH_SEC7 init, "ADC1 Volume"
+ * 20 and ADC1 in NORMAL mode. Boot-arg mic_dec=0|1 picks it (mic_dec is declared above adc1_on()). The names keep
+ * decimator 1's.
+ */
+#define TX_ADC_MUX1_CFG0                (0x100 + 8 * mic_dec)
+#define TX_ADC_MUX1_CFG1                (0x104 + 8 * mic_dec)
+#define TX1_PATH_CTL                    (0x400 + 0x80 * mic_dec)
+#define TX1_PATH_CFG0                   (0x404 + 0x80 * mic_dec)
+#define TX1_VOL_CTL                     (0x40c + 0x80 * mic_dec)
+#define TX1_PATH_SEC2                   (0x418 + 0x80 * mic_dec)
+#define TX1_PATH_SEC7                   (0x42c + 0x80 * mic_dec)
 
 #define VA_CORE_ID_0                    0x0c0
 #define VA_CORE_ID_1                    0x0c4
@@ -1098,16 +1197,13 @@ adc1_on(void)
 #define VA_SWR_MIC_CTL1                 0x0d4
 #define VA_SWR_MIC_CTL2                 0x0d8
 
-static uint32_t found_dec[10], found_va_mic[3];
+static uint32_t found_dec[11], found_va_mic[3];
 static uint32_t smic_input = 1;         /* boot-arg mic_input=N: TX SMIC MUX1's input (1 SWR_MIC0, Android's; 0 ZERO, a test) */
 static bool dec_taken, va_mic_taken;
 static unsigned bolero_version;         /* 20 or 21: the digital codec's own core ID (bolero_soc_codec_probe()) */
 static uint8_t hpf_cut_off;             /* the decimator's high-pass filter as it was found */
 
-static const uint32_t dec_regs[] = {
-	TX_TOP_CSR_SWR_CTRL, TX_SWR_MIC0_CTL, TX_SWR_MIC1_CTL, TX_SWR_MIC2_CTL, TX_SWR_MIC2_CTL + 4, TX_SWR_MIC2_CTL + 8,
-	TX_SWR_MIC2_CTL + 12, TX_ADC_MUX1_CFG0, TX_ADC_MUX1_CFG1, TX1_PATH_CTL,
-};
+static uint32_t dec_regs[11];   /* (filled by dec1_on(): the decimator's registers depend on mic_dec) */
 
 /*
  * Which bolero this is: its core ID, as bolero_soc_codec_probe() reads it (01 0F: 2.0, 02 0E: 2.1),
@@ -1121,9 +1217,17 @@ bolero_look(void)
 	uint32_t id0 = get(&va_macro, "CORE_ID_0", VA_CORE_ID_0) & 0xff, id1 = get(&va_macro, "CORE_ID_1", VA_CORE_ID_1) & 0xff;
 
 	bolero_version = id0 == 0x01 && id1 == 0x0f ? 20 : id0 == 0x02 && id1 == 0x0e ? 21 : 0;
-	say("mic: the digital codec is bolero %s\n", bolero_version == 20 ? "2.0" : bolero_version == 21 ? "2.1" : "OF AN UNKNOWN VERSION");
+	/*
+	 * The POCO F4's (kona) is older: its tree has no "qcom,bolero-version", so bolero.c keeps BOLERO_VERSION_1_0 for any
+	 * other core ID. 1.0 sets no SoundWire mic clocks in either macro (kona's tx-macro.c).
+	 */
+	if (bolero_version == 0 && hakios_soc_is("sm8250")) {
+		bolero_version = 10;
+	}
+	say("mic: the digital codec is bolero %s (core ID %02x %02x)\n", bolero_version == 20 ? "2.0" : bolero_version == 21 ? "2.1" :
+	    bolero_version == 10 ? "1.0" : "OF AN UNKNOWN VERSION", id0, id1);
 	if (bolero_version != 21) {
-		return bolero_version == 20;
+		return bolero_version == 20 || bolero_version == 10;
 	}
 	for (unsigned i = 0; i < 3; i++) {
 		found_va_mic[i] = get(&va_macro, "SWR_MIC_CTL (as found)", VA_SWR_MIC_CTL0 + 4 * i);
@@ -1139,12 +1243,20 @@ static bool
 dec1_on(void)
 {
 	uint32_t cfg0;
+	const uint32_t regs[11] = {
+		TX_TOP_CSR_SWR_CTRL, TX_SWR_MIC0_CTL, TX_SWR_MIC1_CTL, TX_SWR_MIC2_CTL, TX_SWR_MIC2_CTL + 4, TX_SWR_MIC2_CTL + 8,
+		TX_SWR_MIC2_CTL + 12, TX_ADC_MUX1_CFG0, TX_ADC_MUX1_CFG1, TX1_PATH_CTL, TX1_PATH_SEC7,
+	};
 
+	memcpy(dec_regs, regs, sizeof(dec_regs));
 	for (size_t i = 0; i < sizeof(dec_regs) / sizeof(dec_regs[0]); i++) {
 		found_dec[i] = get(&tx_macro, "(as found)", dec_regs[i]);
 	}
 	dec_taken = true;
-	if (!put_bits(&tx_macro, "TX1_TX_PATH_CFG0: an analog mic", TX1_PATH_CFG0, 0x80, 0x00) ||
+	say("mic: decimator %u (TX SMIC MUX%u, TX_CDC_DMA_TX_3 channel bit %u)\n", mic_dec, mic_dec, mic_dec);
+	/* (decimator 0: tx_macro_component_probe() sets its TX_PATH_SEC7 [5:0] to 0xa; from hakios-alioth) */
+	if ((mic_dec == 0 && !put_bits(&tx_macro, "TX0_TX_PATH_SEC7: 0xa (tx_macro_component_probe())", TX1_PATH_SEC7, 0x3f, 0x0a)) ||
+	    !put_bits(&tx_macro, "TX1_TX_PATH_CFG0: an analog mic", TX1_PATH_CFG0, 0x80, 0x00) ||
 	    !put_bits(&tx_macro, smic_input == 1 ? "ADC_MUX1_CFG0: SWR_MIC0" : "ADC_MUX1_CFG0: ANOTHER INPUT (mic_input)", TX_ADC_MUX1_CFG0,
 	    0x0f, smic_input & 0x0f) ||
 	    !put_bits(&tx_macro, "ADC_MUX1_CFG1: SWR_MIC", TX_ADC_MUX1_CFG1, 0x03, 0x01) ||
@@ -1174,10 +1286,12 @@ dec1_on(void)
 	if (!put(&tx_macro, "TX1_TX_VOL_CTL: 0 dB", TX1_VOL_CTL, get(&tx_macro, "TX1_TX_VOL_CTL", TX1_VOL_CTL), 0xff)) {
 		return false;
 	}
+	/* bolero 1.0 (the POCO F4) writes none of these: kona's tx-macro.c touches TOP_CSR_SWR_CTRL only for 2.0 and 2.1,
+	 * and its 0xd0 is SWR_AMIC0_CTL, whose bit 3 does not stick (mic=3, 19 November: 0xc written, 0x4 read) */
 	if (bolero_version != 20) {
 		return true;
 	}
-	/* bolero 2.0 only: the SoundWire mics' clocks */
+	/* bolero 2.0: the SoundWire mics' clocks */
 	return put_bits(&tx_macro, "TOP_CSR_SWR_CTRL", TX_TOP_CSR_SWR_CTRL, 0x01, 0x01) &&
 	       put_bits(&tx_macro, "SWR_MIC0_CTL", TX_SWR_MIC0_CTL, 0x0e, 0x0c) &&
 	       put_bits(&tx_macro, "SWR_MIC1_CTL", TX_SWR_MIC1_CTL, 0x0e, 0x0c) &&
@@ -1412,10 +1526,11 @@ dsp_port_on(void)
 	struct {
 		uint32_t version, rate;
 		uint16_t bits, format, channels, mask;
-	} __attribute__((packed)) config = { 1, MIC_RATE, 16, 0, 1, 1u << 1 };
+	} __attribute__((packed)) config = { 1, MIC_RATE, 16, 0, 1, (uint16_t)(1u << mic_dec) };
 	uint16_t start[2] = { MIC_PORT, 0 };
 
 	if (!afe_port_param(AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_CODEC_DMA_CONFIG, &config, sizeof(config),
+	    mic_dec == 0 ? "the port TX_CDC_DMA_TX_3 (0xb037): 1 channel of 16 bits at 48 kHz, decimator 0" :
 	    "the port TX_CDC_DMA_TX_3 (0xb037): 1 channel of 16 bits at 48 kHz, decimator 1")) {
 		return false;
 	}
@@ -1707,13 +1822,24 @@ path_up(void)
 		say("mic: the clocks were not all given: the blocks are not touched\n");
 		return false;
 	}
-	if (!reset_release() || !pins_on() || !tx_clocks_on() || !master_on()) {
+	touch_check("the LPASS's votes and the TX clocks");
+	if (!reset_release()) {
 		return false;
 	}
+	touch_check("the codec out of reset");
+	if (!pins_on()) {
+		return false;
+	}
+	touch_check("the master's pins");
+	if (!tx_clocks_on() || !master_on()) {
+		return false;
+	}
+	touch_check("the TX macro's clocks and the master");
 	sleep_ms(5);    /* ("5 ms for SoundWire's auto-enumeration", wcd938x_bind()) */
 	if ((codec_device = codec_wait()) == 0) {
 		return false;
 	}
+	touch_check("the codec found on SoundWire");
 	swr_write(0xf, SWRS_SCP_INT_STATUS_MASK_1, 0x04, 0xf);  /* (swrm_runtime_resume(): broadcast) */
 	sleep_ms(10);
 	if (!quiet) {
@@ -1803,9 +1929,12 @@ mic_thread(__unused void *parameter, __unused wait_result_t result)
 	} else {
 		lck_mtx_lock(&mic_lock);
 		if (level == 1) {
+			touch_check("nothing yet");
 			if (clocks_on()) {
+				touch_check("the LPASS's votes and the TX clocks");
 				sleep_ms(10);
 				look();
+				touch_check("the look");
 			} else {
 				say("mic: the clocks were not all given: the blocks are not touched\n");
 			}
@@ -1816,6 +1945,7 @@ mic_thread(__unused void *parameter, __unused wait_result_t result)
 			say("mic: %s; last: %s\n", broken ? "STOPPED" : level >= 3 ? "listened" : "done", last_write);
 		}
 		undo();
+		touch_check("all given back");
 		lck_mtx_unlock(&mic_lock);
 	}
 	running = false;
@@ -1828,18 +1958,40 @@ hakios_mic_dsp_up(void)
 {
 	thread_t thread;
 
-	if (hakios_soc_is("sm8250")) {
-		tlmm.phys = 0x0f500000;
-		tlmm.size = 0x83000;
-		reset_gpio = 32;
+	{
+		uint32_t tile = 0x0f100000;     /* redwood's pin controller */
+
+		if (hakios_soc_is("sm8250")) {
+			tile = 0x0f500000;      /* the POCO F4's south tile */
+			reset_gpio = 32;
+			/* gpio, not the tree's "func2": on gpio32 kona's mux 2 is NA (pinctrl-kona.c), so with it the
+			 * out register never reached the pad and the codec stayed in reset (mic=3, 19 November: the link up,
+			 * slave status 0). mic_reset_func=N to try another mux */
+			reset_function = 0;
+			kona_port = 1, mport = 2, port_si = 1, port_off1 = 1, port_lane = 0;
+			swr_pin_count = 3;
+			mic_dec = 0;            /* kona's "main-mic" (hakios-alioth); mic_dec=1 for the old path */
+		}
+		tlmm.phys = tile + 0x1000 * reset_gpio;
+		tlmm.size = 0x1000;
 	}
 	if (!PE_parse_boot_argn("mic", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	level = level > 4 ? 4 : level;
-	if (hakios_soc_is("sm8250")) {
-		level = 1;              /* (the POCO F4: a look; see the top) */
+	if (PE_parse_boot_argn("mic_reset_func", &reset_function, sizeof(reset_function)) && reset_function > 15) {
+		reset_function = 0;
 	}
+	PE_parse_boot_argn("mic_mport", &mport, sizeof(mport));
+	PE_parse_boot_argn("mic_si", &port_si, sizeof(port_si));
+	PE_parse_boot_argn("mic_off1", &port_off1, sizeof(port_off1));
+	PE_parse_boot_argn("mic_lane", &port_lane, sizeof(port_lane));
+	if (PE_parse_boot_argn("mic_dec", &mic_dec, sizeof(mic_dec)) && mic_dec > 1) {
+		mic_dec = 1;
+	}
+	if (mport < 1 || mport > 5) {
+		mport = kona_port ? 2 : 1;
+	}
+	level = level > 4 ? 4 : level;
 	PE_parse_boot_argn("mic_secs", &mic_secs, sizeof(mic_secs));
 	PE_parse_boot_argn("mic_input", &smic_input, sizeof(smic_input));
 	PE_parse_boot_argn("mic_adc", &adc_on, sizeof(adc_on));
