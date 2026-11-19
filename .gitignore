@@ -47,6 +47,9 @@ __pycache__/
 /xnuloader/*
 !/xnuloader/build.sh
 !/xnuloader/efi.h
+!/xnuloader/filemap.h
+!/xnuloader/im4p.py
+!/xnuloader/mkidentity.sh
 !/xnuloader/loader.c
 !/xnuloader/mkidentity.py
 !/xnuloader/mkpayload.py
