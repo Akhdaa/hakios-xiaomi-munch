@@ -222,8 +222,10 @@ MUNCH_CHARGE	arg	munch_charge	User space	k	hakios.munch_battery.c
 MUNCH_CHARGER_LOOK	arg	munch_charger_look	User space	k	hakios.munch_battery.c	
 MUNCH_MODEM	arg	munch_modem	User space	k	hakios.munch_modem.c	
 MUNCH_MODEM_AP2MDM	arg	munch_modem_ap2mdm	User space	k	hakios.munch_modem.c	left as they are.
+MUNCH_MODEM_CACHED	arg	munch_modem_cached	User space	k	hakios.munch_modem.c	the X55 sees the buffer uncached, as before 19 November (see hakios_wifi_radio_map_cached())
 MUNCH_MODEM_IOVA	arg	munch_modem_iova	User space	k	hakios.munch_modem.c	
 MUNCH_MODEM_KEEP	arg	munch_modem_keep	User space	k	hakios.munch_modem.c	
+MUNCH_MODEM_MSI	arg	munch_modem_msi	User space	k	hakios.munch_modem.c	
 MUNCH_MODEM_PHYS	arg	munch_modem_phys	User space	k	hakios.munch_modem.c	the boot ROM is given the copy's physical address instead of the one our SMMU context shows it at
 MUNCH_MODEM_SOCRESET	arg	munch_modem_socreset	User space	k	hakios.munch_modem.c	a fresh boot ROM first. Android warm-resets the X55 through its PMIC's power-on block before the boot loader goes over BHI; that block's channel at
 MUNCH_MODEM_TBU	arg	munch_modem_tbu	User space	k	hakios.munch_modem.c	

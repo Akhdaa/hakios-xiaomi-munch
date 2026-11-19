@@ -240,8 +240,10 @@ munch_charge	k
 munch_charger_look	k
 munch_modem	k
 munch_modem_ap2mdm	k
+munch_modem_cached	k
 munch_modem_iova	k
 munch_modem_keep	k
+munch_modem_msi	k
 munch_modem_phys	k
 munch_modem_socreset	k
 munch_modem_tbu	k

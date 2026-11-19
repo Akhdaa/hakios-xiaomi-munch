@@ -26,7 +26,10 @@
  *   munch_modem=5  ... and its boot loader given: bus mastering on, our memory shown to it through a context of the SMMU
  *                  for stream 0x1d01 (hakios.wifi.c's, so not with wifi=1 yet), sbl1.mbn (/fw/sdx55m in the system image)
  *                  copied there and handed to its boot ROM over BHI, as mhi_fw_load_sbl() does; then its environment
- *                  read again (SBL: its boot loader runs, and will ask for the rest over Sahara)
+ *                  read again (SBL: its boot loader runs, and will ask for the rest over Sahara). Since 19 November the
+ *                  buffer is mapped write-back cacheable for the X55 and its MSI is on, as on the OnePlus 8 Pro, whose
+ *                  X55 took its boot loader only then (munch_modem_cached=0, munch_modem_msi=0: each left out, to tell
+ *                  which of the two it needs)
  *
  * The modem's own data (its EFS: the partitions mdm1m9kefs1-3 and mdmddr, with its IMEI and calibration) is not read
  * here, and will never be written by anything of this port.
@@ -51,6 +54,8 @@ extern bool hakios_munch_vreg(const char *name, uint32_t millivolts, bool on, ui
 extern void hakios_wifi_radio_space_want(uint32_t stream, uint32_t mask);                           /* hakios.wifi.c */
 extern void hakios_wifi_radio_space_base(uint64_t base);
 extern bool hakios_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address);
+extern bool hakios_wifi_radio_map_cached(uint64_t physical, uint64_t size, unsigned long long *address);
+extern bool hakios_wifi_radio_msi_address(unsigned long long *address);
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern uint64_t kvtophys(vm_offset_t va);
@@ -739,6 +744,9 @@ x55_registers(void)
 	return true;
 }
 
+/* boot-args munch_modem_cached=0 and munch_modem_msi=0: the two changes of 19 November left out (see sbl_load()) */
+static uint32_t modem_cached = 1, modem_msi = 1;
+
 /* memory in one piece, uncached, that the X55 sees through its stream (as hakios.munch_mhi.c's dma_alloc) */
 static uint64_t dma_last_physical;      /* the last dma_alloc()'s, for munch_modem_phys */
 static vm_offset_t dma_last_cached;     /* ... and its cached view, to be cleaned after the copy */
@@ -765,7 +773,9 @@ dma_alloc(vm_size_t size, uint64_t *address)
 	}
 	__asm__ volatile ("dsb sy");
 	uncached = ml_io_map_unmappable(physical, size, VM_WIMG_WCOMB);
-	if (uncached == 0 || !hakios_wifi_radio_map(physical, size, (unsigned long long *)address)) {
+	/* munch_modem_cached=0: the X55 sees the buffer uncached, as before 19 November (see hakios_wifi_radio_map_cached()) */
+	if (uncached == 0 || !(modem_cached ? hakios_wifi_radio_map_cached(physical, size, (unsigned long long *)address) :
+	    hakios_wifi_radio_map(physical, size, (unsigned long long *)address))) {
 		say("munch-modem: %lu KB could not be shown to the X55\n", (unsigned long)(size >> 10));
 		return NULL;
 	}
@@ -795,6 +805,50 @@ smmu_faults(void)
 	say("munch-modem: SMMU as a whole: sgfsr %#x, sgfsynr1 %#x (the stream)\n", rd(smmu + SMMU_SGFSR), rd(smmu + SMMU_SGFSYNR1));
 }
 
+/*
+ * The X55's MSI capability set up and switched on, its writes going to the GIC's SETSPI register through our SMMU context.
+ * The OnePlus 8 Pro's X55 (same chip, same SoC) refused its boot loader with 0xef0e0003, as ours does, until its MSI was on
+ * and its buffers mapped cacheable (hackios-op8pro, docs/research/modem-sdx55.md: both changed at once, which of the two
+ * mattered not separated): its boot ROM probably raises its completion interrupt and fails the transfer when it cannot.
+ * The data is SPI 960 and up (all the vectors it offers): interrupts nothing here enables, so a write only becomes pending.
+ */
+#define X55_MSI_SPI             960u
+
+static bool
+msi_on(void)
+{
+	unsigned long long address = 0;
+	uint32_t cap = rd(conf + 0x34) & 0xfc;
+
+	for (unsigned guard = 0; cap != 0 && guard < 48; guard++) {
+		uint32_t head = rd(conf + cap), control = head >> 16;
+
+		if ((head & 0xff) != 0x05) {
+			cap = head >> 8 & 0xfc;
+			continue;
+		}
+		if (!hakios_wifi_radio_msi_address(&address)) {
+			say("munch-modem: msi: the GIC's register could not be shown to the X55\n");
+			return false;
+		}
+		put(conf + cap, 4, (uint32_t)address);
+		if (control & 0x80) {           /* 64-bit addresses */
+			put(conf + cap, 8, (uint32_t)(address >> 32));
+			put(conf + cap, 12, X55_MSI_SPI);
+		} else {
+			put(conf + cap, 8, X55_MSI_SPI);
+		}
+		/* enabled, with every vector it offers (multiple message enable = multiple message capable) */
+		control = (control & ~0x70u) | ((control >> 1) & 7u) << 4 | 1u;
+		put(conf + cap, 0, (head & 0xffffu) | control << 16);
+		say("munch-modem: msi: capability at %#x (control now %#x, %s addresses): the X55 writes %u + v at %#llx\n", cap,
+		    rd(conf + cap) >> 16, (control & 0x80) ? "64-bit" : "32-bit", X55_MSI_SPI, address);
+		return true;
+	}
+	say("munch-modem: msi: the X55 shows no MSI capability\n");
+	return false;
+}
+
 static bool
 sbl_load(void)
 {
@@ -804,6 +858,8 @@ sbl_load(void)
 	uint32_t session, status = 0, env;
 	unsigned ms;
 
+	PE_parse_boot_argn("munch_modem_cached", &modem_cached, sizeof(modem_cached));
+	PE_parse_boot_argn("munch_modem_msi", &modem_msi, sizeof(modem_msi));
 	env = rd(bhi + BHI_EXECENV);
 	if (env != EE_PBL) {
 		say("munch-modem: the X55 is in %s, not its boot ROM: no boot loader to give it\n", ee_name(env));
@@ -903,7 +959,11 @@ sbl_load(void)
 	    copy[2], copy[3], copy[size - 2], copy[size - 1], image[0], image[1], image[2], image[3]);
 	read_random(&session, sizeof(session));
 	session = (session & 0x3fffffff) | 1;
-	say("munch-modem: BHI: sbl1.mbn (%llu KB) at %#llx, session %#x\n", size >> 10, address, session);
+	if (modem_msi) {
+		(void)msi_on();
+	}
+	say("munch-modem: BHI: sbl1.mbn (%llu KB) at %#llx, session %#x (buffer %s for the X55, MSI %s)\n", size >> 10, address,
+	    session, modem_cached ? "write-back cacheable" : "uncached", modem_msi ? "on" : "left off");
 	wr(bhi + BHI_STATUS, 0);
 	wr(bhi + BHI_INTVEC, 0);
 	wr(bhi + BHI_IMGADDR_HIGH, (uint32_t)(address >> 32));
@@ -1178,10 +1238,14 @@ modem_init(void)
 {
 	thread_t thread;
 
+	kern_return_t kr;
+
 	if (!hakios_soc_is("sm8250") || !PE_parse_boot_argn("munch_modem", &look_level, sizeof(look_level)) || look_level == 0) {
 		return;
 	}
-	if (kernel_thread_start(modem_thread, NULL, &thread) == KERN_SUCCESS) {
+	kr = kernel_thread_start(modem_thread, NULL, &thread);
+	say("munch-modem: level %u, the modem's thread %s (%d)\n", look_level, kr == KERN_SUCCESS ? "started" : "NOT STARTED", kr);
+	if (kr == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
 }

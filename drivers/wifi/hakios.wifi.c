@@ -4008,6 +4008,37 @@ hakios_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *addr
 }
 
 /*
+ * The same, but write-back cacheable and inner shareable (MAIR entry 1 of SMMU_MAIR0): the coherent mapping a dma-coherent
+ * device's tree asks for. The POCO F4's X55 (hakios.munch_modem.c): its boot ROM refused its boot loader through the
+ * uncached mapping (BHI 0xef0e0003); the OnePlus 8 Pro's X55, the same chip on the same SoC, took it once its buffers were
+ * mapped this way and its MSI was on (hackios-op8pro, docs/research/modem-sdx55.md).
+ */
+#define RADIO_PTE_CACHED        (3ull | 1ull << 2 | 1ull << 6 | 3ull << 8 | 1ull << 10 | 1ull << 11)
+
+bool
+hakios_wifi_radio_map_cached(uint64_t physical, uint64_t size, unsigned long long *address)
+{
+	return radio_map(physical, size, RADIO_PTE_CACHED, address);
+}
+
+/*
+ * The GIC's register that raises an SPI (RADIO_MSI_REGISTER), shown in the current radio space as a device's page, for a
+ * device other than the Wi-Fi's radio: *address is where it writes its MSI. Mapped at every call (the space is another one
+ * for each user).
+ */
+bool
+hakios_wifi_radio_msi_address(unsigned long long *address)
+{
+	unsigned long long page = 0;
+
+	if (!radio_map(RADIO_MSI_REGISTER & ~4095ull, 4096, RADIO_PTE_DEVICE, &page)) {
+		return false;
+	}
+	*address = page + (RADIO_MSI_REGISTER & 4095);
+	return true;
+}
+
+/*
  * The POCO F4's QCA6390 (hakios_munch_mhi.c) is behind the same stream: PCIe 0's, 0x1c00 for the
  * root port and 0x1c01 for bus 1 (dt: iommu-map of qcom,pcie@1c00000), which the mask 1 covers; its
  * addresses are where Android puts them too (cnss_pci_iommu_group: 256 MB from 0xa0000000) and its
