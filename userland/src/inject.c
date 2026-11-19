@@ -25,6 +25,7 @@
  * Addresses of things inside the dyld shared cache are those of Darwin userland 16.5 (20F66) for iPhone10,3;
  * every one is checked against what is expected to be there before it is touched.
  */
+#include <Block.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
@@ -1316,6 +1317,174 @@ attention_report(void)
 	});
 }
 
+/* (the screen's orientation from the sensor DSP: from xiongnemo/hakios-alioth, overlays/userland/src/inject.c, as it is) */
+/*
+ * backboardd's BKOrientationManager has the device's orientation from CoreMotion's CMDeviceOrientationManager --
+ * -startDeviceOrientationUpdatesToQueue:withHandler: while SpringBoard wants orientation events, and
+ * -deviceOrientationBlocking when it asks -- which reads the AOP's orientation service, or an accelerometer and a
+ * gyro of the iPhone's own. None of them is here ("[Orientation] fHidDeviceInterface NULL", "missing accel HID
+ * service plugin"): the screen never turned. The sensor DSP knows the orientation (sysctl kern.hakios.orientation,
+ * bsd/dev/hakios.slpi.c, Qualcomm's device_orient: portrait, upside down and the two landscapes, never face up or
+ * down); with slpi=1 those methods give that instead, looked at ten times a second (work/research/sensors-ios.md).
+ */
+#define CM_START_ORIENTATION    0x19199d3f0UL   /* -[CMDeviceOrientationManager startDeviceOrientationUpdatesToQueue:withHandler:] */
+#define CM_STOP_ORIENTATION     0x191c5288cUL   /* -[CMDeviceOrientationManager stopDeviceOrientationUpdates] */
+#define CM_ORIENTATION_BLOCKING 0x1919a32ccUL   /* -[CMDeviceOrientationManager deviceOrientationBlocking] (20F66) */
+
+static pthread_mutex_t orientation_lock = PTHREAD_MUTEX_INITIALIZER;
+static id orientation_queue;                    /* (an NSOperationQueue, retained) */
+static void (^orientation_handler)(id, id);     /* (a copy: void (^)(CMDeviceOrientation *, NSError *)) */
+static int orientation_now;                     /* a UIDeviceOrientation, 0 while not known */
+
+static int
+orientation_read(void)
+{
+	int value = 0;
+	size_t size = sizeof(value);
+
+	return sysctlbyname("kern.hakios.orientation", &value, &size, NULL, 0) == 0 ? value : -1;
+}
+
+/* a CMDeviceOrientation, +1 (-initWithOrientation:andTimestamp: 0x191c51d80: an int, and seconds of mach time) */
+static id
+orientation_object(int orientation)
+{
+	Class cls = objc_getClass("CMDeviceOrientation");
+	id object = cls ? ((id (*)(id, SEL))objc_msgSend)((id)cls, sel_registerName("alloc")) : nil;
+	mach_timebase_info_data_t base;
+
+	mach_timebase_info(&base);
+	return object == nil ? nil : ((id (*)(id, SEL, int, double))objc_msgSend)(object,
+	           sel_registerName("initWithOrientation:andTimestamp:"), orientation,
+	           (double)mach_absolute_time() * base.numer / base.denom / 1e9);
+}
+
+/* The handler, on its queue, told the orientation (with orientation_lock held). */
+static void
+orientation_deliver(int orientation)
+{
+	void (^handler)(id, id) = orientation_handler;
+	id object;
+
+	if (orientation_queue == nil || handler == NULL || (object = orientation_object(orientation)) == nil) {
+		return;
+	}
+	/* (the block keeps the handler; the object it releases itself: plain C does not retain an id it takes along) */
+	((void (*)(id, SEL, void (^)(void)))objc_msgSend)(orientation_queue, sel_registerName("addOperationWithBlock:"), ^{
+		handler(object, nil);
+		((void (*)(id, SEL))objc_msgSend)(object, sel_registerName("release"));
+	});
+}
+
+static void
+orientation_start(__unused id self, __unused SEL selector, id queue, void (^handler)(id, id))
+{
+	static unsigned said;
+
+	pthread_mutex_lock(&orientation_lock);
+	if (orientation_queue != nil) {
+		((void (*)(id, SEL))objc_msgSend)(orientation_queue, sel_registerName("release"));
+	}
+	if (orientation_handler != NULL) {
+		Block_release(orientation_handler);
+	}
+	orientation_queue = queue != nil ? ((id (*)(id, SEL))objc_msgSend)(queue, sel_registerName("retain")) : nil;
+	orientation_handler = handler != NULL ? Block_copy(handler) : NULL;
+	if (orientation_now > 0) {
+		orientation_deliver(orientation_now);
+	}
+	pthread_mutex_unlock(&orientation_lock);
+	if (said++ < 8) {
+		say("hakios: orientation: updates wanted (now %d)\n", orientation_now);
+	}
+}
+
+static void
+orientation_stop(__unused id self, __unused SEL selector)
+{
+	pthread_mutex_lock(&orientation_lock);
+	if (orientation_queue != nil) {
+		((void (*)(id, SEL))objc_msgSend)(orientation_queue, sel_registerName("release"));
+		orientation_queue = nil;
+	}
+	if (orientation_handler != NULL) {
+		Block_release(orientation_handler);
+		orientation_handler = NULL;
+	}
+	pthread_mutex_unlock(&orientation_lock);
+}
+
+static id
+orientation_blocking(__unused id self, __unused SEL selector)
+{
+	int now = orientation_read();
+	id object = orientation_object(now > 0 ? now : 0);
+
+	return object == nil ? nil : ((id (*)(id, SEL))objc_msgSend)(object, sel_registerName("autorelease"));
+}
+
+static void *
+orientation_thread(__unused void *arg)
+{
+	unsigned changes = 0;
+
+	pthread_setname_np("redwood orientation");
+	for (;;) {
+		int value = orientation_read();
+
+		if (value < 0) {
+			say("hakios: orientation: no kern.hakios.orientation: not looked at\n");
+			return NULL;
+		}
+		if (value > 0 && value != orientation_now) {
+			pthread_mutex_lock(&orientation_lock);
+			orientation_now = value;
+			orientation_deliver(value);
+			pthread_mutex_unlock(&orientation_lock);
+			if (changes++ < 40) {
+				say("hakios: orientation: %d (UIDeviceOrientation)\n", value);
+			}
+		}
+		usleep(100000);
+	}
+}
+
+static void
+orientation_fixes(void)
+{
+	static const struct {
+		const char *name;
+		uintptr_t expected;
+		IMP ours;
+	} methods[] = {
+		{ "startDeviceOrientationUpdatesToQueue:withHandler:", CM_START_ORIENTATION, (IMP)orientation_start },
+		{ "stopDeviceOrientationUpdates", CM_STOP_ORIENTATION, (IMP)orientation_stop },
+		{ "deviceOrientationBlocking", CM_ORIENTATION_BLOCKING, (IMP)orientation_blocking },
+	};
+	Class cls = objc_getClass("CMDeviceOrientationManager");
+	Method found[3];
+	pthread_t thread;
+
+	for (unsigned i = 0; i < 3; i++) {
+		IMP original;
+
+		found[i] = cls ? class_getInstanceMethod(cls, sel_registerName(methods[i].name)) : NULL;
+		original = found[i] ? method_getImplementation(found[i]) : NULL;
+		if (original == NULL || (uintptr_t)original != methods[i].expected + slide) {
+			say("hakios: -[CMDeviceOrientationManager %s]: found %#lx, not what was expected; the orientation left alone\n",
+			    methods[i].name, original ? (uintptr_t)original - slide : 0);
+			return;
+		}
+	}
+	for (unsigned i = 0; i < 3; i++) {
+		method_setImplementation(found[i], methods[i].ours);
+	}
+	if (pthread_create(&thread, NULL, orientation_thread, NULL) == 0) {
+		pthread_detach(thread);
+	}
+	say("hakios: orientation: CoreMotion's in backboardd is the sensor DSP's (kern.hakios.orientation)\n");
+}
+
 __attribute__((constructor))
 static void
 hakios_init(void)
@@ -1384,6 +1553,9 @@ hakios_init(void)
 		 * moved the start of the event server onto the moment make_service() now knows how to
 		 * survive; not tried again since, and until it is, the five seconds stay.)
 		 */
+		if (has_boot_arg(arguments, "slpi=1")) {
+			orientation_fixes();    /* (the POCO F4's sensor DSP: devices/munch/drivers/sensors) */
+		}
 		input_start();
 		if (has_boot_arg(arguments, "hw=munch") && has_boot_arg(arguments, "fb_backlight=1")) {
 			dispatch_async(dispatch_get_main_queue(), ^{

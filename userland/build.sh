@@ -137,7 +137,8 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.sb.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo
-/redwood/lib/libhakios.tweaks.dylib Preferences"}
+/redwood/lib/libhakios.tweaks.dylib Preferences
+/redwood/lib/libhakios.motion.dylib SystemCheck Compass"}
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -249,6 +250,10 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		# ... and inside an application, to say what killed it (src/inject_app.c)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.app.dylib -lobjc \
 			-o obj/libhakios.app.dylib src/inject_app.c
+		# ... and the sensors for applications: the compass and CoreMotion from the sensor DSP (src/inject_motion.c,
+		# from xiongnemo/hakios-alioth's inject_ui.c)
+		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.motion.dylib -lobjc \
+			-o obj/libhakios.motion.dylib src/inject_motion.c
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
@@ -373,6 +378,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	cp obj/libhakios.dylib obj/libhakios.sb.dylib root/lib/
 	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
+	[ -f obj/libhakios.motion.dylib ] && cp obj/libhakios.motion.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then
 		mkdir -p root/lib/HakiosAudio.driver
@@ -535,6 +541,14 @@ for tuned in ../fw-camera/com.qti.tuned.hakios_*.bin; do
 	mkdir -p root/fw
 	../tools/camtuning.py "$tuned" "root/fw/camera-$sensor.isp" >/dev/null
 done
+# ... and the files the POCO F4's sensor DSP asks for over FastRPC (devices/munch/drivers/sensors, slpi=1), laid out as it
+# names them: ../fw-sensors/sensors (vendor/etc/sensors, mnt/vendor/persist/sensors, usr/lib/qcom/adsp, sys/devices/soc0;
+# the phone's and the owner's own, never in the repository): /redwood/fw/sensors, 3 MB
+if [ -d ../fw-sensors/sensors/vendor/etc/sensors ]; then
+	rm -rf root/fw/sensors
+	mkdir -p root/fw/sensors
+	cp -R ../fw-sensors/sensors/. root/fw/sensors/
+fi
 # ... and with ADSP=1 the image of the audio DSP, from the same place into ../fw-audio (drivers/audio/hakios.adsp.c):
 # adsp.mdt and adsp.b02 to adsp.b36, 20 MB. Only when asked for: beside GL=1 the payload would be more than the 64 MB
 # the loader takes.
@@ -700,11 +714,23 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# bundle says CADisableMinimumFrameDurationOnPhone, which no application of an iPhone X's system does; the panel
 	# here runs at 120 (IOMFBDisplayRefresh, MiniIOMobileFramebuffer.cpp). New files, not edits: sysroot's are links
 	python3 mkhighrate.py sysroot
+	# ... and applications from ../apps/*.app (git-ignored: other people's builds, e.g. xiongnemo/ios-system-check's
+	# SystemCheck.app for the sensors, GPU and motion): system applications, which LaunchServices finds by walking
+	# /Applications at every boot
+	for app in ../apps/*.app; do
+		[ -d "$app" ] && rm -rf "sysroot/Applications/${app##*/}" && cp -R "$app" sysroot/Applications/
+	done
 	# the audio DSP's firmware, the phone's own from ../fw-audio (never in the repository), where the kernel reads
 	# it once the root is mounted (drivers/audio/hakios.adsp.c, adsp=1): 20 MB that do not fit beside GL=1 in the small image
 	if [ -f ../fw-audio/adsp.mdt ]; then
 		mkdir -p sysroot/fw
 		cp ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] sysroot/fw/
+	fi
+	# the POCO F4's sensor DSP firmware, its own /vendor/firmware_mnt/image/slpi.* from ../fw-sensors/slpi (never in the
+	# repository), read by devices/munch/drivers/sensors (slpi=1) once the root is mounted: 7.6 MB
+	if [ -f ../fw-sensors/slpi/slpi.mdt ]; then
+		mkdir -p sysroot/fw
+		cp ../fw-sensors/slpi/slpi.mdt ../fw-sensors/slpi/slpi.b[0-9][0-9] sysroot/fw/
 	fi
 	# MPSS firmware is much too large for the small boot image. Keep it in the system APFS,
 	# only when explicitly requested, after checking every loadable segment against this DTB.

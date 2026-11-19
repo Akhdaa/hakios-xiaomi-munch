@@ -1,0 +1,6 @@
+# devices/munch/drivers/sensors/conf: the POCO F4's sensors, through its sensor DSP (docs/porting/drivers.md, docs/drivers-config.md).
+
+driver MUNCH_SLPI
+	file    bsd/dev/hakios.munch_slpi.c
+	help    the POCO F4's sensor DSP (SLPI), from xiongnemo/hakios-alioth's hakios.slpi.c: slpi=1 starts it and answers its
+	help    FastRPC file requests from /redwood/fw/sensors (fw-sensors/sensors); kern.hakios.als_millilux, orientation, accel, gyro

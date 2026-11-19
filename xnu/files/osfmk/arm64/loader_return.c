@@ -62,6 +62,8 @@ extern void hakios_haptic_quiesce(void);
 extern void hakios_torch_quiesce(void);
 extern void hakios_camera_quiesce(void);
 extern void hakios_munch_modem_quiesce(void) __attribute__((weak));    /* devices/munch/drivers/modem */
+extern void hakios_slpi_quiesce(void) __attribute__((weak));   /* devices/munch/drivers/sensors (the sensor DSP) */
+extern void hakios_slpi_stop(void) __attribute__((weak));
 extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
 extern void hakios_var_save_on_return(void);   /* drivers/storage/hakios.ufs.c: the data volume into the flash */
@@ -383,6 +385,9 @@ loader_return(void)
 	}
 	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	hakios_adsp_quiesce();         /* nor the audio DSP */
+	if (hakios_slpi_quiesce != NULL) {
+		hakios_slpi_quiesce();  /* nor the sensor DSP */
+	}
 	hakios_mpss_quiesce();         /* nor the modem */
 	if (hakios_munch_modem_quiesce != NULL) {
 		hakios_munch_modem_quiesce();  /* (the POCO F4's X55, on its PCIe 2) */
@@ -509,6 +514,9 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 		}
 		hakios_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
 		hakios_adsp_stop();            /* and the audio DSP */
+		if (hakios_slpi_stop != NULL) {
+			hakios_slpi_stop();     /* and the sensor DSP */
+		}
 		hakios_mpss_stop();            /* and the modem */
 	}
 	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
@@ -561,6 +569,9 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		}
 		hakios_wifi_stop();
 		hakios_adsp_stop();
+		if (hakios_slpi_stop != NULL) {
+			hakios_slpi_stop();
+		}
 		loader_return();
 	}
 	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);

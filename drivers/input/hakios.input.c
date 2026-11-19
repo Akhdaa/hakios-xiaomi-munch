@@ -350,5 +350,8 @@ hakios_input_init(void)
 	hakios_adreno_init();
 	hakios_wifi_init();
 	hakios_adsp_init();
+	if (hakios_slpi_init != NULL) {
+		hakios_slpi_init();     /* (slpi=1: the POCO F4's sensor DSP, devices/munch/drivers/sensors) */
+	}
 	hakios_mpss_init();
 }
