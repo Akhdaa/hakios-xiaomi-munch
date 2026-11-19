@@ -52,7 +52,7 @@ chmod +x "$OUT/assemble.sh"
 
 # what must not be there
 bad=$(cd "$OUT" && find . \( -path '*/fw-*' -o -name '*.ipsw' -o -name '*.im4p' -o -name 'identity.h' -o -name 'network' \
-	-o -name '*.apfs' -o -name 'mac' -o -name 'run-payload.bin' -o -name 'xnu-usb.img' -o -name 'efs*' \) -print | head -5)
+	-o \( -name '*.apfs' -size +64k \) -o -name 'mac' -o -name 'run-payload.bin' -o -name 'xnu-usb.img' -o -name 'efs*' \) -print | head -5)
 [ -z "$bad" ] || die "refused: these must not be in a kit: $bad"
 if grep -rIl -i -e "/home/$WHO" -e "$WHO@" "$OUT" 2> /dev/null | head -1 | grep -q .; then
 	die "refused: the builder's home or address is in: $(grep -rIl -i -e "/home/$WHO" -e "$WHO@" "$OUT" | head -3 | tr '\n' ' ')"

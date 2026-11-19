@@ -109,12 +109,18 @@ else
 	bash "$ROOT/devices/munch/kit/pull-firmware.sh" "$ROOT"
 fi
 
-log "3/5 the Wi-Fi network iOS joins at every boot"
+log "3/5 the Wi-Fi network iOS joins at every boot (optional: empty to join it in Settings each time)"
+# iOS runs from RAM: what is typed in Settings is gone at the next boot, so a network kept in the package is joined at
+# every boot without asking. Leave the name empty (or run without a terminal and no SSID=) to skip it.
 if [ ! -f "$ROOT/fw-wifi/network" ] || [ -n "${SSID:-}" ]; then
-	[ -n "${SSID:-}" ] || read -r -p "Wi-Fi name (SSID): " SSID
-	[ -n "${PSK:-}" ] || { read -r -s -p "its password: " PSK; echo; }
-	mkdir -p "$ROOT/fw-wifi"
-	(umask 077; printf '%s\n%s\n' "$SSID" "$PSK" > "$ROOT/fw-wifi/network")
+	if [ -z "${SSID:-}" ] && [ -t 0 ]; then read -r -p "Wi-Fi name (SSID), empty to skip: " SSID || SSID=; fi
+	if [ -n "${SSID:-}" ]; then
+		[ -n "${PSK:-}" ] || { read -r -s -p "its password: " PSK || die "no Wi-Fi password given (PSK=...)"; echo; }
+		mkdir -p "$ROOT/fw-wifi"
+		(umask 077; printf '%s\n%s\n' "$SSID" "$PSK" > "$ROOT/fw-wifi/network")
+	else
+		echo "no network kept: join Wi-Fi in Settings after each boot"
+	fi
 fi
 
 log "4/5 the system image and the root disk, with the kit's programs (mostly packing 2.5 GB)"
