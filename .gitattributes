@@ -9,3 +9,7 @@
 # the context lines of its hunks carry them (BootManager.c, BootManagerLib.inf). Turning them into LF
 # would make the patch fail to apply.
 *.patch -text
+
+# The Windows launcher (win-boot/boot-ios.bat, .ps1) keeps CRLF: cmd.exe misreads labels and choice in an LF batch file.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
