@@ -1,8 +1,5 @@
 # What is the phone's own and stays on the computer that pulled it (no vendor firmware or phone data in a repository):
-# the UEFI image built from its vendor drivers, its live device tree (it carries the phone's serial numbers), the drivers.
-/prebuilt/SILICIUM_UEFI.fd
-/prebuilt/device-tree.dtb
-/prebuilt/BootShim.bin
+# the vendor drivers the UEFI image is built from. (The built image, BootShim and device tree are published, as hakios-alioth does.)
 /prebuilt/ramdisk
 /uefi/files/Binaries/*/*
 !/uefi/files/Binaries/*/README.md

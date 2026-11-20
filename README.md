@@ -65,23 +65,35 @@ line can show while things move fast.
 
 ## The phone it is developed on
 
-This port is developed and tested on one phone, and parts of it are still fitted to that phone rather than read from yours:
+This port is developed and tested on one phone, and parts of it are still fitted to that phone rather than read from
+yours:
 
 | | |
 |---|---|
-| Model | POCO F4 (`munch`), 22021211RG, hwc=GLOBAL |
+| Model | POCO F4, `22021211RG` (Global), `hwc=GLOBAL` |
 | Memory, storage | 8 GB RAM, 256 GB UFS |
-| Android on it | HyperOS `OS4.0.24.0`, a port by `@Jnt100`, build of 2026-02-11 (not Xiaomi's own build for munch) |
-| Modem firmware | 2.5.1.c1-14.1-0324_0657_6488b87c (Android's baseband version) |
-| reserved-memory | pil_gpu_region@8681a000, pil_slpi_region@88c00000, pil_adsp_region@8bb00000, cont_splash_region@9c000000 among the others |
+| Android on it | HyperOS `OS4.0.24.0`, a port by `@Jnt100` (the build of 2026-02-11; not Xiaomi's own build for munch) |
+| Modem firmware | `2.5.1.c1-14.1-0324_0657_6488b87c` (Android's baseband version) |
+| `reserved-memory` | as in [`prebuilt/device-tree.dtb`](devices/munch/prebuilt/device-tree.dtb): `removed_region@80b00000` (0x5300000 long), then `pil_gpu_region@8681a000`, `pil_slpi_region@88c00000`, `pil_adsp_region@8bb00000`, `cont_splash_region@9c000000` among the others |
 
 What is fitted to this phone so far:
 
-- The sensor DSP's firmware goes to `pil_slpi_region` (`0x88c00000`) and the audio DSP's to `pil_adsp_region` (`0x8bb00000`), both taken from this phone's `reserved-memory`.
+- The device tree the boot stage hands the kernel is this phone's (`devices/munch/prebuilt/device-tree.dtb`), not
+  your phone's. With it are the Mu-Silicium build it boots (`prebuilt/SILICIUM_UEFI.fd`, `prebuilt/BootShim.bin`).
+- Three drivers put their firmware at addresses taken from this phone's `reserved-memory`: the GPU's zap shader
+  (`pil_gpu_region`, `0x8681a000`), the sensor DSP (`pil_slpi_region`, `0x88c00000`) and the audio DSP
+  (`pil_adsp_region`, `0x8bb00000`). Firmware can move these regions: if the kernel stops early or a part does not
+  start on your phone, compare yours. Taking them from your own phone is planned.
 - The display: Silicium's framebuffer at `0x9c000000` (`cont_splash_region`; 1080 x 2400, 4320 bytes a row).
-- Firmware can move these regions. If the kernel stops early or a part does not start on your phone, compare yours. In Android, `adb shell ls /proc/device-tree/reserved-memory/` lists the regions with their addresses (no root needed).
 
-If you try it on your own phone and something goes wrong, please [open an issue](https://github.com/Akhdaa/hakios-xiaomi-munch/issues). Say which phone it is (model, RAM, region, ROM and firmware version) and what happened, and attach your reserved-memory list. Leave out anything personal: the serial number, IMEI, Wi-Fi names and passwords, Bluetooth and MAC addresses.
+To compare yours, in Android: `adb shell ls /proc/device-tree/reserved-memory/` lists the regions with their
+addresses (no root needed); with root, `adb shell su -c 'cat /sys/firmware/fdt' > fdt.bin` gives the whole tree
+(`dtc -I dtb -O dts fdt.bin`). Don't share that file as it is: its `/chosen` node has your phone's serial number.
+
+**If you try it on your own phone and something goes wrong, please
+[open an issue](https://github.com/Akhdaa/hakios-xiaomi-munch/issues).** Say which phone it is (model, RAM, region,
+ROM and firmware version) and what happened, and attach your `reserved-memory` list. Leave out anything personal:
+the serial number, IMEI, Wi-Fi names and passwords, Bluetooth and MAC addresses.
 
 This section follows [xiongnemo/hakios-alioth](https://github.com/xiongnemo/hakios-alioth)'s.
 
