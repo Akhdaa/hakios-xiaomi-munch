@@ -135,3 +135,6 @@ __pycache__/
 /tools/macos-bin/platform-tools
 win-boot/
 /tools/ufs-boot/out/
+
+# the kit is made by the maintainer only
+/tools/make-kit.sh

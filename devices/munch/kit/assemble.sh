@@ -1,5 +1,5 @@
 #!/bin/bash
-# Make the bootable package for a POCO F4 (munch) out of this kit (tools/make-kit.sh) and what cannot be published,
+# Make the bootable package for a POCO F4 (munch) out of this kit and what cannot be published,
 # made here on your computer:
 #   - the system image, from the iOS 16.5 IPSW for the iPhone X, downloaded from Apple's public servers (or IPSW=FILE);
 #     nothing is decrypted or circumvented;

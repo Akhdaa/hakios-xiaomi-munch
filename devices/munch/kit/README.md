@@ -1,6 +1,6 @@
 # munch kit: iOS 16.5 on the POCO F4
 
-Built by `tools/make-kit.sh` from [Akhdaa/hakios-xiaomi-munch](https://github.com/Akhdaa/hakios-xiaomi-munch). It is half
+Built by the maintainer from [Akhdaa/hakios-xiaomi-munch](https://github.com/Akhdaa/hakios-xiaomi-munch). It is half
 of a bootable package; `assemble.bat` (Windows) or `assemble.sh` (Linux) makes the other half on your computer.
 Modelled on [xiongnemo/hakios-alioth](https://github.com/xiongnemo/hakios-alioth)'s kit for the Redmi K40.
 
