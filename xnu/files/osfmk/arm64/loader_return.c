@@ -64,6 +64,7 @@ extern void hakios_camera_quiesce(void);
 extern void hakios_munch_modem_quiesce(void) __attribute__((weak));    /* devices/munch/drivers/modem */
 extern void hakios_slpi_quiesce(void) __attribute__((weak));   /* devices/munch/drivers/sensors (the sensor DSP) */
 extern void hakios_slpi_stop(void) __attribute__((weak));
+extern void hakios_munch_display_quiesce(void) __attribute__((weak));        /* devices/munch/drivers/display (page flips) */
 extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
 extern void hakios_var_save_on_return(void);   /* drivers/storage/hakios.ufs.c: the data volume into the flash */
@@ -387,6 +388,9 @@ loader_return(void)
 	hakios_adsp_quiesce();         /* nor the audio DSP */
 	if (hakios_slpi_quiesce != NULL) {
 		hakios_slpi_quiesce();  /* nor the sensor DSP */
+	}
+	if (hakios_munch_display_quiesce != NULL) {
+		hakios_munch_display_quiesce();         /* the display engine back on Silicium's framebuffer */
 	}
 	hakios_mpss_quiesce();         /* nor the modem */
 	if (hakios_munch_modem_quiesce != NULL) {
