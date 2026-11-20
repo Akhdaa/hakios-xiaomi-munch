@@ -23,14 +23,15 @@ the port needed in the common tree. `main` is upstream as it was forked.
 | Buttons | works | power and volume |
 | CPU | works | all 8 cores; each group's clock follows its load (`cpugov`, schedutil-like with the device tree's frequency tables); lower caps with the screen off |
 | GPU | works | Adreno 650 through Mesa (OpenGL ES), the default; clock follows the load between 305 and 670 MHz (`gpu_dcvs`) |
-| Metal | partial | with `metal=1` the desktop (CoreAnimation) draws through hakios-metal on the A650; smoother since 18 November but still a bit choppy, and one Reachability area is drawn wrong. Compute, copy/fill and offscreen render through Metal.framework pass |
+| Metal | partial | with `metal=1` the desktop (CoreAnimation) draws through hakios-metal on the A650; all 60 uber-shader configurations seen are specialised up front, and without the diagnostic logging (`metal_fps`) most frames come at 60 fps, with occasional hitches from the CPU copy to the panel. One Reachability area is pink: its memoryless attachment is loaded DontCare and keeps old memory. Compute, copy/fill and offscreen render through Metal.framework pass |
 | Wi-Fi | works | QCA6390 on PCIe 0 with the phone's own firmware; joins a network from Settings |
-| Bluetooth | partial | QCA6390 on QUP0 SE6; Classic earbuds connect from Settings and play A2DP (AAC-LC). Control Center tile and CoreBluetooth discovery open |
+| Bluetooth | partial | QCA6390 on QUP0 SE6, on by default (`munch_bt=4`, bluetoothd and BlueTool in the standard image); Classic earbuds connect from Settings and play A2DP (AAC-LC). Control Center tile and CoreBluetooth discovery open |
 | Sound | works | both speakers (TFA9874) through the audio DSP |
-| Microphone | partial | the driver is built; switching it on breaks touch |
+| Microphone | works | WCD938x ADC1 over SoundWire into decimator 0 (`mic=4`): Voice Memos records |
 | Camera | partial | OV64B40 wide and IMX596 front preview in Camera.app; the OV8856 ultra-wide is not started |
 | Flashlight | works | from Control Center, with its levels (`munch_torch=3`) |
 | Haptics | works | Awinic AW86927 |
+| Sensors | works | the sensor DSP (`slpi=1`): ambient light, accelerometer, gyroscope, compass and rotation; the screen turns, and CoreMotion and the compass answer System Check and Compass. Auto-Brightness not yet |
 | Battery | works | level, voltage, current and temperature in the status bar; charges with `munch_charge=1` (charger watchdog petted, input 1500 mA, battery 1800 mA): 55 to 58 % in about 5 minutes on a wall charger; slow from a computer's port (500 mA) |
 | Auto-Lock | works | follows the Settings timeout; no dimming before the lock |
 | Thermal | partial | 25 sensors read; the prime core and the GPU slowed when hot; the stop at 105 °C not yet seen |
@@ -56,10 +57,23 @@ line can show while things move fast.
 
 - No file of iOS. The user space is laid out from an iPhone X IPSW (iOS 16.5, 20F66) you get yourself.
 - No firmware of Qualcomm's or Xiaomi's. It comes off your own phone (`devices/munch/pull-firmware.sh`).
-- No UEFI binaries or device tree taken from a phone, no serial numbers, MAC addresses, IMEI or calibration data.
+- No UEFI binaries or device tree taken from a phone in the repository, no serial numbers, MAC addresses, IMEI or
+  calibration data. (The kit on the Releases page carries a Mu-Silicium build for munch, as hakios-alioth's kit does.)
 - No keys, no activation, no Apple services (Apple ID, iCloud, App Store), no DRM circumvention.
 - No writes to the phone's storage: no `fastboot flash`, no partition written. The modem's file systems, once
   cellular gets that far, are to be served read only.
+
+## The kit (the easy way)
+
+[Releases](https://github.com/Akhdaa/hakios-xiaomi-munch/releases) has a **munch kit**, like
+[xiongnemo/hakios-alioth](https://github.com/xiongnemo/hakios-alioth)'s: the prebuilt kernel, our userland and a
+Mu-Silicium build. `assemble.bat` (Windows with WSL) or `assemble.sh` makes the rest on your computer: it downloads the
+iOS 16.5 IPSW from Apple, copies the firmware from your own phone (root, read only), optionally adds Sileo (`JB=1`), and
+writes an `ios-munch` folder with `start.bat` and `get-log.bat`. Details: [devices/munch/kit/README.md](devices/munch/kit/README.md).
+
+Experimental and not tested, outside the kit: booting the system from storage instead of RAM,
+[tools/storage-boot](tools/storage-boot/README.md) (a file on `/data`) and [tools/ufs-boot](tools/ufs-boot/README.md)
+(HakiOS's base design, a `darwin` partition).
 
 ## Building and running
 
