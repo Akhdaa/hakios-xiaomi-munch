@@ -25,7 +25,7 @@ the port needed in the common tree. `main` is upstream as it was forked.
 | GPU | works | Adreno 650 through Mesa (OpenGL ES), the default; clock follows the load between 305 and 670 MHz (`gpu_dcvs`) |
 | Metal | partial | with `metal=1` the desktop (CoreAnimation) draws through hakios-metal on the A650; all 60 uber-shader configurations seen are specialised up front, and without the diagnostic logging (`metal_fps`) most frames come at 60 fps, with occasional hitches from the CPU copy to the panel. One Reachability area is pink: its memoryless attachment is loaded DontCare and keeps old memory. Compute, copy/fill and offscreen render through Metal.framework pass |
 | Wi-Fi | works | QCA6390 on PCIe 0 with the phone's own firmware; joins a network from Settings |
-| Bluetooth | partial | QCA6390 on QUP0 SE6, on by default (`munch_bt=4`, bluetoothd and BlueTool in the standard image); Classic earbuds connect from Settings and play A2DP (AAC-LC). Control Center tile and CoreBluetooth discovery open |
+| Bluetooth | works | QCA6390 on QUP0 SE6, on by default (`munch_bt=4`, bluetoothd and BlueTool in the standard image); earbuds pair and connect from Settings and play A2DP (AAC-LC) |
 | Sound | works | both speakers (TFA9874) through the audio DSP |
 | Microphone | works | WCD938x ADC1 over SoundWire into decimator 0 (`mic=4`): Voice Memos records |
 | Camera | partial | OV64B40 wide and IMX596 front preview in Camera.app; the OV8856 ultra-wide is not started |
