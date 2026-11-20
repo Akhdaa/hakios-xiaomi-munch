@@ -15,6 +15,7 @@
 #   SSID=... PSK=...   the Wi-Fi network, instead of being asked
 #   FW_FROM=DIR        take the fw-* directories from DIR instead of the phone (a second assembly)
 #   FW_PULL=1          copy the firmware from the phone again (by default the copy of the last run is used)
+#   JB=1 / JB=0        add Sileo (a rootless jailbreak prefix) to the system, or not (asked when run in a terminal)
 #   PERSIST_IMG=FILE   the sensors' calibration from an offline dump of your persist partition
 #   SYSIMAGE_FROM=DIR  use an IPSW extraction already made (another tree's sysimage/)
 #
@@ -128,6 +129,19 @@ if [ ! -f "$ROOT/fw-wifi/network" ] || [ -n "${SSID:-}" ]; then
 fi
 
 log "4/5 the system image and the root disk, with the kit's programs (mostly packing 2.5 GB)"
+# Optional: a jailbreak prefix with Sileo (Procursus's rootless bootstrap under /var/jb, tools/mk-jb.sh fetches it from
+# Procursus and Sileo's public repositories). Off unless JB=1 or answered yes; JB=0 removes one an earlier run added.
+if [ -z "${JB:-}" ] && [ -t 0 ]; then
+	read -r -p "Add Sileo (a rootless jailbreak prefix, ~130 MB) to the system? [y/N] " answer || answer=
+	case "$answer" in [yY]*) JB=1;; *) JB=0;; esac
+fi
+if [ "${JB:-0}" = 1 ]; then
+	[ -d "$ROOT/jb/root/var/jb" ] || (cd "$ROOT" && bash tools/mk-jb.sh) > "$KIT/jb.log" 2>&1 ||
+		{ tail -15 "$KIT/jb.log"; die "the jailbreak prefix was not fetched (log: $KIT/jb.log)"; }
+	echo "Sileo: in (the prefix is copied to /var/jb at every boot)"
+else
+	rm -rf "$ROOT/jb"
+fi
 rm -rf "$ROOT/prebuilt/userland" && mkdir -p "$ROOT/prebuilt" && cp -r "$KIT/prebuilt/userland" "$ROOT/prebuilt/userland"
 mkdir -p "$ROOT/apps"
 url=$(curl -fsSL https://api.github.com/repos/xiongnemo/ios-system-check/releases/latest | grep -o 'https://[^"]*/SystemCheck-[^"]*\.ipa' | head -1 || true)

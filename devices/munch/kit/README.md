@@ -27,7 +27,8 @@ Connect the phone in Android, then run `assemble.bat` (or `./assemble.sh`). It
 1. downloads the iOS 16.5 IPSW for the iPhone X (`iPhone10,3`, 20F66) from Apple's public servers and unpacks the parts
    it needs (`IPSW=FILE` to use one you have; nothing is decrypted or circumvented);
 2. copies the firmware from the phone (`source/devices/munch/kit/pull-firmware.sh`; allow root when the phone asks);
-3. asks for the Wi-Fi network iOS should join;
+3. asks for the Wi-Fi network iOS should join (optional), and whether to add Sileo, a rootless jailbreak prefix
+   (optional, off by default; `JB=1`);
 4. builds the system image and the root disk with the programs in `prebuilt/`;
 5. builds the loader with the iPhone identity from the IPSW, the boot image (Mu-Silicium + loader) and the payload;
 6. writes `ios-munch/` beside the kit, with `start.bat` and Google's adb and fastboot.
