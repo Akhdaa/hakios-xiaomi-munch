@@ -132,7 +132,7 @@ log "4/5 the system image and the root disk, with the kit's programs (mostly pac
 # Optional: a jailbreak prefix with Sileo (Procursus's rootless bootstrap under /var/jb, tools/mk-jb.sh fetches it from
 # Procursus and Sileo's public repositories). Off unless JB=1 or answered yes; JB=0 removes one an earlier run added.
 if [ -z "${JB:-}" ] && [ -t 0 ]; then
-	read -r -p "Add Sileo (a rootless jailbreak prefix, ~130 MB) to the system? [y/N] " answer || answer=
+	read -r -p "Add Sileo (a rootless jailbreak prefix, ~130 MB)? start.bat then asks at each boot whether to use it [y/N] " answer || answer=
 	case "$answer" in [yY]*) JB=1;; *) JB=0;; esac
 fi
 if [ "${JB:-0}" = 1 ]; then
@@ -170,6 +170,12 @@ gpu_recover=1 cam=5 munch_bt=4 mic=4 slpi=1 hw=munch munch_charge=1 wifi_mac=$ma
 python3 "$ROOT/xnuloader/mkpayload.py" -o "$OUT/run-payload.bin" kernel="$KIT/prebuilt/kernel-munch.bin" ramdisk="$U/root.apfs" \
 	--kernel-version "$(cat "$KIT/prebuilt/kernel-munch.ver")" --cmdline "loader_return_after=86400 epoch=$(date +%s) $args" > /dev/null
 [ "$(stat -c %s "$OUT/run-payload.bin")" -le $((63 << 20)) ] || die "the payload is more than the loader takes (63 MB)"
+# with Sileo in the system image, a second payload without it (jb=0): start.bat asks at each boot which one
+rm -f "$OUT/run-payload-nojb.bin"
+if [ "${JB:-0}" = 1 ]; then
+	python3 "$ROOT/xnuloader/mkpayload.py" -o "$OUT/run-payload-nojb.bin" kernel="$KIT/prebuilt/kernel-munch.bin" ramdisk="$U/root.apfs" \
+		--kernel-version "$(cat "$KIT/prebuilt/kernel-munch.ver")" --cmdline "loader_return_after=86400 epoch=$(date +%s) $args jb=0" > /dev/null
+fi
 echo "copying the system image ($(( $(stat -c %s "$U/system.apfs") >> 20 )) MB)"
 cp "$U/system.apfs" "$OUT/system.apfs"
 cp "$ROOT/win-boot/boot-ios.ps1" "$ROOT/devices/munch/kit/start.bat" "$ROOT/devices/munch/kit/get-log.bat" \

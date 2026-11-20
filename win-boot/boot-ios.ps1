@@ -1,4 +1,4 @@
-param([switch]$Check, [switch]$Storage, [switch]$Bluetooth, [switch]$InstallIPA, [switch]$LiveIPA)
+param([switch]$Check, [switch]$Storage, [switch]$Bluetooth, [switch]$InstallIPA, [switch]$LiveIPA, [switch]$NoJB)
 
 $ErrorActionPreference = 'Stop'
 
@@ -98,7 +98,7 @@ function Prepare-Payload([string]$Path) {
             $allowedKeys = @('sb_delay','cpus','bootcpu','cpufreq','touchscreen','gpu','adsp','sound',
                 'wifi','haptic','socinfo','thermal','battery_stop','pmic','battery','fb_hole',
                 'gpu_push_ms','munch_torch','panel','panel_level','wifi_mac','fb_backlight','fb_hz',
-                'gpu_recover','loader_return_after','cam','epoch','mic','slpi','hw','munch_charge','munch_bt')
+                'gpu_recover','loader_return_after','cam','epoch','mic','slpi','hw','munch_charge','munch_bt','jb','touch_exit')
             $keys = @($arguments | ForEach-Object { ($_ -split '=', 2)[0] })
             if ($Bluetooth) { $allowedKeys += 'munch_bt' }
             if (@($keys | Where-Object { $_ -notin $allowedKeys }).Count -or
@@ -141,6 +141,10 @@ try {
     $loader = Join-Path $PSScriptRoot 'xnu-usb.img'
     $system = Join-Path $PSScriptRoot 'system.apfs'
     $source = Join-Path $PSScriptRoot 'run-payload.bin'
+    if ($NoJB) {
+        # (the kit's package with Sileo has a second payload without it, jb=0: start.bat asks at each boot)
+        $source = Join-Path $PSScriptRoot 'run-payload-nojb.bin'
+    }
     if ($Bluetooth) {
         if ($Storage) { throw 'Choose one boot mode.' }
         $source = Join-Path (Split-Path -Parent $PSScriptRoot) 'logs/munch-camera/focus-bt-qs-test.bin'

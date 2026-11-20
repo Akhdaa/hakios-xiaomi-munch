@@ -987,6 +987,11 @@ mount_writable(void)
 	 */
 	jb = stat("/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR ? "/jb" :
 	    stat("/private/preboot/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR ? "/private/preboot/jb" : NULL;
+	/* boot-arg jb=0: an image with the prefix boots without it (the kit's start.bat asks at each boot) */
+	if (jb != NULL && boot_arg("jb") != NULL && strcmp(boot_arg("jb"), "0") == 0) {
+		printf("init: jb=0: the package manager's prefix is not installed this boot\n");
+		jb = NULL;
+	}
 	if (ok && jb != NULL) {
 		const char *to = "/private/var/jb";
 		int dirs = 0, entries = 0, grafted, users = 0;

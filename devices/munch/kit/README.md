@@ -31,9 +31,11 @@ Connect the phone in Android, then run `assemble.bat` (or `./assemble.sh`). It
    (optional, off by default; `JB=1`);
 4. builds the system image and the root disk with the programs in `prebuilt/`;
 5. builds the loader with the iPhone identity from the IPSW, the boot image (Mu-Silicium + loader) and the payload;
-6. writes `ios-munch/` beside the kit, with `start.bat` and Google's adb and fastboot.
+6. writes `ios-munch/` beside the kit, with `start.bat`, `get-log.bat` and Google's adb and fastboot.
 
-Then run `start.bat` in `ios-munch/` with the phone in Android or fastboot. A reboot brings Android back.
+Then run `start.bat` in `ios-munch/` with the phone in Android or fastboot (with Sileo in the package it asks first
+whether to boot with it). A reboot brings Android back. `get-log.bat` saves the log, with the Wi-Fi address and serial
+number blanked out. The five-finger hold that ended a test run is off (`touch_exit=1` turns it on).
 
 **Keep `ios-munch/` to yourself**: it holds Apple's files, the vendor's firmware and your Wi-Fi password.
 

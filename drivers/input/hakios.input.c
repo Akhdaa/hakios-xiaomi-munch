@@ -64,7 +64,7 @@ static uint32_t touch_head, touch_tail;        /* read from head, add at tail */
 
 /*
  * The way out when nothing else is at hand: five fingers held on the screen for a second and a
- * half end the run -- control goes back to the loader, as when loader_return_after expires.
+ * half end the run -- control goes back to the loader, as when loader_return_after expires. Only with touch_exit=1.
  * Only a driver's fingers count, not samples a program writes to the device.
  */
 #define EXIT_FINGERS    5
@@ -336,7 +336,13 @@ hakios_input_init(void)
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-touch") == NULL) {
 		printf("hakios-touch: cannot create the device\n");
 	}
-	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
+	{
+		/* the five-finger way out: off unless touch_exit=1 (in daily use a five-finger grab ended iOS; 20 November) */
+		uint32_t touch_exit = 0;
+
+		PE_parse_boot_argn("touch_exit", &touch_exit, sizeof(touch_exit));
+		exit_call = touch_exit != 0 ? thread_call_allocate(exit_hold_elapsed, NULL) : NULL;
+	}
 	last_activity = mach_absolute_time();
 	autolock_call = thread_call_allocate(autolock_check, NULL);
 	autolock_check(NULL, NULL);

@@ -1,7 +1,7 @@
 iOS 16.5 on the POCO F4 (munch), in RAM
 
   1. Connect the phone in Android (USB debugging on) or in fastboot (Power + Volume Down).
-  2. Run start.bat. It boots Mu-Silicium and the loader with "fastboot boot", uploads system.apfs (about 100 s)
+  2. Run start.bat (with Sileo in the package it first asks whether to boot with it). It boots Mu-Silicium and the loader with "fastboot boot", uploads system.apfs (about 100 s)
      and starts the kernel. iOS appears about 30-45 s later.
   3. A reboot (hold Power) brings Android back. Nothing is ever flashed or written to the phone's storage.
 
