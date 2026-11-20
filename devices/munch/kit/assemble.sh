@@ -158,7 +158,8 @@ python3 "$ROOT/xnuloader/mkpayload.py" -o "$OUT/run-payload.bin" kernel="$KIT/pr
 [ "$(stat -c %s "$OUT/run-payload.bin")" -le $((63 << 20)) ] || die "the payload is more than the loader takes (63 MB)"
 echo "copying the system image ($(( $(stat -c %s "$U/system.apfs") >> 20 )) MB)"
 cp "$U/system.apfs" "$OUT/system.apfs"
-cp "$ROOT/win-boot/boot-ios.ps1" "$ROOT/devices/munch/kit/start.bat" "$ROOT/devices/munch/kit/README-package.txt" "$OUT/"
+cp "$ROOT/win-boot/boot-ios.ps1" "$ROOT/devices/munch/kit/start.bat" "$ROOT/devices/munch/kit/get-log.bat" \
+	"$ROOT/devices/munch/kit/README-package.txt" "$OUT/"
 cp "$PT"/adb.exe "$PT"/fastboot.exe "$PT"/AdbWinApi.dll "$PT"/AdbWinUsbApi.dll "$OUT/bin/" 2> /dev/null || true
 rm -f "$KIT/usb-payload.bin"
 echo
