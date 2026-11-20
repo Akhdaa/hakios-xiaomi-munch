@@ -34,6 +34,10 @@ n = d.count(w)
 open(dst, 'wb').write(d.replace(w, r))
 print('make-kit: kernel: %d strings with the build user replaced' % n)
 EOF
+# the kernel's version as the loader passes it (hakios_kver): the drivers find the SoC in it (-sm8250-); a kit has no
+# .config for tools/kernel-version.py to read, so it is kept beside the kernel
+python3 tools/kernel-version.py | sed 's/-dirty$//' > "$OUT/prebuilt/kernel-munch.ver"
+grep -q -- '-sm8250-' "$OUT/prebuilt/kernel-munch.ver" || die "the kernel version has no -sm8250-: $(cat "$OUT/prebuilt/kernel-munch.ver")"
 # userland/obj: the programs and libraries (no objects, no leftovers)
 for f in userland/obj/*; do
 	case "$f" in *.o|*.a|*.new|*.d|*.tmp) continue;; esac

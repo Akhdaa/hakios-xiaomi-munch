@@ -14,6 +14,7 @@
 #   IPSW=FILE          an iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw you already have
 #   SSID=... PSK=...   the Wi-Fi network, instead of being asked
 #   FW_FROM=DIR        take the fw-* directories from DIR instead of the phone (a second assembly)
+#   FW_PULL=1          copy the firmware from the phone again (by default the copy of the last run is used)
 #   PERSIST_IMG=FILE   the sensors' calibration from an offline dump of your persist partition
 #   SYSIMAGE_FROM=DIR  use an IPSW extraction already made (another tree's sysimage/)
 #
@@ -38,7 +39,7 @@ mkdir -p "$TOOLS"
 export PATH=$TOOLS:$PATH
 log() { printf '\n== %s\n' "$*"; }
 die() { echo "assemble: $*" >&2; exit 1; }
-[ -f "$KIT/prebuilt/kernel-munch.bin" ] && [ -d "$ROOT/devices/munch" ] || die "this is not an unpacked kit ($KIT)"
+[ -f "$KIT/prebuilt/kernel-munch.bin" ] && [ -f "$KIT/prebuilt/kernel-munch.ver" ] && [ -d "$ROOT/devices/munch" ] || die "this is not an unpacked kit ($KIT)"
 
 log "what this computer needs"
 missing=
@@ -105,6 +106,9 @@ if [ -n "${FW_FROM:-}" ]; then
 	for d in fw-gpu fw-audio fw-wifi fw-bluetooth fw-camera fw-sensors fw-haptic fw-modem; do
 		[ -d "$FW_FROM/$d" ] && { rm -rf "$ROOT/$d"; cp -r "$FW_FROM/$d" "$ROOT/$d"; }
 	done
+elif [ -z "${FW_PULL:-}" ] && [ -f "$ROOT/fw-gpu/a650_sqe.fw" ] && [ -f "$ROOT/fw-audio/adsp.mdt" ] && [ -f "$ROOT/fw-wifi/amss20.bin" ] &&
+	[ -f "$ROOT/fw-bluetooth/htbtfw20.tlv" ] && [ -f "$ROOT/fw-sensors/slpi/slpi.mdt" ]; then
+	echo "the firmware copied last time is used (FW_PULL=1 copies it from the phone again)"
 else
 	bash "$ROOT/devices/munch/kit/pull-firmware.sh" "$ROOT"
 fi
@@ -146,9 +150,11 @@ python3 "$ROOT/xnuloader/mkpayload.py" -o "$KIT/usb-payload.bin" loader.efi="$RO
 mac=$(head -1 "$ROOT/fw-wifi/mac" | tr -d '\r ')
 args="sb_delay=8 cpus=8 bootcpu=7 cpufreq=1 touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1 haptic=5 socinfo=1 thermal=1 \
 battery_stop=15 pmic=1 battery=1 fb_hole=23 gpu_push_ms=0 munch_torch=3 panel=2 panel_level=300 fb_backlight=1 fb_hz=60 \
-gpu_recover=1 cam=5 mic=4 slpi=1 hw=munch munch_charge=1 wifi_mac=$mac"
+gpu_recover=1 cam=5 munch_bt=4 mic=4 slpi=1 hw=munch munch_charge=1 wifi_mac=$mac"
+# (kernel.ver: the loader hands it to the kernel as hakios_kver, where the drivers find the SoC: without -sm8250- none of
+# the phone's drivers starts -- kit 1.0's crash at the Apple logo)
 python3 "$ROOT/xnuloader/mkpayload.py" -o "$OUT/run-payload.bin" kernel="$KIT/prebuilt/kernel-munch.bin" ramdisk="$U/root.apfs" \
-	--cmdline "loader_return_after=86400 epoch=$(date +%s) $args" > /dev/null
+	--kernel-version "$(cat "$KIT/prebuilt/kernel-munch.ver")" --cmdline "loader_return_after=86400 epoch=$(date +%s) $args" > /dev/null
 [ "$(stat -c %s "$OUT/run-payload.bin")" -le $((63 << 20)) ] || die "the payload is more than the loader takes (63 MB)"
 echo "copying the system image ($(( $(stat -c %s "$U/system.apfs") >> 20 )) MB)"
 cp "$U/system.apfs" "$OUT/system.apfs"

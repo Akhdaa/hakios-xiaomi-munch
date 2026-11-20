@@ -124,6 +124,14 @@ DARWIN_JOBS=${JOBS-"
 # (Count a QEMU run log with its duplicate lines removed: run-darwin.sh prints launchd's log twice.)
 # WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && DARWIN_JOBS="$DARWIN_JOBS com.apple.wifid"
+# The POCO F4's Bluetooth (the kernel's munch_bt=4: the QCA6390 over UART, an H4 transport for iOS): Darwin's own
+# bluetoothd and BlueTool, with libhakios.bt (src/munch_bluetooth.c) inside them, as tools/munch-bt-test-image.sh made it
+# for its test images. In when the firmware is there (../fw-bluetooth); BT=0 leaves it out.
+if [ "${BT-1}" != 0 ] && [ -f ../fw-bluetooth/htbtfw20.tlv ]; then
+	DARWIN_JOBS="$DARWIN_JOBS com.apple.BlueTool com.apple.bluetoothd com.apple.tccd com.apple.securityd"
+	BT_INJECT="
+/redwood/lib/libhakios.bt.dylib BlueTool bluetoothd"
+fi
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libhakios.dylib, src/inject_sb.c is libhakios.sb.dylib, src/inject_media.c is
 # libhakios.media.dylib).
@@ -138,7 +146,7 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo
 /redwood/lib/libhakios.tweaks.dylib Preferences
-/redwood/lib/libhakios.motion.dylib SystemCheck Compass"}
+/redwood/lib/libhakios.motion.dylib SystemCheck Compass${BT_INJECT:-}"}
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -254,6 +262,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		# from xiongnemo/hakios-alioth's inject_ui.c)
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.motion.dylib -lobjc \
 			-o obj/libhakios.motion.dylib src/inject_motion.c
+		# ... and Bluetooth inside bluetoothd and BlueTool (src/munch_bluetooth.c)
+		$DYN -fblocks -dynamiclib -install_name /redwood/lib/libhakios.bt.dylib -framework CoreFoundation -framework IOKit \
+			-o obj/libhakios.bt.dylib src/munch_bluetooth.c
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
@@ -379,6 +390,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.motion.dylib ] && cp obj/libhakios.motion.dylib root/lib/
+	[ -f obj/libhakios.bt.dylib ] && [ -n "${BT_INJECT:-}" ] && cp obj/libhakios.bt.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then
 		mkdir -p root/lib/HakiosAudio.driver

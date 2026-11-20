@@ -98,7 +98,7 @@ function Prepare-Payload([string]$Path) {
             $allowedKeys = @('sb_delay','cpus','bootcpu','cpufreq','touchscreen','gpu','adsp','sound',
                 'wifi','haptic','socinfo','thermal','battery_stop','pmic','battery','fb_hole',
                 'gpu_push_ms','munch_torch','panel','panel_level','wifi_mac','fb_backlight','fb_hz',
-                'gpu_recover','loader_return_after','cam','epoch','mic','slpi','hw','munch_charge')
+                'gpu_recover','loader_return_after','cam','epoch','mic','slpi','hw','munch_charge','munch_bt')
             $keys = @($arguments | ForEach-Object { ($_ -split '=', 2)[0] })
             if ($Bluetooth) { $allowedKeys += 'munch_bt' }
             if (@($keys | Where-Object { $_ -notin $allowedKeys }).Count -or
