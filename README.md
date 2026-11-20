@@ -63,6 +63,28 @@ line can show while things move fast.
 - No writes to the phone's storage: no `fastboot flash`, no partition written. The modem's file systems, once
   cellular gets that far, are to be served read only.
 
+## The phone it is developed on
+
+This port is developed and tested on one phone, and parts of it are still fitted to that phone rather than read from yours:
+
+| | |
+|---|---|
+| Model | POCO F4 (`munch`), 22021211RG, hwc=GLOBAL |
+| Memory, storage | 8 GB RAM, 256 GB UFS |
+| Android on it | HyperOS `OS4.0.24.0`, a port by `@Jnt100`, build of 2026-02-11 (not Xiaomi's own build for munch) |
+| Modem firmware | 2.5.1.c1-14.1-0324_0657_6488b87c (Android's baseband version) |
+| reserved-memory | pil_gpu_region@8681a000, pil_slpi_region@88c00000, pil_adsp_region@8bb00000, cont_splash_region@9c000000 among the others |
+
+What is fitted to this phone so far:
+
+- The sensor DSP's firmware goes to `pil_slpi_region` (`0x88c00000`) and the audio DSP's to `pil_adsp_region` (`0x8bb00000`), both taken from this phone's `reserved-memory`.
+- The display: Silicium's framebuffer at `0x9c000000` (`cont_splash_region`; 1080 x 2400, 4320 bytes a row).
+- Firmware can move these regions. If the kernel stops early or a part does not start on your phone, compare yours. In Android, `adb shell ls /proc/device-tree/reserved-memory/` lists the regions with their addresses (no root needed).
+
+If you try it on your own phone and something goes wrong, please [open an issue](https://github.com/Akhdaa/hakios-xiaomi-munch/issues). Say which phone it is (model, RAM, region, ROM and firmware version) and what happened, and attach your reserved-memory list. Leave out anything personal: the serial number, IMEI, Wi-Fi names and passwords, Bluetooth and MAC addresses.
+
+This section follows [xiongnemo/hakios-alioth](https://github.com/xiongnemo/hakios-alioth)'s.
+
 ## The kit (the easy way)
 
 [Releases](https://github.com/Akhdaa/hakios-xiaomi-munch/releases) has a **munch kit**, like
